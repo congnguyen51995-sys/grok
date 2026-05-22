@@ -1,0 +1,33 @@
+{
+  "appId": "com.fluxy.thanhcongmedia",
+  "productName": "Fluxy - Thành Công Media",
+  "asar": false,
+  "directories": {
+    "output": "release"
+  },
+  "extraMetadata": {
+    "main": "build-protected/main/bootstrap.js",
+    "version": "2.4.1"
+  },
+  "files": [
+    "dist/**/*",
+    "build-protected/**/*",
+    "node_modules/**/*",
+    "!node_modules/.cache/**/*",
+    "!node_modules/.bin/**/*"
+  ],
+  "extraResources": [
+    {
+      "from": "FluxyExtension-main",
+      "to": "FluxyExtension"
+    },
+    {
+      "from": "src/main/resources/grok-worker",
+      "to": "grok-worker"
+    }
+  ],
+  "win": {
+    "target": "nsis",
+    "icon": "public/logo.png"
+  }
+}

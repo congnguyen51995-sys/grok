@@ -1,0 +1,178 @@
+================================================================================
+        HƯỚNG DẪN CẬP NHẬT PHIÊN BẢN - FLUXY THÀNH CÔNG MEDIA
+================================================================================
+
+File này hướng dẫn cách phát hành bản cập nhật mới cho app Fluxy.
+Mỗi lần ra bản mới, chỉ cần làm theo các bước dưới đây.
+
+--------------------------------------------------------------------------------
+TỔNG QUAN CÁCH HOẠT ĐỘNG
+--------------------------------------------------------------------------------
+
+  App khởi động
+      ↓
+  Đọc file version.json trên Google Drive (link đã cài sẵn trong app)
+      ↓
+  So sánh version trong file với version app đang chạy
+      ↓
+  Nếu trên Drive CAO HƠN → hiện banner tím "Có bản cập nhật mới"
+      ↓
+  User bấm "Tải về" → tải file .exe từ Drive về máy
+      ↓
+  User bấm "Cài đặt ngay" → chạy installer → app tự tắt → cài bản mới
+
+
+--------------------------------------------------------------------------------
+CÁC FILE QUAN TRỌNG
+--------------------------------------------------------------------------------
+
+  File cấu hình updater:
+    D:\TOOL REUP\grok\src\main\updater.js
+
+  File version.json trên Google Drive:
+    https://drive.google.com/file/d/1mTDb2JKNZHBD3CUkHMQItlhSghJ4gyqp/view
+
+  Version hiện tại của app (package.json):
+    D:\TOOL REUP\grok\package.json
+    → Dòng: "version": "x.x.x"
+
+
+================================================================================
+KHI CÓ BẢN MỚI — LÀM THEO 4 BƯỚC NÀY
+================================================================================
+
+BƯỚC 1 — TĂNG VERSION TRONG package.json
+─────────────────────────────────────────
+  Mở file: D:\TOOL REUP\grok\package.json
+  Tìm dòng:  "version": "1.0.0"
+  Đổi thành: "version": "1.1.0"   (tăng số giữa hoặc số cuối)
+
+  Quy tắc đặt version:
+    1.0.0 → 1.0.1   (sửa lỗi nhỏ)
+    1.0.0 → 1.1.0   (thêm tính năng mới)
+    1.0.0 → 2.0.0   (thay đổi lớn, làm lại giao diện)
+
+
+BƯỚC 2 — BUILD FILE INSTALLER MỚI
+────────────────────────────────────
+  Mở terminal trong thư mục D:\TOOL REUP\grok
+  Chạy lệnh:
+
+    npm run build:electron
+
+  Sau khi build xong, file .exe nằm ở:
+    D:\TOOL REUP\grok\release\Fluxy - Thành Công Media Setup x.x.x.exe
+
+
+BƯỚC 3 — UPLOAD INSTALLER LÊN GOOGLE DRIVE
+──────────────────────────────────────────────
+  1. Vào Google Drive: https://drive.google.com
+  2. Upload file .exe vừa build lên Drive
+  3. Chuột phải vào file .exe → Share → Change to "Anyone with the link" → Copy link
+  4. Link sẽ có dạng:
+       https://drive.google.com/file/d/ABCDEF123456/view?usp=sharing
+                                       ──────────────
+                                       Đây là FILE_ID cần lấy
+
+  5. Lấy FILE_ID (phần chữ giữa /d/ và /view)
+     Ví dụ: ABCDEF123456
+
+  6. Tạo đường dẫn tải thẳng (direct download):
+     https://drive.usercontent.google.com/download?id=ABCDEF123456&export=download&confirm=t
+                                                        ────────────
+                                                        Thay bằng FILE_ID vừa lấy
+
+
+BƯỚC 4 — CẬP NHẬT FILE version.json TRÊN GOOGLE DRIVE
+────────────────────────────────────────────────────────
+  Link file version.json:
+    https://drive.google.com/file/d/1mTDb2JKNZHBD3CUkHMQItlhSghJ4gyqp/view
+
+  Cách sửa file trên Drive:
+    - Vào Drive → tìm file version.json
+    - Chuột phải → Open with → Google Docs (hoặc Text Editor)
+    - Sửa nội dung bên dưới
+    - Lưu lại (Ctrl+S)
+
+  Nội dung cần sửa:
+
+    {
+      "version": "1.1.0",
+      "releaseNotes": "- Thêm tính năng X\n- Sửa lỗi Y\n- Cải thiện tốc độ",
+      "downloadUrl": "https://drive.usercontent.google.com/download?id=FILE_ID_CỦA_EXE_MỚI&export=download&confirm=t"
+    }
+
+  Trong đó:
+    "version"      → phải CAO HƠN version đang chạy trong app (bước 1)
+    "releaseNotes" → ghi chú bản cập nhật (hiện trong banner)
+    "downloadUrl"  → đường dẫn direct download file .exe (bước 3)
+
+
+================================================================================
+VÍ DỤ THỰC TẾ — PHÁT HÀNH BẢN 1.1.0
+================================================================================
+
+  Giả sử app đang là 1.0.0, muốn lên 1.1.0:
+
+  1. Sửa package.json:
+       "version": "1.1.0"
+
+  2. Chạy: npm run build:electron
+     → Tạo ra: Fluxy - Thành Công Media Setup 1.1.0.exe
+
+  3. Upload file .exe lên Drive → lấy FILE_ID:
+     Giả sử FILE_ID = XYZ999abc
+
+  4. Sửa version.json trên Drive thành:
+     {
+       "version": "1.1.0",
+       "releaseNotes": "Thêm Audio to Video, sửa lỗi video đen",
+       "downloadUrl": "https://drive.usercontent.google.com/download?id=XYZ999abc&export=download&confirm=t"
+     }
+
+  5. Xong! Người dùng khởi động app → thấy banner tím → bấm Tải về → Cài đặt ngay
+
+
+================================================================================
+LƯU Ý QUAN TRỌNG
+================================================================================
+
+  ✅ Version trong version.json PHẢI CAO HƠN version trong package.json
+     → Nếu bằng nhau hoặc thấp hơn → app KHÔNG hiện thông báo
+
+  ✅ File .exe trên Drive phải được Share "Anyone with the link"
+     → Nếu để private → app tải về sẽ bị lỗi
+
+  ✅ File version.json trên Drive cũng phải được Share "Anyone with the link"
+     → FILE_ID đã cài sẵn: 1mTDb2JKNZHBD3CUkHMQItlhSghJ4gyqp
+
+  ✅ Sau khi sửa version.json → đợi 1-2 phút rồi test
+     → Google Drive cache có thể chậm cập nhật
+
+  ⚠️  Không xóa file version.json trên Drive
+     → Nếu xóa, app sẽ không check update được (lỗi im lặng, không crash)
+
+  ⚠️  File .exe cũ trên Drive có thể xóa sau khi bản mới ổn định
+     → Giải phóng dung lượng Drive
+
+
+================================================================================
+KIỂM TRA HOẠT ĐỘNG (TEST)
+================================================================================
+
+  Cách test nhanh không cần build:
+  1. Sửa version.json trên Drive → đổi version cao hơn (vd 9.9.9)
+  2. Điền downloadUrl = link bất kỳ (có thể để link giả để test banner)
+  3. Khởi động lại app → phải thấy banner tím xuất hiện
+  4. Nếu thấy banner → hệ thống hoạt động đúng ✅
+  5. Sau khi test xong → sửa lại version.json về đúng version thật
+
+
+================================================================================
+HỖ TRỢ
+================================================================================
+
+  SĐT/Zalo: 0866680795
+  App: Fluxy - Thành Công Media
+
+================================================================================

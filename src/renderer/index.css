@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-slate-950 text-slate-100 font-sans antialiased;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+}
+
+@layer utilities {
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .line-clamp-3 {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0f172a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* ─── Brightness boost: tăng độ sáng text trên nền tối ─────────── */
+/* Đẩy mỗi tone lên ~2 bậc để dễ đọc hơn mà không mất phân cấp */
+.text-slate-400 { color: rgb(188 202 222) !important; }
+.text-slate-500 { color: rgb(155 174 200) !important; }
+.text-slate-600 { color: rgb(120 142 172) !important; }
+.text-slate-700 { color: rgb(93 117 150) !important; }
+
+/* ─── Select / Option — màu chữ nổi trên nền tối ───────────────── */
+select {
+  color: #c4b5fd !important; /* violet-300 */
+}
+
+select option {
+  background-color: #1e1b4b;
+  color: #ddd6fe;            /* violet-200 */
+  font-size: 11px;
+}
+
+select option:checked,
+select option:hover {
+  background-color: #4c1d95;
+  color: #ffffff;
+}
+
+/* Animation */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}

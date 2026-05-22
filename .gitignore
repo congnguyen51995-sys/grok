@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+release/
+build-protected/
+
+# Backup folders
+backup_*/
+
+# Archives
+*.rar
+*.zip
+*.7z
+
+# Executables
+*.exe
+*.bat
+
+# Debug
+debug/
+
+# Environment / secrets
+.env
+.env.*
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+
+# Temp
+*.tmp
+*.temp

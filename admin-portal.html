@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fluxy Admin Portal - Management</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <style>
+        body { background-color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        /* Cuộn mượt cho bảng */
+        .table-container { max-height: calc(100vh - 180px); overflow-y: auto; }
+        /* Tùy chỉnh thanh cuộn */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+</head>
+<body class="text-slate-800 flex h-screen overflow-hidden">
+
+    <!-- MÀN HÌNH ĐĂNG NHẬP -->
+    <div id="loginScreen" class="fixed inset-0 z-50 bg-[#0f172a] flex items-center justify-center">
+        <div class="bg-[#1e293b] p-8 rounded-2xl shadow-2xl w-[380px] border border-slate-700">
+            <div class="text-center mb-8">
+                <h2 class="text-2xl font-bold text-white tracking-wide">Fluxy Portal</h2>
+                <p class="text-xs text-slate-400 mt-1">Đăng nhập hệ thống quản lý</p>
+            </div>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-[11px] font-semibold text-slate-300 mb-1">Tên đăng nhập</label>
+                    <input type="text" id="username" class="w-full bg-[#0f172a] border border-slate-600 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500">
+                </div>
+                <div>
+                    <label class="block text-[11px] font-semibold text-slate-300 mb-1">Mật khẩu</label>
+                    <input type="password" id="password" class="w-full bg-[#0f172a] border border-slate-600 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500">
+                </div>
+                <button onclick="login()" class="w-full bg-[#5b5fff] hover:bg-[#4f53e6] text-white font-bold py-3 rounded-lg text-sm transition-colors mt-2 shadow-lg">
+                    ĐĂNG NHẬP
+                </button>
+                <p id="loginError" class="text-red-400 text-xs text-center hidden mt-2">Sai tài khoản hoặc mật khẩu!</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- MÀN HÌNH CHÍNH -->
+    <div id="dashboardScreen" class="flex w-full h-full hidden">
+        
+        <!-- SIDEBAR BÊN TRÁI -->
+        <aside class="w-64 bg-white border-r border-slate-200 flex flex-col justify-between shadow-sm z-10">
+            <div>
+                <div class="h-16 flex items-center px-6 border-b border-slate-100 mb-4">
+                    <div class="flex items-center gap-2">
+                        <div class="w-7 h-7 bg-[#5b5fff] rounded flex items-center justify-center shadow-sm">
+                            <div class="w-3 h-3 border-2 border-white rounded-sm transform rotate-45"></div>
+                        </div>
+                        <h1 class="text-2xl font-black text-[#5b5fff] tracking-tight">Fluxy</h1>
+                    </div>
+                </div>
+                <nav class="px-4 space-y-2">
+                    <button onclick="switchTab('create')" id="tab-create" class="w-full flex items-center gap-3 px-4 py-3 bg-[#f5f3ff] text-[#5b5fff] rounded-xl font-semibold text-sm transition-all">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                        Thêm Key Mới
+                    </button>
+                    <button onclick="switchTab('history')" id="tab-history" class="w-full flex items-center gap-3 px-4 py-3 text-slate-500 hover:bg-slate-50 hover:text-slate-700 rounded-xl font-medium text-sm transition-all">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        Lịch sử tạo Key
+                    </button>
+                </nav>
+            </div>
+            
+            <div class="p-4 border-t border-slate-200 bg-slate-50">
+                <div class="flex items-center gap-3 mb-4 px-2">
+                    <div class="w-8 h-8 rounded-full bg-blue-200 text-blue-700 flex items-center justify-center font-bold text-xs">AD</div>
+                    <div>
+                        <p class="text-sm font-bold text-slate-700">Admin</p>
+                        <p class="text-[10px] text-slate-500 uppercase tracking-wider">Super User</p>
+                    </div>
+                </div>
+                <button onclick="logout()" class="w-full bg-white border border-slate-300 text-slate-600 hover:text-red-500 hover:border-red-200 hover:bg-red-50 font-semibold py-2 rounded-lg text-xs transition-colors shadow-sm">
+                    ĐĂNG XUẤT
+                </button>
+            </div>
+        </aside>
+
+        <!-- KHU VỰC NỘI DUNG CHÍNH -->
+        <main class="flex-1 bg-[#f8fafc] relative">
+            
+            <!-- TAB 1: TẠO KEY MỚI -->
+            <div id="section-create" class="p-10 h-full overflow-y-auto">
+                <div class="max-w-2xl bg-white rounded-2xl shadow-[0_2px_20px_-5px_rgba(0,0,0,0.05)] border border-slate-200 p-8">
+                    <h2 class="text-2xl font-bold mb-6 text-slate-800">Tạo License Mới</h2>
+                    
+                    <div class="space-y-5">
+                        <div>
+                            <label class="block text-sm font-semibold mb-1.5 text-slate-700">Tên khách hàng / Ghi chú</label>
+                            <input type="text" id="noteInput" placeholder="Ví dụ: Anh Nguyễn Văn A..." class="w-full border border-slate-300 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-[#5b5fff]/50 focus:border-[#5b5fff] transition-all">
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-semibold mb-1.5 text-slate-700">HWID (Mã máy khách gửi)</label>
+                            <input type="text" id="hwidInput" placeholder="Dán HWID vào đây..." class="w-full border border-slate-300 rounded-lg px-4 py-3 font-mono text-sm text-blue-600 focus:outline-none focus:ring-2 focus:ring-[#5b5fff]/50 focus:border-[#5b5fff] transition-all">
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-semibold mb-1.5 text-slate-700">Thời hạn sử dụng</label>
+                            <select id="durationSelect" class="w-full border border-slate-300 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-[#5b5fff]/50 focus:border-[#5b5fff] transition-all bg-white font-medium">
+                                <option value="5">5 Ngày (Bản Test)</option>
+                                <option value="30" selected>30 Ngày (1 Tháng)</option>
+                                <option value="90">3 Tháng</option>
+                                <option value="180">6 Tháng</option>
+                                <option value="365">1 Năm</option>
+                                <option value="3650">Vĩnh viễn (10 năm)</option>
+                            </select>
+                        </div>
+
+                        <button onclick="generateKey()" class="w-full bg-[#1677ff] hover:bg-[#0f5fcb] text-white font-bold py-3.5 rounded-lg transition-colors mt-4 shadow-[0_4px_14px_0_rgba(22,119,255,0.39)] text-sm tracking-wide">
+                            TẠO MÃ KÍCH HOẠT
+                        </button>
+
+                        <div class="mt-8 p-5 bg-slate-50 border border-slate-200 rounded-xl relative">
+                            <label class="block text-xs font-bold mb-2 text-slate-500 uppercase tracking-widest">Key Gửi Cho Khách</label>
+                            <div class="relative">
+                                <input type="text" id="keyOutput" readonly class="w-full bg-white border border-emerald-300 rounded-lg px-4 py-3.5 font-mono font-bold text-emerald-600 text-center focus:outline-none text-lg shadow-inner">
+                                <button onclick="copyKey()" class="absolute right-2 top-2 p-2 bg-slate-100 hover:bg-slate-200 rounded-md text-slate-600 transition-colors" title="Copy Key">
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- TAB 2: LỊCH SỬ KEY -->
+            <div id="section-history" class="p-8 h-full hidden flex-col">
+                <div class="flex justify-between items-end mb-6">
+                    <div>
+                        <h2 class="text-2xl font-bold text-slate-800">Lịch sử Key đã tạo</h2>
+                        <p class="text-sm text-slate-500 mt-1">Quản lý và theo dõi bản quyền khách hàng</p>
+                    </div>
+                    <div class="flex gap-3">
+                        <input type="text" id="searchInput" onkeyup="renderTable()" placeholder="Tìm tên, HWID..." class="border border-slate-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-[#5b5fff] w-64">
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-xl shadow-sm border border-slate-200 flex-1 flex flex-col overflow-hidden">
+                    <div class="table-container flex-1">
+                        <table class="w-full text-left border-collapse">
+                            <thead class="bg-slate-50 sticky top-0 z-10 border-b border-slate-200">
+                                <tr>
+                                    <th class="px-6 py-4 text-[11px] font-bold text-slate-500 uppercase tracking-wider">Khách hàng & Key</th>
+                                    <th class="px-6 py-4 text-[11px] font-bold text-slate-500 uppercase tracking-wider">Mã máy (HWID)</th>
+                                    <th class="px-6 py-4 text-[11px] font-bold text-slate-500 uppercase tracking-wider">Ngày tạo</th>
+                                    <th class="px-6 py-4 text-[11px] font-bold text-slate-500 uppercase tracking-wider">Ngày hết hạn</th>
+                                    <th class="px-6 py-4 text-[11px] font-bold text-slate-500 uppercase tracking-wider text-center">Trạng thái</th>
+                                    <th class="px-6 py-4 text-[11px] font-bold text-slate-500 uppercase tracking-wider text-right">Hành động</th>
+                                </tr>
+                            </thead>
+                            <tbody id="historyTableBody" class="divide-y divide-slate-100">
+                                <!-- Dữ liệu sẽ được chèn bằng JS -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+        </main>
+    </div>
+
+    <script>
+        // MÃ BÍ MẬT BẢO VỆ KEY - PHẢI TRÙNG VỚI ELECTRON!
+        const SECRET_SALT = "GROK_STUDIO_PRO_VIP_2026_SECRET";
+
+        // Mảng chứa dữ liệu lịch sử
+        let historyDB = [];
+
+        // KHỞI TẠO ỨNG DỤNG
+        window.onload = () => {
+            loadHistory();
+            
+            // Xử lý đăng nhập bằng phím Enter
+            document.getElementById('password').addEventListener('keypress', function (e) {
+                if (e.key === 'Enter') login();
+            });
+        };
+
+        // ==========================================
+        // 1. CHỨC NĂNG ĐĂNG NHẬP
+        // ==========================================
+        function login() {
+            const user = document.getElementById('username').value;
+            const pass = document.getElementById('password').value;
+            
+            if(user === 'admin' && pass === 'Dung@1906') { 
+                document.getElementById('loginScreen').classList.add('hidden');
+                document.getElementById('dashboardScreen').classList.remove('hidden');
+                renderTable(); // Vẽ lại bảng khi đăng nhập thành công
+            } else {
+                document.getElementById('loginError').classList.remove('hidden');
+            }
+        }
+
+        function logout() {
+            document.getElementById('loginScreen').classList.remove('hidden');
+            document.getElementById('dashboardScreen').classList.add('hidden');
+            document.getElementById('password').value = '';
+            document.getElementById('keyOutput').value = '';
+        }
+
+        // ==========================================
+        // 2. CHUYỂN ĐỔI TAB (TẠO KEY & LỊCH SỬ)
+        // ==========================================
+        function switchTab(tabName) {
+            const btnCreate = document.getElementById('tab-create');
+            const btnHistory = document.getElementById('tab-history');
+            const secCreate = document.getElementById('section-create');
+            const secHistory = document.getElementById('section-history');
+
+            // Đặt lại style
+            btnCreate.className = "w-full flex items-center gap-3 px-4 py-3 text-slate-500 hover:bg-slate-50 hover:text-slate-700 rounded-xl font-medium text-sm transition-all";
+            btnHistory.className = "w-full flex items-center gap-3 px-4 py-3 text-slate-500 hover:bg-slate-50 hover:text-slate-700 rounded-xl font-medium text-sm transition-all";
+            secCreate.classList.add('hidden');
+            secHistory.classList.add('hidden');
+
+            if(tabName === 'create') {
+                btnCreate.className = "w-full flex items-center gap-3 px-4 py-3 bg-[#f5f3ff] text-[#5b5fff] rounded-xl font-semibold text-sm transition-all";
+                secCreate.classList.remove('hidden');
+            } else {
+                btnHistory.className = "w-full flex items-center gap-3 px-4 py-3 bg-[#f5f3ff] text-[#5b5fff] rounded-xl font-semibold text-sm transition-all";
+                secHistory.classList.remove('hidden');
+                secHistory.classList.add('flex'); // Bắt buộc để flexbox hoạt động
+                renderTable();
+            }
+        }
+
+        // ==========================================
+        // 3. THUẬT TOÁN TẠO KEY & LƯU LỊCH SỬ
+        // ==========================================
+        function generateKey() {
+            const customerName = document.getElementById('noteInput').value.trim();
+            const hwid = document.getElementById('hwidInput').value.trim().toUpperCase();
+            const days = parseInt(document.getElementById('durationSelect').value);
+            
+            if(!hwid) return alert("Vui lòng nhập Mã máy (HWID) của khách!");
+            if(!customerName) return alert("Vui lòng nhập Tên/Ghi chú để dễ quản lý sau này!");
+
+            // Tính toán Timestamp
+            const createdDate = new Date();
+            const expiryDate = new Date();
+            expiryDate.setDate(expiryDate.getDate() + days);
+            const expiryTimestamp = expiryDate.getTime();
+            
+            // Format Key
+            const expiryHex = expiryTimestamp.toString(16).toUpperCase();
+            const payload = hwid + expiryHex;
+            const signature = CryptoJS.HmacSHA256(payload, SECRET_SALT).toString(CryptoJS.enc.Hex).toUpperCase().substring(0, 16);
+            const finalKey = `${expiryHex}-${signature}`;
+            
+            document.getElementById('keyOutput').value = finalKey;
+
+            // Lưu vào Cơ sở dữ liệu nội bộ (Local Storage)
+            const record = {
+                id: Date.now().toString(),
+                customerName: customerName,
+                hwid: hwid,
+                key: finalKey,
+                days: days,
+                createdTimestamp: createdDate.getTime(),
+                expiryTimestamp: expiryTimestamp
+            };
+
+            historyDB.unshift(record); // Thêm lên đầu mảng
+            saveHistory();
+            
+            alert(`Tạo Key thành công cho: ${customerName}\nĐã tự động lưu vào Lịch sử!`);
+        }
+
+        function copyKey() {
+            const key = document.getElementById('keyOutput').value;
+            if(key) {
+                navigator.clipboard.writeText(key);
+                alert("Đã copy Key!");
+            }
+        }
+
+        function copyText(text, btn) {
+            navigator.clipboard.writeText(text).then(() => {
+                const orig = btn.innerHTML;
+                btn.innerHTML = '<svg class="w-3.5 h-3.5 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>';
+                setTimeout(() => { btn.innerHTML = orig; }, 1500);
+            });
+        }
+
+        // ==========================================
+        // 4. QUẢN LÝ CƠ SỞ DỮ LIỆU (LOCAL STORAGE)
+        // ==========================================
+        function saveHistory() {
+            localStorage.setItem('fluxy_license_history', JSON.stringify(historyDB));
+        }
+
+        function loadHistory() {
+            const data = localStorage.getItem('fluxy_license_history');
+            if(data) {
+                try { historyDB = JSON.parse(data); } 
+                catch(e) { historyDB = []; }
+            }
+        }
+
+        // Chức năng: Gia hạn (Chuyển thông tin sang Tab Tạo Mới)
+        function renewKey(hwid, name) {
+            document.getElementById('hwidInput').value = hwid;
+            document.getElementById('noteInput').value = `${name} (Gia hạn)`;
+            document.getElementById('keyOutput').value = '';
+            switchTab('create');
+        }
+
+        // Chức năng: Xóa bản ghi
+        function deleteRecord(id) {
+            if(confirm("Bạn có chắc chắn muốn xóa lịch sử Key này không? (Lưu ý: Việc xóa chỉ làm mất lịch sử trên Web, khách vẫn dùng được nếu Key còn hạn)")) {
+                historyDB = historyDB.filter(item => item.id !== id);
+                saveHistory();
+                renderTable();
+            }
+        }
+
+        // Format ngày tháng hiển thị đẹp (DD/MM/YYYY)
+        function formatDate(timestamp) {
+            const d = new Date(timestamp);
+            return `${d.getDate().toString().padStart(2, '0')}/${(d.getMonth()+1).toString().padStart(2, '0')}/${d.getFullYear()}`;
+        }
+
+        // Hiển thị bảng
+        function renderTable() {
+            const tbody = document.getElementById('historyTableBody');
+            const searchVal = document.getElementById('searchInput').value.toLowerCase();
+            const now = Date.now();
+            
+            tbody.innerHTML = '';
+
+            // Lọc dữ liệu tìm kiếm
+            const filteredData = historyDB.filter(item => 
+                item.customerName.toLowerCase().includes(searchVal) || 
+                item.hwid.toLowerCase().includes(searchVal) ||
+                item.key.toLowerCase().includes(searchVal)
+            );
+
+            if(filteredData.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="6" class="px-6 py-10 text-center text-slate-400 text-sm">Chưa có dữ liệu hoặc không tìm thấy kết quả.</td></tr>`;
+                return;
+            }
+
+            filteredData.forEach(item => {
+                const isExpired = now > item.expiryTimestamp;
+
+                let statusHtml = '';
+                if(isExpired) {
+                    statusHtml = `<span class="px-2.5 py-1 bg-amber-100 text-amber-700 text-[10px] font-bold rounded-md tracking-wider">HẾT HẠN</span>`;
+                } else {
+                    statusHtml = `<span class="px-2.5 py-1 bg-emerald-100 text-emerald-700 text-[10px] font-bold rounded-md tracking-wider">ACTIVE</span>`;
+                }
+
+                const safeKey  = item.key.replace(/'/g, "\\'");
+                const safeHwid = item.hwid.replace(/'/g, "\\'");
+                const safeName = item.customerName.replace(/'/g, "\\'");
+
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-slate-50/80 transition-colors";
+                tr.innerHTML = `
+                    <td class="px-6 py-4 border-b border-slate-100" style="min-width:260px">
+                        <p class="text-xs text-slate-600 font-bold mb-1">${item.customerName}</p>
+                        <div class="flex items-center gap-1.5">
+                            <span class="font-mono font-bold text-blue-600 text-xs bg-blue-50 border border-blue-200 rounded px-2 py-1 select-all">${item.key}</span>
+                            <button onclick="copyText('${safeKey}', this)" title="Copy Key" class="flex-shrink-0 p-1 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                            </button>
+                        </div>
+                    </td>
+                    <td class="px-6 py-4 border-b border-slate-100" style="min-width:240px">
+                        <div class="flex items-center gap-1.5">
+                            <span class="text-[11px] font-mono text-slate-600 bg-slate-100 border border-slate-200 rounded px-2 py-1 select-all break-all">${item.hwid}</span>
+                            <button onclick="copyText('${safeHwid}', this)" title="Copy HWID" class="flex-shrink-0 p-1 text-slate-400 hover:text-slate-700 hover:bg-slate-200 rounded transition-colors">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                            </button>
+                        </div>
+                    </td>
+                    <td class="px-6 py-4 border-b border-slate-100 whitespace-nowrap">
+                        <p class="text-sm font-semibold text-slate-700">${formatDate(item.createdTimestamp)}</p>
+                        <p class="text-[10px] text-slate-400 mt-1 uppercase">Admin</p>
+                    </td>
+                    <td class="px-6 py-4 border-b border-slate-100 whitespace-nowrap">
+                        <p class="text-sm font-bold ${isExpired ? 'text-amber-600' : 'text-slate-700'}">${formatDate(item.expiryTimestamp)}</p>
+                    </td>
+                    <td class="px-6 py-4 border-b border-slate-100 text-center whitespace-nowrap">
+                        ${statusHtml}
+                    </td>
+                    <td class="px-6 py-4 border-b border-slate-100 whitespace-nowrap">
+                        <div class="flex items-center gap-1.5">
+                            <button onclick="copyText('${safeKey}', this)" title="Cấp lại Key cũ (Copy)" class="flex items-center gap-1 px-2 py-1.5 text-[11px] font-bold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded transition-colors">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                                Cấp lại
+                            </button>
+                            <button onclick="renewKey('${safeHwid}', '${safeName}')" title="Gia hạn (Tạo Key mới)" class="p-1.5 text-blue-500 hover:bg-blue-50 border border-slate-200 rounded transition-colors">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                            </button>
+                            <button onclick="deleteRecord('${item.id}')" title="Xóa lịch sử này" class="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 border border-slate-200 rounded transition-colors">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                            </button>
+                        </div>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+    </script>
+</body>
+</html>

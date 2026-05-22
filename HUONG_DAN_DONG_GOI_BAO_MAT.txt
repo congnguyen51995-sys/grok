@@ -1,0 +1,117 @@
+================================================================================
+        HƯỚNG DẪN ĐÓNG GÓI APP BẢO MẬT - FLUXY THÀNH CÔNG MEDIA
+================================================================================
+
+File này hướng dẫn cách build file .exe có mã hóa, chống crack.
+
+--------------------------------------------------------------------------------
+TỔNG QUAN CÁC LỚP BẢO VỆ
+--------------------------------------------------------------------------------
+
+  Lớp 1 — ASAR
+    → Đóng gói toàn bộ source vào 1 file binary duy nhất
+    → Người dùng KHÔNG thể mở thư mục app để xem source code
+
+  Lớp 2 — Javascript Obfuscator
+    → Mã hóa toàn bộ JS trong dist/ (renderer) và src/main/ (main process)
+    → Biến tên hàm, biến thành mã hex (a0x1f2c, b0x3d4e...)
+    → Encode string sang base64
+    → Đọc vào không hiểu gì cả
+
+
+--------------------------------------------------------------------------------
+CÁC FILE QUAN TRỌNG
+--------------------------------------------------------------------------------
+
+  Script obfuscate:
+    D:\TOOL REUP\grok\scripts\obfuscate.js
+
+  Cấu hình build:
+    D:\TOOL REUP\grok\package.json
+    → Mục "build": { "asar": true, ... }
+
+  Version app:
+    D:\TOOL REUP\grok\package.json
+    → Dòng: "version": "x.x.x"
+
+
+================================================================================
+KHI MUỐN BUILD BẢN MỚI — CHỈ CẦN 2 BƯỚC
+================================================================================
+
+BƯỚC 1 — TĂNG VERSION (nếu ra bản mới)
+────────────────────────────────────────
+  Mở file: D:\TOOL REUP\grok\package.json
+  Tìm dòng:  "version": "2.0.0"
+  Đổi thành: "version": "2.1.0"   (tăng tùy ý)
+
+  Quy tắc đặt version:
+    2.0.0 → 2.0.1   (sửa lỗi nhỏ)
+    2.0.0 → 2.1.0   (thêm tính năng mới)
+    2.0.0 → 3.0.0   (thay đổi lớn)
+
+
+BƯỚC 2 — CHẠY LỆNH BUILD BẢO MẬT
+────────────────────────────────────
+  Mở terminal trong thư mục D:\TOOL REUP\grok
+  Chạy lệnh:
+
+    npm run build:secure
+
+  Lệnh này tự động làm 3 việc:
+    1. Vite build  → biên dịch React ra dist/
+    2. Obfuscate   → mã hóa toàn bộ JS trong dist/ và src/main/
+    3. Electron-builder → đóng gói thành file .exe
+
+  File .exe nằm ở:
+    D:\TOOL REUP\grok\release\Fluxy - Thành Công Media Setup x.x.x.exe
+
+
+================================================================================
+SO SÁNH 2 LỆNH BUILD
+================================================================================
+
+  npm run build:electron   → Build THƯỜNG (không mã hóa, dùng để test nhanh)
+  npm run build:secure     → Build BẢO MẬT (mã hóa + ASAR, dùng khi phát hành)
+
+
+================================================================================
+NẾU CÓ LỖI KHI BUILD
+================================================================================
+
+  Lỗi: "javascript-obfuscator not found"
+  → Chạy: npm install
+  → Rồi thử lại: npm run build:secure
+
+  Lỗi: "Cannot find module vite"
+  → Chạy: npm install
+  → Rồi thử lại
+
+  Lỗi: icon not found
+  → Kiểm tra file: D:\TOOL REUP\grok\public\logo.png có tồn tại không
+
+  Build thành công nhưng app bị lỗi sau khi cài
+  → Thử build không mã hóa trước: npm run build:electron
+  → Nếu build thường OK mà build:secure lỗi → lỗi do obfuscate
+  → Mở scripts/obfuscate.js → tắt bớt option (đổi true → false)
+
+
+================================================================================
+QUY TRÌNH ĐẦY ĐỦ KHI PHÁT HÀNH BẢN MỚI
+================================================================================
+
+  1. Sửa version trong package.json
+  2. Chạy: npm run build:secure
+  3. Upload file .exe lên Google Drive
+  4. Cập nhật version.json trên Drive (xem HUONG_DAN_CAP_NHAT_PHIEN_BAN.txt)
+  5. Xong! User bật app → thấy banner cập nhật → tải về → cài bản mới
+
+
+================================================================================
+HỖ TRỢ
+================================================================================
+
+  SĐT/Zalo: 0866680795
+  App: Fluxy - Thành Công Media
+
+================================================================================

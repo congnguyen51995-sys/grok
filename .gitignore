@@ -38,3 +38,7 @@ npm-debug.log*
 # Temp
 *.tmp
 *.temp
+
+# OmniVoice bundled backend (large ML env, không push lên git)
+OmniVoice-Studio-main/
+OmniVoice-Studio-main/.venv/

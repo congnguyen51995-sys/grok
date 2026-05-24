@@ -1088,31 +1088,51 @@ function setupIpcHandlers() {
 
   // Tìm uv ở các vị trí cài đặt phổ biến trên Windows/Mac/Linux
   function findUvExecutable() {
-    const h = process.env.USERPROFILE || process.env.HOME || '';
+    const h  = process.env.USERPROFILE || process.env.HOME || '';
+    const ad = process.env.APPDATA  || '';
+    const la = process.env.LOCALAPPDATA || '';
+
+    // Đọc PATH từ registry Windows (user PATH, không bị giới hạn bởi Electron env)
+    const registryPaths = [];
+    try {
+      const { execSync } = require('child_process');
+      const regOut = execSync('reg query "HKCU\\Environment" /v PATH 2>nul', { encoding: 'utf8', timeout: 3000 });
+      const match = regOut.match(/PATH\s+REG(?:_EXPAND)?_SZ\s+(.+)/i);
+      if (match) {
+        const regPathStr = match[1].trim();
+        // Expand %USERPROFILE%, %APPDATA%, etc.
+        const expanded = regPathStr
+          .replace(/%USERPROFILE%/gi, h)
+          .replace(/%APPDATA%/gi, ad)
+          .replace(/%LOCALAPPDATA%/gi, la);
+        for (const p of expanded.split(';')) {
+          const t = p.trim();
+          if (t) registryPaths.push(path.join(t, 'uv.exe'), path.join(t, 'uv'));
+        }
+      }
+    } catch (_) {}
+
     const candidates = [
-      // Windows — uv installer mới (AppData\Roaming\uv\bin)
-      path.join(process.env.APPDATA  || '', 'uv', 'bin', 'uv.exe'),
-      // Windows — uv installer mới (LocalAppData\uv\bin)
-      path.join(process.env.LOCALAPPDATA || '', 'uv', 'bin', 'uv.exe'),
-      // Windows — ~/.local/bin (pipx / cargo style)
-      path.join(h, '.local', 'bin', 'uv.exe'),
-      // Windows — ~/.cargo/bin (installed via cargo)
-      path.join(h, '.cargo', 'bin', 'uv.exe'),
-      // Linux / macOS — ~/.local/bin
-      path.join(h, '.local', 'bin', 'uv'),
-      // Linux / macOS — ~/.cargo/bin
+      ...registryPaths,                              // từ registry PATH
+      path.join(h, '.local', 'bin', 'uv.exe'),      // official uv installer (Windows)
+      path.join(h, '.local', 'bin', 'uv'),           // official uv installer (Linux/Mac)
+      path.join(ad,  'uv', 'bin', 'uv.exe'),        // uv AppData\Roaming
+      path.join(la,  'uv', 'bin', 'uv.exe'),        // uv AppData\Local
+      path.join(h, '.cargo', 'bin', 'uv.exe'),      // cargo install
       path.join(h, '.cargo', 'bin', 'uv'),
-      // macOS Homebrew (Intel)
+      // Python Scripts thư mục — nếu pip install uv
+      path.join(la, 'Programs', 'Python', 'Python312', 'Scripts', 'uv.exe'),
+      path.join(la, 'Programs', 'Python', 'Python311', 'Scripts', 'uv.exe'),
+      path.join(la, 'Programs', 'Python', 'Python310', 'Scripts', 'uv.exe'),
       '/usr/local/bin/uv',
-      // macOS Homebrew (Apple Silicon)
       '/opt/homebrew/bin/uv',
-      // Linux system-wide
       '/usr/bin/uv',
     ].filter(Boolean);
+
     for (const p of candidates) {
       try { if (fs.existsSync(p)) return p; } catch (_) {}
     }
-    return null; // không tìm thấy
+    return null;
   }
 
   // Chọn lệnh khởi động: ưu tiên .venv Python (không cần uv), fallback sang uv

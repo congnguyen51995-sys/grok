@@ -1156,45 +1156,62 @@ function setupIpcHandlers() {
     return null;
   }
 
-  // Chọn lệnh khởi động: ưu tiên .venv Python (không cần uv), fallback sang uv
+  // Chọn lệnh khởi động: ưu tiên uvicorn.exe từ .venv (fully venv-aware), fallback nhiều cấp
   function resolveStartCommand(backendDir) {
     const mainScript = path.join(backendDir, 'backend', 'main.py');
     const venvDir    = path.join(backendDir, '.venv');
 
-    // 1. .venv tồn tại — dùng Python gốc từ pyvenv.cfg (bỏ qua uv shim hoàn toàn)
     if (fs.existsSync(venvDir)) {
-      const homePy = readVenvHomePython(venvDir);
-      if (homePy) {
-        // Cần set VIRTUAL_ENV + PATH để Python nhận site-packages của venv
-        const venvScripts = path.join(venvDir, 'Scripts');     // Windows
-        const venvBin     = path.join(venvDir, 'bin');          // Unix
-        const scriptsDir  = fs.existsSync(venvScripts) ? venvScripts : venvBin;
-        const siteWin     = path.join(venvDir, 'Lib',  'site-packages');
-        const siteUnix    = path.join(venvDir, 'lib',  `python${process.version.replace(/^v/, '').split('.')[0]}`, 'site-packages');
-        const sitePackages = fs.existsSync(siteWin) ? siteWin : siteUnix;
+      // Option A: uvicorn.exe trong venv — cách tốt nhất, tự động load toàn bộ .pth files
+      const uvicornWin  = path.join(venvDir, 'Scripts', 'uvicorn.exe');
+      const uvicornUnix = path.join(venvDir, 'bin', 'uvicorn');
+      const uvicornExe  = fs.existsSync(uvicornWin)  ? uvicornWin
+                        : fs.existsSync(uvicornUnix) ? uvicornUnix : null;
+      if (uvicornExe) {
         return {
-          cmd: homePy,
-          args: [mainScript],
-          method: 'pyvenv-home',
-          extraEnv: {
-            VIRTUAL_ENV: venvDir,
-            PYTHONPATH: sitePackages,
-            PATH: scriptsDir + path.delimiter + (process.env.PATH || ''),
-          }
+          cmd: uvicornExe,
+          args: ['backend.main:app', '--host', '127.0.0.1', '--port', '3900'],
+          method: 'uvicorn-exe',
         };
       }
-      // Fallback: thử shim trực tiếp (nếu venv tạo bằng system Python thì shim OK)
+
+      // Option B: home Python + site.addsitedir — load đúng .pth files, chạy main.py như __main__
+      const homePy = readVenvHomePython(venvDir);
+      if (homePy) {
+        const siteWin  = path.join(venvDir, 'Lib', 'site-packages');
+        const siteUnix = path.join(venvDir, 'lib',
+          `python${process.version.replace(/^v/, '').split('.').slice(0, 2).join('.')}`,
+          'site-packages');
+        const sitePkgs = fs.existsSync(siteWin) ? siteWin : siteUnix;
+        // Dùng -c: thêm venv site-packages vào sys.path (xử lý .pth), rồi chạy main.py
+        const pyCode = [
+          `import sys, os, site, runpy`,
+          `sys.path.insert(0, ${JSON.stringify(backendDir)})`,
+          `site.addsitedir(${JSON.stringify(sitePkgs)})`,
+          `os.environ.setdefault('VIRTUAL_ENV', ${JSON.stringify(venvDir)})`,
+          `runpy.run_path(${JSON.stringify(mainScript)}, run_name='__main__')`,
+        ].join('; ');
+        return {
+          cmd: homePy,
+          args: ['-c', pyCode],
+          method: 'pyvenv-home-site',
+          extraEnv: {
+            VIRTUAL_ENV: venvDir,
+            PATH: path.join(venvDir, 'Scripts') + path.delimiter + (process.env.PATH || ''),
+          },
+        };
+      }
+
+      // Option C: thử shim trực tiếp (nếu venv tạo bằng system Python thì shim OK)
       const venvWin  = path.join(venvDir, 'Scripts', 'python.exe');
       const venvUnix = path.join(venvDir, 'bin', 'python');
       if (fs.existsSync(venvWin))  return { cmd: venvWin,  args: [mainScript], method: 'venv-shim-win' };
       if (fs.existsSync(venvUnix)) return { cmd: venvUnix, args: [mainScript], method: 'venv-shim-unix' };
     }
 
-    // 2. Tìm uv ở các đường dẫn phổ biến
+    // Fallback: uv run
     const uvPath = findUvExecutable();
     if (uvPath) return { cmd: uvPath, args: ['run', 'python', mainScript], method: 'uv-found' };
-
-    // 3. Fallback: thử gọi 'uv' qua shell
     return { cmd: 'uv', args: ['run', 'python', mainScript], method: 'uv-shell' };
   }
 
@@ -1215,7 +1232,11 @@ function setupIpcHandlers() {
     const { cmd, args, method, extraEnv = {} } = resolveStartCommand(backendDir);
     sendOvLog(`🚀 Đang khởi động OmniVoice...`, 'info');
     sendOvLog(`📁 Thư mục: ${backendDir}`, 'info');
-    if (method === 'pyvenv-home') {
+    if (method === 'uvicorn-exe') {
+      sendOvLog(`🦄 Dùng uvicorn.exe từ .venv`, 'info');
+    } else if (method === 'pyvenv-home-site') {
+      sendOvLog(`🐍 Python: ${path.basename(path.dirname(cmd))} + site.addsitedir`, 'info');
+    } else if (method === 'pyvenv-home') {
       sendOvLog(`🐍 Python: ${path.basename(path.dirname(cmd))} (pyvenv.cfg home)`, 'info');
     } else if (method.startsWith('venv-shim')) {
       sendOvLog(`🐍 Dùng .venv shim Python`, 'info');

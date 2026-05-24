@@ -138,7 +138,277 @@ function formatSRTInfo(segments) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 export default function VoiceStudio({ dark = true }) {
-    const [subTab, setSubTab] = useState('edge'); // 'edge' | 'elevenlabs'
+    const [subTab, setSubTab] = useState('edge'); // 'edge' | 'elevenlabs' | 'omnivoice'
+
+    // =========================================================================
+    // ===  OMNI VOICE STATE  ==================================================
+    // =========================================================================
+    const OV_BASE = 'http://localhost:8000';
+    const [ovConnected,        setOvConnected]        = useState(false);
+    const [ovConnecting,       setOvConnecting]       = useState(false);
+    const [ovStarting,         setOvStarting]         = useState(false);   // backend đang khởi động
+    const [ovStartError,       setOvStartError]       = useState('');      // lỗi khởi động
+    const [ovDir,              setOvDir]              = useState('');       // đường dẫn backend
+    const [ovLogs,             setOvLogs]             = useState([]);       // log từ backend
+    const ovPollRef    = useRef(null); // interval ref để poll kết nối
+    const ovLogListened = useRef(false); // đã đăng ký lắng nghe log chưa
+    const [ovProfiles,         setOvProfiles]         = useState([]);
+    const [ovEngineActive,     setOvEngineActive]     = useState('');
+    const [ovText,             setOvText]             = useState('');
+    const [ovLanguage,         setOvLanguage]         = useState('');
+    const [ovSelectedProfile,  setOvSelectedProfile]  = useState('');
+    const [ovInstruct,         setOvInstruct]         = useState('');
+    const [ovNumStep,          setOvNumStep]          = useState(16);
+    const [ovGuidance,         setOvGuidance]         = useState(2.0);
+    const [ovSpeed,            setOvSpeed]            = useState(1.0);
+    const [ovEffectPreset,     setOvEffectPreset]     = useState('broadcast');
+    const [ovGenerating,       setOvGenerating]       = useState(false);
+    const [ovAudioUrl,         setOvAudioUrl]         = useState(null);
+    const [ovAudioDur,         setOvAudioDur]         = useState(null);
+    const [ovHistory,          setOvHistory]          = useState([]);
+    const [ovSection,          setOvSection]          = useState('generate'); // 'generate'|'clone'|'profiles'
+    const [ovOutputFolder,     setOvOutputFolder]     = useState('');
+    // Clone profile state
+    const [ovProfName,         setOvProfName]         = useState('');
+    const [ovProfLang,         setOvProfLang]         = useState('');
+    const [ovProfInstruct,     setOvProfInstruct]     = useState('');
+    const [ovRefText,          setOvRefText]          = useState('');
+    const [ovRefFile,          setOvRefFile]          = useState(null); // File object
+    const [ovRefFileName,      setOvRefFileName]      = useState('');
+    const [ovCreatingProf,     setOvCreatingProf]     = useState(false);
+    const [ovSaving,           setOvSaving]           = useState(false);
+    const ovAudioRef = useRef(null);
+
+    const OV_LANGS = [
+        { v: '',    l: '🌐 Auto (tự động)' },
+        { v: 'vi',  l: '🇻🇳 Tiếng Việt' },
+        { v: 'en',  l: '🇺🇸 English' },
+        { v: 'ja',  l: '🇯🇵 日本語' },
+        { v: 'zh',  l: '🇨🇳 中文' },
+        { v: 'ko',  l: '🇰🇷 한국어' },
+        { v: 'fr',  l: '🇫🇷 Français' },
+        { v: 'es',  l: '🇪🇸 Español' },
+        { v: 'de',  l: '🇩🇪 Deutsch' },
+        { v: 'th',  l: '🇹🇭 ภาษาไทย' },
+        { v: 'ru',  l: '🇷🇺 Русский' },
+        { v: 'ar',  l: '🇸🇦 العربية' },
+        { v: 'pt',  l: '🇧🇷 Português' },
+        { v: 'it',  l: '🇮🇹 Italiano' },
+        { v: 'id',  l: '🇮🇩 Bahasa Indonesia' },
+    ];
+    const OV_PRESETS = ['broadcast','voice','podcast','raw'];
+
+    // ── Omni Voice helpers ────────────────────────────────────────────────────
+    const ovFetch = async (path, opts = {}) => {
+        const r = await fetch(`${OV_BASE}${path}`, opts);
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        return r;
+    };
+
+    const ovCheckConnection = async () => {
+        setOvConnecting(true);
+        try {
+            await ovFetch('/model/status');
+            setOvConnected(true);
+            setOvStartError('');
+            // Load profiles + engine info after connect
+            const [pr, er] = await Promise.all([ovFetch('/profiles'), ovFetch('/engines/tts')]);
+            const profiles = await pr.json();
+            const engines  = await er.json();
+            setOvProfiles(profiles?.profiles || profiles || []);
+            setOvEngineActive(engines?.active || '');
+            try {
+                const hist = await (await ovFetch('/history')).json();
+                setOvHistory((hist?.history || hist || []).slice(0, 30));
+            } catch {}
+        } catch { setOvConnected(false); }
+        finally  { setOvConnecting(false); }
+    };
+
+    // Khởi động backend tự động rồi poll cho đến khi kết nối được
+    const ovStartAndConnect = async () => {
+        if (ovConnected || ovStarting) return;
+        setOvStarting(true);
+        setOvStartError('');
+        setOvLogs([]);
+
+        // Lắng nghe log từ backend (chỉ đăng ký 1 lần duy nhất)
+        if (!ovLogListened.current) {
+            ovLogListened.current = true;
+            window.electronAPI?.onOmniVoiceLog?.((entry) => {
+                setOvLogs(prev => [...prev.slice(-60), entry]);
+            });
+        }
+
+        // Load đường dẫn đã lưu
+        const savedDir = await window.electronAPI?.omniVoiceGetDir?.() || '';
+        if (savedDir) setOvDir(savedDir);
+
+        // Thử kết nối trực tiếp (backend có thể đang chạy sẵn)
+        try {
+            await ovFetch('/model/status');
+            // Đang chạy rồi!
+            setOvConnected(true);
+            setOvStarting(false);
+            const [pr, er] = await Promise.all([ovFetch('/profiles'), ovFetch('/engines/tts')]);
+            setOvProfiles((await pr.json())?.profiles || []);
+            setOvEngineActive((await er.json())?.active || '');
+            return;
+        } catch {}
+
+        // Chưa chạy → yêu cầu Electron spawn process
+        const startResult = await window.electronAPI?.omniVoiceStart?.() || {};
+        if (!startResult.success && !startResult.alreadyRunning) {
+            setOvStartError(startResult.error || 'Không thể khởi động OmniVoice');
+            setOvStarting(false);
+            return;
+        }
+
+        // Poll kết nối mỗi 2s, tối đa 45s (backend cần tải model ML)
+        let attempts = 0;
+        const MAX_ATTEMPTS = 22;
+        if (ovPollRef.current) clearInterval(ovPollRef.current);
+        ovPollRef.current = setInterval(async () => {
+            attempts++;
+            try {
+                await ovFetch('/model/status');
+                clearInterval(ovPollRef.current);
+                ovPollRef.current = null;
+                setOvConnected(true);
+                setOvStarting(false);
+                // Load data sau khi kết nối
+                try {
+                    const [pr, er] = await Promise.all([ovFetch('/profiles'), ovFetch('/engines/tts')]);
+                    setOvProfiles((await pr.json())?.profiles || []);
+                    setOvEngineActive((await er.json())?.active || '');
+                } catch {}
+            } catch {
+                if (attempts >= MAX_ATTEMPTS) {
+                    clearInterval(ovPollRef.current);
+                    ovPollRef.current = null;
+                    setOvStarting(false);
+                    setOvConnected(false);
+                    setOvStartError('Hết thời gian chờ (45s). Kiểm tra log bên dưới để biết lỗi.');
+                }
+            }
+        }, 2000);
+    };
+
+    const ovStopBackend = async () => {
+        if (ovPollRef.current) { clearInterval(ovPollRef.current); ovPollRef.current = null; }
+        await window.electronAPI?.omniVoiceStop?.();
+        setOvConnected(false);
+        setOvStarting(false);
+    };
+
+    const ovChangeDir = async () => {
+        const result = await window.electronAPI?.omniVoiceSelectDir?.();
+        if (result?.success) {
+            setOvDir(result.dir);
+            setOvLogs([]);
+            setOvStartError('');
+        }
+    };
+
+    const ovLoadProfiles = async () => {
+        try {
+            const r = await (await ovFetch('/profiles')).json();
+            setOvProfiles(r?.profiles || r || []);
+        } catch {}
+    };
+
+    const ovGenerate = async () => {
+        if (!ovText.trim()) return;
+        setOvGenerating(true);
+        if (ovAudioUrl) { URL.revokeObjectURL(ovAudioUrl); setOvAudioUrl(null); }
+        try {
+            const fd = new FormData();
+            fd.append('text', ovText.trim());
+            if (ovLanguage)        fd.append('language', ovLanguage);
+            if (ovSelectedProfile) fd.append('profile_id', ovSelectedProfile);
+            if (ovInstruct)        fd.append('instruct', ovInstruct);
+            fd.append('num_step',       String(ovNumStep));
+            fd.append('guidance_scale', String(ovGuidance));
+            fd.append('speed',          String(ovSpeed));
+            fd.append('effect_preset',  ovEffectPreset);
+            const r = await fetch(`${OV_BASE}/generate`, { method: 'POST', body: fd });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const blob   = await r.blob();
+            const url    = URL.createObjectURL(blob);
+            const audioId = r.headers.get('X-Audio-Id') || '';
+            const genMs   = r.headers.get('X-Generation-Time') || '';
+            setOvAudioUrl(url);
+            setOvAudioDur(genMs ? `${(+genMs/1000).toFixed(1)}s` : '');
+            // Save to disk if folder selected
+            if (ovOutputFolder && window.electronAPI?.saveBlobToFolder) {
+                const arr = await blob.arrayBuffer();
+                const name = `omni_${Date.now()}.wav`;
+                await window.electronAPI.saveBlobToFolder(ovOutputFolder, name, Array.from(new Uint8Array(arr)));
+            }
+            // Refresh history
+            const hist = await (await ovFetch('/history')).json();
+            setOvHistory((hist?.history || hist || []).slice(0, 30));
+        } catch (e) {
+            alert('Lỗi tạo giọng: ' + e.message);
+        } finally { setOvGenerating(false); }
+    };
+
+    const ovCreateProfile = async () => {
+        if (!ovProfName.trim() || !ovRefFile) return alert('Cần nhập tên và chọn file audio tham chiếu!');
+        setOvCreatingProf(true);
+        try {
+            const fd = new FormData();
+            fd.append('name',      ovProfName.trim());
+            fd.append('ref_audio', ovRefFile);
+            if (ovRefText)      fd.append('ref_text',  ovRefText);
+            if (ovProfInstruct) fd.append('instruct',  ovProfInstruct);
+            if (ovProfLang)     fd.append('language',  ovProfLang);
+            const r = await fetch(`${OV_BASE}/profiles`, { method: 'POST', body: fd });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const prof = await r.json();
+            setOvProfiles(p => [prof, ...p]);
+            setOvSelectedProfile(prof.id);
+            setOvProfName(''); setOvRefFile(null); setOvRefFileName(''); setOvRefText(''); setOvProfInstruct('');
+            alert(`✅ Tạo hồ sơ giọng "${prof.name}" thành công!`);
+            setOvSection('generate');
+        } catch (e) { alert('Lỗi tạo hồ sơ: ' + e.message); }
+        finally { setOvCreatingProf(false); }
+    };
+
+    const ovDeleteProfile = async (id, name) => {
+        if (!confirm(`Xoá hồ sơ giọng "${name}"?`)) return;
+        try {
+            await ovFetch(`/profiles/${id}`, { method: 'DELETE' });
+            setOvProfiles(p => p.filter(x => x.id !== id));
+            if (ovSelectedProfile === id) setOvSelectedProfile('');
+        } catch (e) { alert('Lỗi xoá: ' + e.message); }
+    };
+
+    const ovSaveAudio = async () => {
+        if (!ovAudioUrl) return;
+        setOvSaving(true);
+        try {
+            const folder = ovOutputFolder || await window.electronAPI?.selectFolder?.();
+            if (!folder) return;
+            if (!ovOutputFolder) setOvOutputFolder(folder);
+            const r = await fetch(ovAudioUrl);
+            const arr = Array.from(new Uint8Array(await r.arrayBuffer()));
+            const name = `omni_${Date.now()}.wav`;
+            await window.electronAPI?.saveBlobToFolder?.(folder, name, arr);
+            alert(`✅ Đã lưu: ${folder}\\${name}`);
+        } catch (e) { alert('Lỗi lưu file: ' + e.message); }
+        finally { setOvSaving(false); }
+    };
+
+    useEffect(() => {
+        if (subTab === 'omnivoice' && !ovConnected && !ovStarting) {
+            ovStartAndConnect();
+        }
+        // Cleanup poll khi unmount
+        return () => {
+            if (ovPollRef.current) { clearInterval(ovPollRef.current); ovPollRef.current = null; }
+        };
+    }, [subTab]);
 
     // =========================================================================
     // ===  EDGE TTS STATE  ====================================================
@@ -780,6 +1050,10 @@ export default function VoiceStudio({ dark = true }) {
                 </button>
                 <button onClick={() => setSubTab('gemini')} className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm transition-all ${subTab === 'gemini' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}>
                     <Sparkles size={16} /> Gemini TTS
+                </button>
+                <button onClick={() => setSubTab('omnivoice')} className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm transition-all ${subTab === 'omnivoice' ? 'bg-rose-600 text-white shadow-md' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}>
+                    <Volume2 size={16} /> Omni Voice
+                    {ovConnected && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"/>}
                 </button>
             </div>
 
@@ -1716,6 +1990,451 @@ export default function VoiceStudio({ dark = true }) {
                     </div>
                 )}
             </div>
+            )}
+
+            {/* ════════════════════════════════════════════════════════════════ */}
+            {/* ══  TAB: OMNI VOICE  ══════════════════════════════════════════ */}
+            {/* ════════════════════════════════════════════════════════════════ */}
+            {subTab === 'omnivoice' && (
+            <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
+
+              {/* ── Connection bar ─────────────────────────────────────────── */}
+              <div className="flex items-center gap-3 px-6 py-2 bg-[#0d1424] border-b border-slate-800 shrink-0 flex-wrap">
+                {/* Status dot */}
+                <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${ovConnected ? 'bg-emerald-400 shadow-[0_0_6px_#34d399]' : ovStarting ? 'bg-amber-400 animate-pulse' : 'bg-slate-600'}`}/>
+                <span className="text-[11px] font-bold text-slate-400">{OV_BASE}</span>
+                <span className={`text-[10px] font-semibold ${ovConnected ? 'text-emerald-400' : ovStarting ? 'text-amber-400' : 'text-slate-600'}`}>
+                  {ovConnected ? `● ONLINE${ovEngineActive ? ' · ' + ovEngineActive : ''}` : ovStarting ? '● Đang khởi động...' : '● OFFLINE'}
+                </span>
+                {/* Dir path (compact) */}
+                {ovDir && !ovConnected && (
+                  <span className="text-[9px] text-slate-700 truncate max-w-[220px]" title={ovDir}>{ovDir}</span>
+                )}
+                <div className="ml-auto flex items-center gap-2 shrink-0">
+                  {/* Change dir button */}
+                  <button onClick={ovChangeDir} title="Đổi thư mục OmniVoice"
+                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-400 transition-colors">
+                    📁 Đổi đường dẫn
+                  </button>
+                  {/* Stop button (only when running) */}
+                  {ovConnected && (
+                    <button onClick={ovStopBackend}
+                      className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-red-900/30 hover:bg-red-800/40 text-[10px] text-red-400 transition-colors border border-red-800/30">
+                      ⏹ Dừng
+                    </button>
+                  )}
+                  {/* Reconnect / Retry button */}
+                  {!ovStarting && (
+                    <button onClick={() => { setOvConnected(false); setOvStarting(false); setOvStartError(''); setTimeout(ovStartAndConnect, 100); }}
+                      disabled={ovConnecting}
+                      className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 transition-colors">
+                      <RefreshCw size={11} className={ovConnecting ? 'animate-spin' : ''}/>
+                      {ovConnected ? 'Làm mới' : 'Thử lại'}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* ── Starting / Error / Offline state ────────────────────────── */}
+              {!ovConnected ? (
+                <div className="flex-1 flex flex-col items-center justify-center gap-4 p-8 overflow-y-auto custom-scrollbar">
+                  {ovStarting ? (
+                    /* STARTING STATE */
+                    <div className="flex flex-col items-center gap-5 max-w-md w-full">
+                      <div className="relative">
+                        <div className="w-20 h-20 rounded-full bg-rose-500/10 border-2 border-rose-500/30 flex items-center justify-center">
+                          <Volume2 size={36} className="text-rose-400 animate-pulse"/>
+                        </div>
+                        <div className="absolute inset-0 rounded-full border-2 border-rose-500/20 animate-ping"/>
+                      </div>
+                      <div className="text-center">
+                        <p className="text-base font-bold text-slate-300 mb-1">Đang khởi động OmniVoice...</p>
+                        <p className="text-xs text-slate-500">Chờ backend tải model (có thể mất 20–40 giây)</p>
+                      </div>
+                      {/* Mini log - last 6 lines */}
+                      {ovLogs.length > 0 && (
+                        <div className="w-full bg-slate-900/60 border border-slate-800 rounded-xl p-3 font-mono text-[10px] space-y-0.5 max-h-[120px] overflow-y-auto custom-scrollbar">
+                          {ovLogs.slice(-6).map((l, i) => (
+                            <div key={i} className={`leading-relaxed ${l.type === 'error' ? 'text-red-400' : l.type === 'warn' ? 'text-amber-400' : 'text-slate-500'}`}>
+                              {l.text}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {/* Progress dots */}
+                      <div className="flex gap-1.5">
+                        {[0,1,2,3,4].map(i => (
+                          <div key={i} className="w-1.5 h-1.5 rounded-full bg-rose-500/40 animate-bounce"
+                               style={{ animationDelay: `${i * 150}ms` }}/>
+                        ))}
+                      </div>
+                    </div>
+                  ) : ovStartError ? (
+                    /* ERROR STATE */
+                    <div className="flex flex-col items-center gap-4 max-w-lg w-full">
+                      <div className="w-16 h-16 rounded-full bg-red-500/10 flex items-center justify-center">
+                        <AlertCircle size={32} className="text-red-400"/>
+                      </div>
+                      <p className="text-sm font-bold text-red-400">Không thể khởi động OmniVoice</p>
+                      <div className="w-full bg-red-900/20 border border-red-800/40 rounded-xl p-3 text-xs text-red-300">
+                        {ovStartError}
+                      </div>
+                      {/* Full log */}
+                      {ovLogs.length > 0 && (
+                        <div className="w-full bg-slate-900/60 border border-slate-800 rounded-xl p-3 font-mono text-[10px] space-y-0.5 max-h-[160px] overflow-y-auto custom-scrollbar">
+                          {ovLogs.slice(-20).map((l, i) => (
+                            <div key={i} className={`leading-relaxed ${l.type === 'error' ? 'text-red-400' : l.type === 'warn' ? 'text-amber-400' : 'text-slate-600'}`}>
+                              <span className="text-slate-700 mr-1">{l.time}</span>{l.text}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <div className="flex gap-3">
+                        <button onClick={ovChangeDir}
+                          className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 rounded-xl font-semibold">
+                          📁 Đổi đường dẫn
+                        </button>
+                        <button onClick={() => { setOvStartError(''); ovStartAndConnect(); }}
+                          className="px-5 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold rounded-xl flex items-center gap-2">
+                          <RefreshCw size={13}/> Thử lại
+                        </button>
+                      </div>
+                      <p className="text-[10px] text-slate-700 text-center">
+                        Đảm bảo <code className="text-slate-500">uv</code> đã được cài và thư mục OmniVoice đúng.
+                      </p>
+                    </div>
+                  ) : (
+                    /* OFFLINE STATE (first load fallback) */
+                    <div className="flex flex-col items-center gap-4 text-slate-600">
+                      <Volume2 size={44} className="opacity-20"/>
+                      <p className="text-sm font-bold text-slate-500">Đang kết nối OmniVoice...</p>
+                      <button onClick={ovStartAndConnect}
+                        className="px-6 py-2 bg-rose-600 hover:bg-rose-500 text-white text-sm font-bold rounded-xl flex items-center gap-2">
+                        <RefreshCw size={14}/> Khởi động
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ) : (
+              <div className="flex flex-1 min-h-0 overflow-hidden">
+
+                {/* ── Left sidebar: sub-nav + profiles ───────────────────── */}
+                <div className="w-52 shrink-0 border-r border-slate-800 flex flex-col bg-[#0a0f1e] overflow-y-auto custom-scrollbar">
+                  <div className="p-3 space-y-1 shrink-0">
+                    {[
+                      { id:'generate', icon:'🎙', label:'Tạo giọng nói' },
+                      { id:'clone',    icon:'🧬', label:'Clone giọng' },
+                      { id:'profiles', icon:'👤', label:`Hồ sơ (${ovProfiles.length})` },
+                      { id:'history',  icon:'📜', label:'Lịch sử' },
+                    ].map(s => (
+                      <button key={s.id} onClick={() => setOvSection(s.id)}
+                        className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[11px] font-semibold text-left transition-all ${ovSection === s.id ? 'bg-rose-600/20 text-rose-300 border border-rose-700/40' : 'text-slate-500 hover:bg-slate-800 hover:text-slate-300'}`}>
+                        <span>{s.icon}</span>{s.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Quick profile list */}
+                  {ovProfiles.length > 0 && (
+                    <div className="mt-2 px-3 pb-3">
+                      <p className="text-[9px] font-bold text-slate-700 uppercase tracking-wider mb-1.5">Hồ sơ giọng</p>
+                      <div className="space-y-1">
+                        {ovProfiles.map(p => (
+                          <button key={p.id} onClick={() => { setOvSelectedProfile(p.id); setOvSection('generate'); }}
+                            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left transition-all ${ovSelectedProfile === p.id ? 'bg-rose-700/20 border border-rose-700/40' : 'hover:bg-slate-800/60'}`}>
+                            <div className="w-6 h-6 rounded-full bg-gradient-to-br from-rose-500 to-violet-600 flex items-center justify-center text-[9px] font-bold text-white shrink-0">
+                              {p.name?.[0]?.toUpperCase() || '?'}
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-[10px] font-semibold text-slate-300 truncate">{p.name}</p>
+                              <p className="text-[8px] text-slate-600">{p.kind || 'clone'}</p>
+                            </div>
+                            {ovSelectedProfile === p.id && <span className="text-rose-400 text-[8px]">✓</span>}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* ── Main content area ───────────────────────────────────── */}
+                <div className="flex-1 overflow-y-auto custom-scrollbar p-5 space-y-4">
+
+                  {/* ── SECTION: Generate ─────────────────────────────────── */}
+                  {ovSection === 'generate' && (<>
+                    <div className="flex items-center gap-3 mb-1">
+                      <div className="w-8 h-8 bg-rose-500/10 rounded-lg flex items-center justify-center"><span className="text-base">🎙</span></div>
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-200">Tạo giọng nói</h3>
+                        <p className="text-[10px] text-slate-600">OmniVoice · 646 ngôn ngữ · Zero-shot cloning</p>
+                      </div>
+                    </div>
+
+                    {/* Text input */}
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 block">Văn bản</label>
+                      <textarea value={ovText} onChange={e => setOvText(e.target.value)} rows={5}
+                        placeholder="Nhập văn bản cần chuyển thành giọng nói..."
+                        className="w-full bg-[#0a1020] border border-slate-700/60 rounded-xl px-3 py-2.5 text-sm text-slate-300 resize-none focus:outline-none focus:border-rose-500/50 placeholder-slate-700"/>
+                      <p className="text-[9px] text-slate-700 mt-1 text-right">{ovText.length} ký tự</p>
+                    </div>
+
+                    {/* Language + Profile */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 block">Ngôn ngữ</label>
+                        <select value={ovLanguage} onChange={e => setOvLanguage(e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 text-slate-300 text-xs rounded-lg px-2.5 py-2 outline-none">
+                          {OV_LANGS.map(l => <option key={l.v} value={l.v}>{l.l}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 block">Hồ sơ giọng</label>
+                        <select value={ovSelectedProfile} onChange={e => setOvSelectedProfile(e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 text-slate-300 text-xs rounded-lg px-2.5 py-2 outline-none">
+                          <option value="">— Không có (giọng mặc định) —</option>
+                          {ovProfiles.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* Voice instruction */}
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 block">Voice instruction <span className="text-slate-700 normal-case font-normal">(tùy chọn: "warm", "sad", "excited"...)</span></label>
+                      <input value={ovInstruct} onChange={e => setOvInstruct(e.target.value)}
+                        placeholder='Ví dụ: warm and friendly, slow pace...'
+                        className="w-full bg-slate-800/60 border border-slate-700/60 rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-rose-500/40"/>
+                    </div>
+
+                    {/* Advanced controls */}
+                    <div className="bg-slate-900/40 border border-slate-800/60 rounded-xl p-3">
+                      <p className="text-[9px] font-bold text-slate-600 uppercase tracking-wider mb-3">Cài đặt nâng cao</p>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="text-[9px] text-slate-600 mb-1 block">Diffusion Steps: <span className="text-rose-400 font-bold">{ovNumStep}</span></label>
+                          <input type="range" min={4} max={32} step={4} value={ovNumStep} onChange={e => setOvNumStep(+e.target.value)}
+                            className="w-full accent-rose-500 h-1"/>
+                          <div className="flex justify-between text-[8px] text-slate-700 mt-0.5"><span>Nhanh (4)</span><span>Chất (32)</span></div>
+                        </div>
+                        <div>
+                          <label className="text-[9px] text-slate-600 mb-1 block">Guidance Scale: <span className="text-rose-400 font-bold">{ovGuidance.toFixed(1)}</span></label>
+                          <input type="range" min={1} max={5} step={0.5} value={ovGuidance} onChange={e => setOvGuidance(+e.target.value)}
+                            className="w-full accent-rose-500 h-1"/>
+                          <div className="flex justify-between text-[8px] text-slate-700 mt-0.5"><span>Thấp</span><span>Cao</span></div>
+                        </div>
+                        <div>
+                          <label className="text-[9px] text-slate-600 mb-1 block">Tốc độ: <span className="text-rose-400 font-bold">{ovSpeed.toFixed(1)}x</span></label>
+                          <input type="range" min={0.5} max={2} step={0.1} value={ovSpeed} onChange={e => setOvSpeed(+e.target.value)}
+                            className="w-full accent-rose-500 h-1"/>
+                          <div className="flex justify-between text-[8px] text-slate-700 mt-0.5"><span>0.5x</span><span>2.0x</span></div>
+                        </div>
+                        <div>
+                          <label className="text-[9px] text-slate-600 mb-1.5 block">Effect Preset</label>
+                          <select value={ovEffectPreset} onChange={e => setOvEffectPreset(e.target.value)}
+                            className="w-full bg-slate-800 border border-slate-700 text-slate-300 text-[10px] rounded-lg px-2 py-1.5 outline-none">
+                            {OV_PRESETS.map(p => <option key={p} value={p}>{p}</option>)}
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Output folder */}
+                    <div className="flex gap-2">
+                      <div className="flex-1 bg-slate-800/60 border border-slate-700/60 rounded-lg px-2.5 py-2 text-[10px] text-slate-500 truncate">
+                        {ovOutputFolder || 'Thư mục lưu (tùy chọn)...'}
+                      </div>
+                      <button onClick={async () => { const f = await window.electronAPI?.selectFolder?.(); if (f) setOvOutputFolder(f); }}
+                        className="p-2 bg-slate-700/60 hover:bg-slate-600 rounded-lg transition-colors">
+                        <FolderOpen size={13} className="text-slate-400"/>
+                      </button>
+                    </div>
+
+                    {/* Generate button */}
+                    <button onClick={ovGenerate} disabled={ovGenerating || !ovText.trim()}
+                      className="w-full py-3 bg-gradient-to-r from-rose-600 to-violet-600 hover:from-rose-500 hover:to-violet-500 disabled:from-slate-700 disabled:to-slate-700 disabled:text-slate-500 text-white text-sm font-bold rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg shadow-rose-900/20">
+                      {ovGenerating ? <><Loader2 size={14} className="animate-spin"/> Đang tạo giọng...</>
+                                    : <><Volume2 size={14}/> ▶ Tạo giọng nói</>}
+                    </button>
+
+                    {/* Audio player */}
+                    {ovAudioUrl && (
+                      <div className="bg-slate-900/60 border border-rose-700/20 rounded-xl p-4 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-bold text-rose-300">✅ Tạo xong{ovAudioDur ? ` · ${ovAudioDur}` : ''}</span>
+                          <div className="flex gap-2">
+                            <button onClick={ovSaveAudio} disabled={ovSaving}
+                              className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-[10px] text-slate-300 transition-colors">
+                              <Download size={11}/> {ovSaving ? 'Đang lưu...' : 'Lưu WAV'}
+                            </button>
+                          </div>
+                        </div>
+                        <audio ref={ovAudioRef} src={ovAudioUrl} controls autoPlay
+                          className="w-full h-9 rounded-lg" style={{ colorScheme: 'dark' }}/>
+                      </div>
+                    )}
+                  </>)}
+
+                  {/* ── SECTION: Clone ────────────────────────────────────── */}
+                  {ovSection === 'clone' && (<>
+                    <div className="flex items-center gap-3 mb-1">
+                      <div className="w-8 h-8 bg-violet-500/10 rounded-lg flex items-center justify-center"><span className="text-base">🧬</span></div>
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-200">Clone giọng nói</h3>
+                        <p className="text-[10px] text-slate-600">Upload 3 giây audio tham chiếu → tạo hồ sơ giọng riêng</p>
+                      </div>
+                    </div>
+
+                    {/* Profile name */}
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 block">Tên hồ sơ giọng <span className="text-rose-400">*</span></label>
+                      <input value={ovProfName} onChange={e => setOvProfName(e.target.value)}
+                        placeholder="Ví dụ: Giọng Nam, Giọng Thuyết minh..."
+                        className="w-full bg-slate-800/60 border border-slate-700/60 rounded-lg px-3 py-2 text-sm text-slate-300 focus:outline-none focus:border-violet-500/50"/>
+                    </div>
+
+                    {/* Reference audio upload */}
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 block">Audio tham chiếu <span className="text-rose-400">*</span> <span className="text-slate-700 normal-case font-normal">(WAV/MP3, ≥3 giây)</span></label>
+                      <div onClick={() => { const inp = document.createElement('input'); inp.type='file'; inp.accept='audio/*'; inp.onchange=e=>{ const f=e.target.files[0]; if(f){ setOvRefFile(f); setOvRefFileName(f.name); }}; inp.click(); }}
+                        className="w-full border-2 border-dashed border-slate-700 hover:border-violet-500/60 rounded-xl p-5 flex flex-col items-center gap-2 cursor-pointer transition-all bg-slate-900/30 hover:bg-violet-900/10">
+                        <FileAudio size={24} className={ovRefFile ? 'text-violet-400' : 'text-slate-600'}/>
+                        <span className="text-xs text-slate-500">{ovRefFileName || 'Click để chọn file audio'}</span>
+                        {ovRefFile && <span className="text-[10px] text-emerald-400">✓ Đã chọn</span>}
+                      </div>
+                    </div>
+
+                    {/* Reference text */}
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 block">Văn bản trong audio <span className="text-slate-700 normal-case font-normal">(tùy chọn, giúp cloning chính xác hơn)</span></label>
+                      <textarea value={ovRefText} onChange={e => setOvRefText(e.target.value)} rows={2}
+                        placeholder="Nội dung của đoạn audio tham chiếu..."
+                        className="w-full bg-slate-800/60 border border-slate-700/60 rounded-lg px-3 py-2 text-xs text-slate-300 resize-none focus:outline-none"/>
+                    </div>
+
+                    {/* Voice instruction */}
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 block">Voice instruction <span className="text-slate-700 normal-case font-normal">(tùy chọn)</span></label>
+                      <input value={ovProfInstruct} onChange={e => setOvProfInstruct(e.target.value)}
+                        placeholder='Ví dụ: deep voice, slow pace, warm tone...'
+                        className="w-full bg-slate-800/60 border border-slate-700/60 rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none"/>
+                    </div>
+
+                    {/* Language */}
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 block">Ngôn ngữ chính</label>
+                      <select value={ovProfLang} onChange={e => setOvProfLang(e.target.value)}
+                        className="w-full bg-slate-800 border border-slate-700 text-slate-300 text-xs rounded-lg px-2.5 py-2 outline-none">
+                        {OV_LANGS.map(l => <option key={l.v} value={l.v}>{l.l}</option>)}
+                      </select>
+                    </div>
+
+                    <button onClick={ovCreateProfile} disabled={ovCreatingProf || !ovProfName.trim() || !ovRefFile}
+                      className="w-full py-3 bg-gradient-to-r from-violet-600 to-rose-600 hover:from-violet-500 hover:to-rose-500 disabled:from-slate-700 disabled:to-slate-700 disabled:text-slate-500 text-white text-sm font-bold rounded-xl flex items-center justify-center gap-2 transition-all">
+                      {ovCreatingProf ? <><Loader2 size={14} className="animate-spin"/> Đang tạo hồ sơ...</>
+                                      : <><Plus size={14}/> Tạo hồ sơ giọng</>}
+                    </button>
+                  </>)}
+
+                  {/* ── SECTION: Profiles ─────────────────────────────────── */}
+                  {ovSection === 'profiles' && (<>
+                    <div className="flex items-center justify-between mb-1">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 bg-emerald-500/10 rounded-lg flex items-center justify-center"><span className="text-base">👤</span></div>
+                        <div>
+                          <h3 className="text-sm font-bold text-slate-200">Hồ sơ giọng nói</h3>
+                          <p className="text-[10px] text-slate-600">{ovProfiles.length} hồ sơ đã lưu</p>
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        <button onClick={ovLoadProfiles} className="p-1.5 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors">
+                          <RefreshCw size={12} className="text-slate-400"/>
+                        </button>
+                        <button onClick={() => setOvSection('clone')}
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-700 hover:bg-violet-600 text-white text-[10px] font-bold rounded-lg transition-colors">
+                          <Plus size={11}/> Thêm mới
+                        </button>
+                      </div>
+                    </div>
+                    {ovProfiles.length === 0 ? (
+                      <div className="flex flex-col items-center py-12 text-slate-700 gap-3">
+                        <User size={32} className="opacity-30"/>
+                        <p className="text-sm">Chưa có hồ sơ nào</p>
+                        <button onClick={() => setOvSection('clone')}
+                          className="text-xs text-violet-400 hover:text-violet-300">+ Tạo hồ sơ đầu tiên</button>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {ovProfiles.map(p => (
+                          <div key={p.id} className={`flex items-center gap-3 p-3 rounded-xl border transition-all ${ovSelectedProfile === p.id ? 'bg-rose-900/10 border-rose-700/30' : 'bg-slate-900/40 border-slate-800/60 hover:border-slate-700'}`}>
+                            <div className="w-10 h-10 rounded-full bg-gradient-to-br from-rose-500 to-violet-600 flex items-center justify-center text-sm font-bold text-white shrink-0">
+                              {p.name?.[0]?.toUpperCase() || '?'}
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs font-bold text-slate-200 truncate">{p.name}</p>
+                              <p className="text-[9px] text-slate-600">
+                                {p.kind || 'clone'} · {p.language || 'Auto'}{p.instruct ? ` · "${p.instruct}"` : ''}
+                              </p>
+                            </div>
+                            <div className="flex gap-1.5 shrink-0">
+                              <button onClick={() => { setOvSelectedProfile(p.id); setOvSection('generate'); }}
+                                className="px-2.5 py-1 bg-rose-700/30 hover:bg-rose-600/40 text-rose-300 text-[10px] font-bold rounded-lg transition-colors">
+                                Dùng
+                              </button>
+                              <button onClick={() => ovDeleteProfile(p.id, p.name)}
+                                className="p-1 hover:bg-red-900/30 rounded-lg text-slate-600 hover:text-red-400 transition-colors">
+                                <Trash2 size={12}/>
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>)}
+
+                  {/* ── SECTION: History ──────────────────────────────────── */}
+                  {ovSection === 'history' && (<>
+                    <div className="flex items-center justify-between mb-1">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 bg-blue-500/10 rounded-lg flex items-center justify-center"><span className="text-base">📜</span></div>
+                        <div>
+                          <h3 className="text-sm font-bold text-slate-200">Lịch sử tạo giọng</h3>
+                          <p className="text-[10px] text-slate-600">{ovHistory.length} bản ghi gần nhất</p>
+                        </div>
+                      </div>
+                      <button onClick={async () => { const h = await (await ovFetch('/history')).json(); setOvHistory((h?.history||h||[]).slice(0,30)); }}
+                        className="p-1.5 bg-slate-700 hover:bg-slate-600 rounded-lg">
+                        <RefreshCw size={12} className="text-slate-400"/>
+                      </button>
+                    </div>
+                    {ovHistory.length === 0 ? (
+                      <div className="flex flex-col items-center py-12 text-slate-700 gap-2">
+                        <History size={32} className="opacity-30"/>
+                        <p className="text-sm">Chưa có lịch sử nào</p>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {ovHistory.map((h, i) => (
+                          <div key={h.id || i} className="bg-slate-900/40 border border-slate-800/60 rounded-xl p-3 space-y-1.5">
+                            <p className="text-xs text-slate-300 line-clamp-2">{h.text || h.input_text || '—'}</p>
+                            <div className="flex items-center gap-3 text-[9px] text-slate-600">
+                              <span>{h.language || 'Auto'}</span>
+                              {h.profile_id && <span>· {h.profile_id.slice(0,8)}...</span>}
+                              {h.duration_sec && <span>· {(+h.duration_sec).toFixed(1)}s</span>}
+                              {h.created_at && <span className="ml-auto">{new Date(h.created_at * 1000).toLocaleString('vi')}</span>}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>)}
+
+                </div>{/* end main content */}
+              </div>/* end connected layout */
+              )}
+            </div>/* end omnivoice tab */
+            )}
+            {/* END TAB: OMNI VOICE */}
+
         </div>
     );
 }

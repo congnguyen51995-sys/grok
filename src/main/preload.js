@@ -102,4 +102,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onUpdateProgress:      (cb) => ipcRenderer.on('update:progress',       (_e, data) => cb(data)),
   onUpdateDownloaded:    (cb) => ipcRenderer.on('update:downloaded',     (_e, data) => cb(data)),
   onUpdateDownloadError: (cb) => ipcRenderer.on('update:download-error', (_e, data) => cb(data)),
+  // ── OMNIVOICE BACKEND ─────────────────────────────────────────────────────
+  omniVoiceStart:    (opts) => ipcRenderer.invoke('omnivoice:start', opts || {}),
+  omniVoiceStop:     ()     => ipcRenderer.invoke('omnivoice:stop'),
+  omniVoiceStatus:   ()     => ipcRenderer.invoke('omnivoice:status'),
+  omniVoiceGetDir:   ()     => ipcRenderer.invoke('omnivoice:get-dir'),
+  omniVoiceSetDir:   (dir)  => ipcRenderer.invoke('omnivoice:set-dir', dir),
+  omniVoiceSelectDir:()     => ipcRenderer.invoke('omnivoice:select-dir'),
+  onOmniVoiceLog:    (cb)   => ipcRenderer.on('omnivoice-log', (_e, d) => cb(d)),
 });

@@ -218,7 +218,11 @@ let mainWindow = null;
 let db = null;
 let queueManager = null;
 let playwrightEngine = null;
-let profilesBaseDir = null;   
+let profilesBaseDir = null;
+
+// ── OMNIVOICE BACKEND PROCESS ─────────────────────────────────────────────────
+let omniVoiceProc     = null;
+let omniVoiceStarting = false;
 
 if (protocol && protocol.registerSchemesAsPrivileged) {
   protocol.registerSchemesAsPrivileged([{ scheme: 'local', privileges: { secure: true, standard: true, supportFetchAPI: true, bypassCSP: true } }]);
@@ -1064,6 +1068,106 @@ function setupIpcHandlers() {
       return { success: true, outputPath };
     } catch (e) { return { success: false, error: e.message }; }
   });
+
+  // ── OMNIVOICE BACKEND AUTO-START ───────────────────────────────────────────
+  const sendOvLog = (text, type = 'info') => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('omnivoice-log', { time: new Date().toLocaleTimeString(), text, type });
+    }
+  };
+
+  ipcMain.handle('omnivoice:start', async (event, opts = {}) => {
+    // Already running? Return immediately
+    if (omniVoiceProc && !omniVoiceProc.killed) {
+      return { success: true, alreadyRunning: true, pid: omniVoiceProc.pid };
+    }
+    const backendDir = opts.path || (db ? await db.getSetting('omnivoiceDir', 'D:\\Creator\\OmniVoice-Studio-main') : 'D:\\Creator\\OmniVoice-Studio-main');
+    if (!fs.existsSync(backendDir)) {
+      return { success: false, error: `Không tìm thấy thư mục OmniVoice: ${backendDir}` };
+    }
+    sendOvLog(`🚀 Đang khởi động OmniVoice...`, 'info');
+    sendOvLog(`📁 Thư mục: ${backendDir}`, 'info');
+    omniVoiceStarting = true;
+    try {
+      omniVoiceProc = spawn('uv', ['run', 'python', '-m', 'backend'], {
+        cwd: backendDir,
+        shell: true,
+        windowsHide: true,
+        detached: false,
+        env: { ...process.env }
+      });
+      omniVoiceProc.stdout.on('data', d => {
+        const t = d.toString().trim();
+        if (t) sendOvLog(t, 'info');
+      });
+      omniVoiceProc.stderr.on('data', d => {
+        const t = d.toString().trim();
+        // Uvicorn logs to stderr — most are INFO, not errors
+        if (t) {
+          const type = t.toLowerCase().includes('error') ? 'error' : 'info';
+          sendOvLog(t, type);
+        }
+      });
+      omniVoiceProc.on('close', code => {
+        omniVoiceStarting = false;
+        omniVoiceProc = null;
+        if (code !== 0 && code !== null) {
+          sendOvLog(`⚠️ OmniVoice đã dừng (exit ${code})`, 'warn');
+        }
+      });
+      omniVoiceProc.on('error', err => {
+        omniVoiceStarting = false;
+        omniVoiceProc = null;
+        const hint = err.code === 'ENOENT'
+          ? ' — Hãy cài uv: https://docs.astral.sh/uv/'
+          : '';
+        sendOvLog(`❌ Lỗi khởi động: ${err.message}${hint}`, 'error');
+      });
+      return { success: true, pid: omniVoiceProc.pid };
+    } catch (e) {
+      omniVoiceStarting = false;
+      return { success: false, error: e.message };
+    }
+  });
+
+  ipcMain.handle('omnivoice:stop', () => {
+    if (omniVoiceProc && !omniVoiceProc.killed) {
+      try { omniVoiceProc.kill('SIGTERM'); } catch (_) { try { omniVoiceProc.kill(); } catch (_2) {} }
+      omniVoiceProc = null;
+      omniVoiceStarting = false;
+      sendOvLog('🛑 OmniVoice đã được dừng thủ công', 'warn');
+      return { success: true };
+    }
+    return { success: false, error: 'Không có process đang chạy' };
+  });
+
+  ipcMain.handle('omnivoice:status', () => ({
+    running:  !!(omniVoiceProc && !omniVoiceProc.killed),
+    starting: omniVoiceStarting,
+    pid:      omniVoiceProc?.pid || null
+  }));
+
+  ipcMain.handle('omnivoice:get-dir', async () =>
+    db ? await db.getSetting('omnivoiceDir', 'D:\\Creator\\OmniVoice-Studio-main') : 'D:\\Creator\\OmniVoice-Studio-main'
+  );
+
+  ipcMain.handle('omnivoice:set-dir', async (event, dir) => {
+    if (db) await db.setSetting('omnivoiceDir', dir);
+    return { success: true };
+  });
+
+  ipcMain.handle('omnivoice:select-dir', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openDirectory'],
+      title: 'Chọn thư mục OmniVoice-Studio'
+    });
+    if (!result.canceled && result.filePaths.length > 0) {
+      const dir = result.filePaths[0];
+      if (db) await db.setSetting('omnivoiceDir', dir);
+      return { success: true, dir };
+    }
+    return { success: false };
+  });
 }
 
 function setupProtocol() {
@@ -1086,7 +1190,14 @@ app.whenReady().then(async () => {
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('before-quit', async () => { if (queueManager) await queueManager.stop(); if (db) db.close(); });
+app.on('before-quit', async () => {
+  if (omniVoiceProc && !omniVoiceProc.killed) {
+    try { omniVoiceProc.kill(); } catch (_) {}
+    omniVoiceProc = null;
+  }
+  if (queueManager) await queueManager.stop();
+  if (db) db.close();
+});
 process.on('uncaughtException', (error) => console.error(error));
 process.on('unhandledRejection', (reason) => console.error(reason));
 

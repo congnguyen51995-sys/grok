@@ -177,7 +177,13 @@ export default function VoiceStudio({ dark = true }) {
     const [ovRefFileName,      setOvRefFileName]      = useState('');
     const [ovCreatingProf,     setOvCreatingProf]     = useState(false);
     const [ovSaving,           setOvSaving]           = useState(false);
-    const ovAudioRef = useRef(null);
+    // Batch import state
+    const [ovImporting,        setOvImporting]        = useState(false);
+    const [ovImportDone,       setOvImportDone]       = useState(0);
+    const [ovImportTotal,      setOvImportTotal]      = useState(0);
+    const [ovImportErrors,     setOvImportErrors]     = useState([]);
+    const ovAudioRef       = useRef(null);
+    const ovBatchInputRef  = useRef(null);
 
     const OV_LANGS = [
         { v: '',    l: '🌐 Auto (tự động)' },
@@ -377,6 +383,40 @@ export default function VoiceStudio({ dark = true }) {
             setOvSection('generate');
         } catch (e) { alert('Lỗi tạo hồ sơ: ' + e.message); }
         finally { setOvCreatingProf(false); }
+    };
+
+    // Batch-import: nhận array File, tạo profile cho từng file
+    const ovBatchImport = async (files) => {
+        if (!files?.length) return;
+        const audioFiles = Array.from(files).filter(f =>
+            /\.(wav|mp3|m4a|flac|ogg|aac|opus|wma)$/i.test(f.name)
+        );
+        if (!audioFiles.length) return alert('Không tìm thấy file audio nào!');
+        setOvImporting(true);
+        setOvImportDone(0);
+        setOvImportTotal(audioFiles.length);
+        setOvImportErrors([]);
+        let done = 0;
+        const errs = [];
+        for (const file of audioFiles) {
+            try {
+                const name = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
+                const fd = new FormData();
+                fd.append('name', name || file.name);
+                fd.append('ref_audio', file);
+                const r = await fetch(`${OV_BASE}/profiles`, { method: 'POST', body: fd });
+                if (!r.ok) throw new Error(`${r.status}`);
+            } catch (e) {
+                errs.push(file.name + ': ' + e.message);
+            }
+            done++;
+            setOvImportDone(done);
+        }
+        setOvImportErrors(errs);
+        setOvImporting(false);
+        await ovLoadProfiles();
+        // Reset file input
+        if (ovBatchInputRef.current) ovBatchInputRef.current.value = '';
     };
 
     const ovDeleteProfile = async (id, name) => {
@@ -2281,12 +2321,19 @@ export default function VoiceStudio({ dark = true }) {
 
                   {/* ── SECTION: Clone ────────────────────────────────────── */}
                   {ovSection === 'clone' && (<>
-                    <div className="flex items-center gap-3 mb-1">
-                      <div className="w-8 h-8 bg-violet-500/10 rounded-lg flex items-center justify-center"><span className="text-base">🧬</span></div>
-                      <div>
-                        <h3 className="text-sm font-bold text-slate-200">Clone giọng nói</h3>
-                        <p className="text-[10px] text-slate-600">Upload 3 giây audio tham chiếu → tạo hồ sơ giọng riêng</p>
+                    <div className="flex items-center justify-between mb-1">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 bg-violet-500/10 rounded-lg flex items-center justify-center"><span className="text-base">🧬</span></div>
+                        <div>
+                          <h3 className="text-sm font-bold text-slate-200">Clone giọng nói</h3>
+                          <p className="text-[10px] text-slate-600">Upload 3 giây audio tham chiếu → tạo hồ sơ</p>
+                        </div>
                       </div>
+                      <button onClick={() => ovBatchInputRef.current?.click()} disabled={ovImporting}
+                        title="Nhập nhiều file cùng lúc"
+                        className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-800/60 hover:bg-emerald-700 disabled:opacity-50 text-emerald-300 text-[10px] font-bold rounded-lg transition-colors border border-emerald-700/40">
+                        <Download size={10}/> Nhập nhiều
+                      </button>
                     </div>
 
                     {/* Profile name */}
@@ -2342,6 +2389,12 @@ export default function VoiceStudio({ dark = true }) {
 
                   {/* ── SECTION: Profiles ─────────────────────────────────── */}
                   {ovSection === 'profiles' && (<>
+                    {/* Hidden multi-file input */}
+                    <input ref={ovBatchInputRef} type="file" multiple
+                      accept=".wav,.mp3,.m4a,.flac,.ogg,.aac,.opus,.wma"
+                      className="hidden"
+                      onChange={e => ovBatchImport(Array.from(e.target.files || []))}/>
+
                     <div className="flex items-center justify-between mb-1">
                       <div className="flex items-center gap-3">
                         <div className="w-8 h-8 bg-emerald-500/10 rounded-lg flex items-center justify-center"><span className="text-base">👤</span></div>
@@ -2351,21 +2404,58 @@ export default function VoiceStudio({ dark = true }) {
                         </div>
                       </div>
                       <div className="flex gap-2">
-                        <button onClick={ovLoadProfiles} className="p-1.5 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors">
+                        <button onClick={ovLoadProfiles} className="p-1.5 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors" title="Tải lại">
                           <RefreshCw size={12} className="text-slate-400"/>
+                        </button>
+                        <button onClick={() => ovBatchInputRef.current?.click()} disabled={ovImporting}
+                          title="Chọn nhiều file audio → tự tạo hồ sơ"
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:bg-slate-700 disabled:text-slate-500 text-white text-[10px] font-bold rounded-lg transition-colors">
+                          <Download size={11}/> Nhập nhiều
                         </button>
                         <button onClick={() => setOvSection('clone')}
                           className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-700 hover:bg-violet-600 text-white text-[10px] font-bold rounded-lg transition-colors">
-                          <Plus size={11}/> Thêm mới
+                          <Plus size={11}/> Thêm 1
                         </button>
                       </div>
                     </div>
+
+                    {/* Batch import progress */}
+                    {ovImporting && (
+                      <div className="mb-3 bg-emerald-900/20 border border-emerald-700/30 rounded-xl p-3">
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="text-[10px] font-bold text-emerald-400">Đang nhập giọng...</span>
+                          <span className="text-[10px] text-slate-400">{ovImportDone}/{ovImportTotal}</span>
+                        </div>
+                        <div className="w-full bg-slate-800 rounded-full h-1.5">
+                          <div className="bg-emerald-500 h-1.5 rounded-full transition-all"
+                            style={{ width: `${ovImportTotal ? (ovImportDone/ovImportTotal)*100 : 0}%` }}/>
+                        </div>
+                      </div>
+                    )}
+                    {!ovImporting && ovImportErrors.length > 0 && (
+                      <div className="mb-3 bg-red-900/20 border border-red-700/30 rounded-xl p-2.5">
+                        <p className="text-[10px] text-red-400 font-bold mb-1">Lỗi {ovImportErrors.length} file:</p>
+                        {ovImportErrors.slice(0,3).map((e,i) => (
+                          <p key={i} className="text-[9px] text-slate-500 truncate">{e}</p>
+                        ))}
+                      </div>
+                    )}
+
                     {ovProfiles.length === 0 ? (
-                      <div className="flex flex-col items-center py-12 text-slate-700 gap-3">
+                      <div className="flex flex-col items-center py-10 text-slate-700 gap-3">
                         <User size={32} className="opacity-30"/>
                         <p className="text-sm">Chưa có hồ sơ nào</p>
-                        <button onClick={() => setOvSection('clone')}
-                          className="text-xs text-violet-400 hover:text-violet-300">+ Tạo hồ sơ đầu tiên</button>
+                        <p className="text-[10px] text-slate-600 text-center px-4">Bấm <span className="text-emerald-400 font-bold">Nhập nhiều</span> để chọn nhiều file audio cùng lúc, hoặc <span className="text-violet-400 font-bold">Thêm 1</span> để tạo từng giọng</p>
+                        <div className="flex gap-2 mt-1">
+                          <button onClick={() => ovBatchInputRef.current?.click()}
+                            className="flex items-center gap-1.5 px-4 py-2 bg-emerald-700 hover:bg-emerald-600 text-white text-[11px] font-bold rounded-xl transition-colors">
+                            <Download size={12}/> Nhập từ file
+                          </button>
+                          <button onClick={() => setOvSection('clone')}
+                            className="flex items-center gap-1.5 px-4 py-2 bg-violet-700 hover:bg-violet-600 text-white text-[11px] font-bold rounded-xl transition-colors">
+                            <Plus size={12}/> Tạo thủ công
+                          </button>
+                        </div>
                       </div>
                     ) : (
                       <div className="space-y-2">

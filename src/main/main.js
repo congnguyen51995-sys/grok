@@ -1135,21 +1135,66 @@ function setupIpcHandlers() {
     return null;
   }
 
+  // Đọc pyvenv.cfg để lấy đường dẫn Python gốc (bỏ qua uv shim)
+  function readVenvHomePython(venvDir) {
+    try {
+      const cfgPath = path.join(venvDir, 'pyvenv.cfg');
+      if (!fs.existsSync(cfgPath)) return null;
+      const cfg = fs.readFileSync(cfgPath, 'utf8');
+      const homeMatch = cfg.match(/^home\s*=\s*(.+)$/im);
+      if (!homeMatch) return null;
+      const home = homeMatch[1].trim();
+      const candidates = [
+        path.join(home, 'python.exe'),  // Windows
+        path.join(home, 'python3'),     // Mac/Linux
+        path.join(home, 'python'),      // Linux
+      ];
+      for (const p of candidates) {
+        if (fs.existsSync(p)) return p;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   // Chọn lệnh khởi động: ưu tiên .venv Python (không cần uv), fallback sang uv
   function resolveStartCommand(backendDir) {
     const mainScript = path.join(backendDir, 'backend', 'main.py');
+    const venvDir    = path.join(backendDir, '.venv');
 
-    // 1. Thử .venv Python trực tiếp (đã uv sync → .venv tồn tại)
-    const venvWin  = path.join(backendDir, '.venv', 'Scripts', 'python.exe');
-    const venvUnix = path.join(backendDir, '.venv', 'bin',     'python');
-    if (fs.existsSync(venvWin))  return { cmd: venvWin,  args: [mainScript], method: 'venv-win' };
-    if (fs.existsSync(venvUnix)) return { cmd: venvUnix, args: [mainScript], method: 'venv-unix' };
+    // 1. .venv tồn tại — dùng Python gốc từ pyvenv.cfg (bỏ qua uv shim hoàn toàn)
+    if (fs.existsSync(venvDir)) {
+      const homePy = readVenvHomePython(venvDir);
+      if (homePy) {
+        // Cần set VIRTUAL_ENV + PATH để Python nhận site-packages của venv
+        const venvScripts = path.join(venvDir, 'Scripts');     // Windows
+        const venvBin     = path.join(venvDir, 'bin');          // Unix
+        const scriptsDir  = fs.existsSync(venvScripts) ? venvScripts : venvBin;
+        const siteWin     = path.join(venvDir, 'Lib',  'site-packages');
+        const siteUnix    = path.join(venvDir, 'lib',  `python${process.version.replace(/^v/, '').split('.')[0]}`, 'site-packages');
+        const sitePackages = fs.existsSync(siteWin) ? siteWin : siteUnix;
+        return {
+          cmd: homePy,
+          args: [mainScript],
+          method: 'pyvenv-home',
+          extraEnv: {
+            VIRTUAL_ENV: venvDir,
+            PYTHONPATH: sitePackages,
+            PATH: scriptsDir + path.delimiter + (process.env.PATH || ''),
+          }
+        };
+      }
+      // Fallback: thử shim trực tiếp (nếu venv tạo bằng system Python thì shim OK)
+      const venvWin  = path.join(venvDir, 'Scripts', 'python.exe');
+      const venvUnix = path.join(venvDir, 'bin', 'python');
+      if (fs.existsSync(venvWin))  return { cmd: venvWin,  args: [mainScript], method: 'venv-shim-win' };
+      if (fs.existsSync(venvUnix)) return { cmd: venvUnix, args: [mainScript], method: 'venv-shim-unix' };
+    }
 
     // 2. Tìm uv ở các đường dẫn phổ biến
     const uvPath = findUvExecutable();
     if (uvPath) return { cmd: uvPath, args: ['run', 'python', mainScript], method: 'uv-found' };
 
-    // 3. Fallback: thử gọi 'uv' qua shell (hy vọng PATH có sẵn)
+    // 3. Fallback: thử gọi 'uv' qua shell
     return { cmd: 'uv', args: ['run', 'python', mainScript], method: 'uv-shell' };
   }
 
@@ -1167,11 +1212,13 @@ function setupIpcHandlers() {
       };
     }
 
-    const { cmd, args, method } = resolveStartCommand(backendDir);
+    const { cmd, args, method, extraEnv = {} } = resolveStartCommand(backendDir);
     sendOvLog(`🚀 Đang khởi động OmniVoice...`, 'info');
     sendOvLog(`📁 Thư mục: ${backendDir}`, 'info');
-    if (method === 'venv-win' || method === 'venv-unix') {
-      sendOvLog(`🐍 Dùng .venv Python trực tiếp (${path.basename(cmd)})`, 'info');
+    if (method === 'pyvenv-home') {
+      sendOvLog(`🐍 Python: ${path.basename(path.dirname(cmd))} (pyvenv.cfg home)`, 'info');
+    } else if (method.startsWith('venv-shim')) {
+      sendOvLog(`🐍 Dùng .venv shim Python`, 'info');
     } else if (method === 'uv-found') {
       sendOvLog(`⚡ Tìm thấy uv: ${cmd}`, 'info');
     } else {
@@ -1182,10 +1229,10 @@ function setupIpcHandlers() {
     try {
       omniVoiceProc = spawn(cmd, args, {
         cwd: backendDir,
-        shell: method === 'uv-shell', // chỉ dùng shell khi không tìm thấy path trực tiếp
+        shell: method === 'uv-shell',
         windowsHide: true,
         detached: false,
-        env: { ...process.env }
+        env: { ...process.env, ...extraEnv }
       });
       omniVoiceProc.stdout.on('data', d => {
         const t = d.toString().trim();

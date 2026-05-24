@@ -143,7 +143,7 @@ export default function VoiceStudio({ dark = true }) {
     // =========================================================================
     // ===  OMNI VOICE STATE  ==================================================
     // =========================================================================
-    const OV_BASE = 'http://localhost:8000';
+    const OV_BASE = 'http://localhost:3900';
     const [ovConnected,        setOvConnected]        = useState(false);
     const [ovConnecting,       setOvConnecting]       = useState(false);
     const [ovStarting,         setOvStarting]         = useState(false);   // backend đang khởi động
@@ -208,15 +208,17 @@ export default function VoiceStudio({ dark = true }) {
     const ovCheckConnection = async () => {
         setOvConnecting(true);
         try {
-            await ovFetch('/model/status');
+            await ovFetch('/health');
             setOvConnected(true);
             setOvStartError('');
             // Load profiles + engine info after connect
-            const [pr, er] = await Promise.all([ovFetch('/profiles'), ovFetch('/engines/tts')]);
-            const profiles = await pr.json();
-            const engines  = await er.json();
-            setOvProfiles(profiles?.profiles || profiles || []);
-            setOvEngineActive(engines?.active || '');
+            try {
+                const [pr, er] = await Promise.all([ovFetch('/profiles'), ovFetch('/engines/tts')]);
+                const profiles = await pr.json();
+                const engines  = await er.json();
+                setOvProfiles(profiles?.profiles || profiles || []);
+                setOvEngineActive(engines?.active || '');
+            } catch {}
             try {
                 const hist = await (await ovFetch('/history')).json();
                 setOvHistory((hist?.history || hist || []).slice(0, 30));
@@ -246,13 +248,15 @@ export default function VoiceStudio({ dark = true }) {
 
         // Thử kết nối trực tiếp (backend có thể đang chạy sẵn)
         try {
-            await ovFetch('/model/status');
+            await ovFetch('/health');
             // Đang chạy rồi!
             setOvConnected(true);
             setOvStarting(false);
-            const [pr, er] = await Promise.all([ovFetch('/profiles'), ovFetch('/engines/tts')]);
-            setOvProfiles((await pr.json())?.profiles || []);
-            setOvEngineActive((await er.json())?.active || '');
+            try {
+                const [pr, er] = await Promise.all([ovFetch('/profiles'), ovFetch('/engines/tts')]);
+                setOvProfiles((await pr.json())?.profiles || []);
+                setOvEngineActive((await er.json())?.active || '');
+            } catch {}
             return;
         } catch {}
 
@@ -271,7 +275,7 @@ export default function VoiceStudio({ dark = true }) {
         ovPollRef.current = setInterval(async () => {
             attempts++;
             try {
-                await ovFetch('/model/status');
+                await ovFetch('/health');
                 clearInterval(ovPollRef.current);
                 ovPollRef.current = null;
                 setOvConnected(true);

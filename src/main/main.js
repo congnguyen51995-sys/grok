@@ -1137,18 +1137,20 @@ function setupIpcHandlers() {
 
   // Chọn lệnh khởi động: ưu tiên .venv Python (không cần uv), fallback sang uv
   function resolveStartCommand(backendDir) {
+    const mainScript = path.join(backendDir, 'backend', 'main.py');
+
     // 1. Thử .venv Python trực tiếp (đã uv sync → .venv tồn tại)
     const venvWin  = path.join(backendDir, '.venv', 'Scripts', 'python.exe');
     const venvUnix = path.join(backendDir, '.venv', 'bin',     'python');
-    if (fs.existsSync(venvWin))  return { cmd: venvWin,  args: ['-m', 'backend'], method: 'venv-win' };
-    if (fs.existsSync(venvUnix)) return { cmd: venvUnix, args: ['-m', 'backend'], method: 'venv-unix' };
+    if (fs.existsSync(venvWin))  return { cmd: venvWin,  args: [mainScript], method: 'venv-win' };
+    if (fs.existsSync(venvUnix)) return { cmd: venvUnix, args: [mainScript], method: 'venv-unix' };
 
     // 2. Tìm uv ở các đường dẫn phổ biến
     const uvPath = findUvExecutable();
-    if (uvPath) return { cmd: uvPath, args: ['run', 'python', '-m', 'backend'], method: 'uv-found' };
+    if (uvPath) return { cmd: uvPath, args: ['run', 'python', mainScript], method: 'uv-found' };
 
     // 3. Fallback: thử gọi 'uv' qua shell (hy vọng PATH có sẵn)
-    return { cmd: 'uv', args: ['run', 'python', '-m', 'backend'], method: 'uv-shell' };
+    return { cmd: 'uv', args: ['run', 'python', mainScript], method: 'uv-shell' };
   }
 
   ipcMain.handle('omnivoice:start', async (event, opts = {}) => {

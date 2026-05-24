@@ -1076,22 +1076,91 @@ function setupIpcHandlers() {
     }
   };
 
+  // Đường dẫn mặc định: trong thư mục tool (cạnh file exe hoặc trong app folder dev)
+  function getDefaultOvDir() {
+    if (app.isPackaged) {
+      // Packaged: cạnh file exe, thư mục OmniVoice-Studio-main
+      return path.join(path.dirname(app.getPath('exe')), 'OmniVoice-Studio-main');
+    }
+    // Dev mode: trong project grok folder
+    return path.join(app.getAppPath(), 'OmniVoice-Studio-main');
+  }
+
+  // Tìm uv ở các vị trí cài đặt phổ biến trên Windows/Mac/Linux
+  function findUvExecutable() {
+    const h = process.env.USERPROFILE || process.env.HOME || '';
+    const candidates = [
+      // Windows — uv installer mới (AppData\Roaming\uv\bin)
+      path.join(process.env.APPDATA  || '', 'uv', 'bin', 'uv.exe'),
+      // Windows — uv installer mới (LocalAppData\uv\bin)
+      path.join(process.env.LOCALAPPDATA || '', 'uv', 'bin', 'uv.exe'),
+      // Windows — ~/.local/bin (pipx / cargo style)
+      path.join(h, '.local', 'bin', 'uv.exe'),
+      // Windows — ~/.cargo/bin (installed via cargo)
+      path.join(h, '.cargo', 'bin', 'uv.exe'),
+      // Linux / macOS — ~/.local/bin
+      path.join(h, '.local', 'bin', 'uv'),
+      // Linux / macOS — ~/.cargo/bin
+      path.join(h, '.cargo', 'bin', 'uv'),
+      // macOS Homebrew (Intel)
+      '/usr/local/bin/uv',
+      // macOS Homebrew (Apple Silicon)
+      '/opt/homebrew/bin/uv',
+      // Linux system-wide
+      '/usr/bin/uv',
+    ].filter(Boolean);
+    for (const p of candidates) {
+      try { if (fs.existsSync(p)) return p; } catch (_) {}
+    }
+    return null; // không tìm thấy
+  }
+
+  // Chọn lệnh khởi động: ưu tiên .venv Python (không cần uv), fallback sang uv
+  function resolveStartCommand(backendDir) {
+    // 1. Thử .venv Python trực tiếp (đã uv sync → .venv tồn tại)
+    const venvWin  = path.join(backendDir, '.venv', 'Scripts', 'python.exe');
+    const venvUnix = path.join(backendDir, '.venv', 'bin',     'python');
+    if (fs.existsSync(venvWin))  return { cmd: venvWin,  args: ['-m', 'backend'], method: 'venv-win' };
+    if (fs.existsSync(venvUnix)) return { cmd: venvUnix, args: ['-m', 'backend'], method: 'venv-unix' };
+
+    // 2. Tìm uv ở các đường dẫn phổ biến
+    const uvPath = findUvExecutable();
+    if (uvPath) return { cmd: uvPath, args: ['run', 'python', '-m', 'backend'], method: 'uv-found' };
+
+    // 3. Fallback: thử gọi 'uv' qua shell (hy vọng PATH có sẵn)
+    return { cmd: 'uv', args: ['run', 'python', '-m', 'backend'], method: 'uv-shell' };
+  }
+
   ipcMain.handle('omnivoice:start', async (event, opts = {}) => {
-    // Already running? Return immediately
     if (omniVoiceProc && !omniVoiceProc.killed) {
       return { success: true, alreadyRunning: true, pid: omniVoiceProc.pid };
     }
-    const backendDir = opts.path || (db ? await db.getSetting('omnivoiceDir', 'D:\\Creator\\OmniVoice-Studio-main') : 'D:\\Creator\\OmniVoice-Studio-main');
+    const defaultDir = getDefaultOvDir();
+    const backendDir = opts.path || (db ? await db.getSetting('omnivoiceDir', defaultDir) : defaultDir);
+
     if (!fs.existsSync(backendDir)) {
-      return { success: false, error: `Không tìm thấy thư mục OmniVoice: ${backendDir}` };
+      return {
+        success: false,
+        error: `Không tìm thấy thư mục OmniVoice:\n${backendDir}\n\nHãy bấm "Đổi đường dẫn" để chọn đúng thư mục OmniVoice-Studio-main.`
+      };
     }
+
+    const { cmd, args, method } = resolveStartCommand(backendDir);
     sendOvLog(`🚀 Đang khởi động OmniVoice...`, 'info');
     sendOvLog(`📁 Thư mục: ${backendDir}`, 'info');
+    if (method === 'venv-win' || method === 'venv-unix') {
+      sendOvLog(`🐍 Dùng .venv Python trực tiếp (${path.basename(cmd)})`, 'info');
+    } else if (method === 'uv-found') {
+      sendOvLog(`⚡ Tìm thấy uv: ${cmd}`, 'info');
+    } else {
+      sendOvLog(`⚡ Thử gọi uv qua PATH...`, 'info');
+    }
+
     omniVoiceStarting = true;
     try {
-      omniVoiceProc = spawn('uv', ['run', 'python', '-m', 'backend'], {
+      omniVoiceProc = spawn(cmd, args, {
         cwd: backendDir,
-        shell: true,
+        shell: method === 'uv-shell', // chỉ dùng shell khi không tìm thấy path trực tiếp
         windowsHide: true,
         detached: false,
         env: { ...process.env }
@@ -1102,9 +1171,9 @@ function setupIpcHandlers() {
       });
       omniVoiceProc.stderr.on('data', d => {
         const t = d.toString().trim();
-        // Uvicorn logs to stderr — most are INFO, not errors
         if (t) {
-          const type = t.toLowerCase().includes('error') ? 'error' : 'info';
+          // Uvicorn/FastAPI log to stderr — đa số là INFO bình thường
+          const type = /\b(error|traceback|exception)\b/i.test(t) ? 'error' : 'info';
           sendOvLog(t, type);
         }
       });
@@ -1118,12 +1187,15 @@ function setupIpcHandlers() {
       omniVoiceProc.on('error', err => {
         omniVoiceStarting = false;
         omniVoiceProc = null;
-        const hint = err.code === 'ENOENT'
-          ? ' — Hãy cài uv: https://docs.astral.sh/uv/'
-          : '';
-        sendOvLog(`❌ Lỗi khởi động: ${err.message}${hint}`, 'error');
+        let hint = '';
+        if (err.code === 'ENOENT') {
+          hint = method.startsWith('venv')
+            ? '\n→ .venv chưa được tạo. Chạy: uv sync trong thư mục OmniVoice'
+            : '\n→ Không tìm thấy uv. Cài tại: https://docs.astral.sh/uv/';
+        }
+        sendOvLog(`❌ ${err.message}${hint}`, 'error');
       });
-      return { success: true, pid: omniVoiceProc.pid };
+      return { success: true, pid: omniVoiceProc.pid, method };
     } catch (e) {
       omniVoiceStarting = false;
       return { success: false, error: e.message };
@@ -1147,9 +1219,10 @@ function setupIpcHandlers() {
     pid:      omniVoiceProc?.pid || null
   }));
 
-  ipcMain.handle('omnivoice:get-dir', async () =>
-    db ? await db.getSetting('omnivoiceDir', 'D:\\Creator\\OmniVoice-Studio-main') : 'D:\\Creator\\OmniVoice-Studio-main'
-  );
+  ipcMain.handle('omnivoice:get-dir', async () => {
+    const defaultDir = getDefaultOvDir();
+    return db ? await db.getSetting('omnivoiceDir', defaultDir) : defaultDir;
+  });
 
   ipcMain.handle('omnivoice:set-dir', async (event, dir) => {
     if (db) await db.setSetting('omnivoiceDir', dir);
@@ -1159,7 +1232,7 @@ function setupIpcHandlers() {
   ipcMain.handle('omnivoice:select-dir', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
       properties: ['openDirectory'],
-      title: 'Chọn thư mục OmniVoice-Studio'
+      title: 'Chọn thư mục OmniVoice-Studio-main'
     });
     if (!result.canceled && result.filePaths.length > 0) {
       const dir = result.filePaths[0];

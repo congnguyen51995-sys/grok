@@ -2099,8 +2099,9 @@ export default function VoiceStudio({ dark = true }) {
                           <RefreshCw size={13}/> Thử lại
                         </button>
                       </div>
-                      <p className="text-[10px] text-slate-700 text-center">
-                        Đảm bảo <code className="text-slate-500">uv</code> đã được cài và thư mục OmniVoice đúng.
+                      <p className="text-[10px] text-slate-600 text-center max-w-xs leading-relaxed">
+                        Tool sẽ tự dùng <code className="text-slate-500">.venv\Scripts\python.exe</code> nếu có.<br/>
+                        Nếu chưa có .venv: chạy <code className="text-slate-500">uv sync</code> trong thư mục OmniVoice một lần.
                       </p>
                     </div>
                   ) : (

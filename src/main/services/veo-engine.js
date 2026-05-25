@@ -546,7 +546,7 @@ class VeoEngine {
 
                             sendLog(`[JOBID:${task.id}] 100% - Đang tải Extend Video...`, 'progress');
 
-                            // Multi-strategy download (silent first 2, Extension là main)
+                            // Multi-strategy download (silent first 2, tRPC direct 3, Extension là fallback)
                             let dlDone = false;
                             const dlStrategies = [
                                 { label: 'aisandbox ?alt=media', silent: true, fn: async () => {
@@ -556,6 +556,12 @@ class VeoEngine {
                                 { label: 'aisandbox :download', silent: true, fn: async () => {
                                     const downloadUrl = `https://aisandbox-pa.googleapis.com/v1/flowMedia/${mediaName4dl}:download`;
                                     return VeoEngine.downloadMedia(downloadUrl, videoFilePath, true);
+                                }},
+                                // tRPC redirect trực tiếp Node.js — KHÔNG cần Chrome Extension
+                                { label: 'tRPC redirect direct', silent: false, fn: async () => {
+                                    const directUrl = await VeoEngine.resolveMediaUrlDirect(mediaName4dl);
+                                    sendLog(`[JOBID:${task.id}] 🔗 tRPC direct → ${directUrl.slice(0, 80)}`, 'info');
+                                    return VeoEngine.downloadMedia(directUrl, videoFilePath, false);
                                 }},
                                 { label: 'Extension chrome.downloads', fn: () => this.downloadViaExtension(mediaName4dl, videoFilePath) },
                             ];
@@ -676,6 +682,11 @@ class VeoEngine {
                 const strategies = [
                     { silent: true,  fn: async () => VeoEngine.downloadMedia(`https://aisandbox-pa.googleapis.com/v1/projects/${pid}/flowMedia/${mName}?alt=media`, videoFilePath, true) },
                     { silent: true,  fn: async () => VeoEngine.downloadMedia(`https://aisandbox-pa.googleapis.com/v1/flowMedia/${mName}:download`, videoFilePath, true) },
+                    // tRPC redirect trực tiếp Node.js — KHÔNG cần Chrome Extension
+                    { silent: false, fn: async () => {
+                        const directUrl = await VeoEngine.resolveMediaUrlDirect(mName);
+                        return VeoEngine.downloadMedia(directUrl, videoFilePath, false);
+                    }},
                     { silent: false, fn: () => this.downloadViaExtension(mName, videoFilePath) },
                 ];
                 for (let si = 0; si < strategies.length && !dlDone; si++) {
@@ -824,8 +835,10 @@ class VeoEngine {
         return new Promise((resolve) => {
             _extensionUploadLock = _extensionUploadLock.then(async () => {
                 sendLog(`[JOBID:${taskId}] Đang upload ${frameName} qua Extension (MAIN world)...`, 'info');
-                global.googleLabsAuth.pendingImageUpload = imgPath;
+                // Reset triggered flag TRƯỚC khi set pendingImageUpload — đảm bảo Extension nhận được lệnh mới
+                global.googleLabsAuth.imageUploadTriggered = false;
                 global.googleLabsAuth.uploadedMediaId = null;
+                global.googleLabsAuth.pendingImageUpload = imgPath;
 
                 let waited = 0;
                 while (!global.googleLabsAuth.uploadedMediaId && waited < 30) {
@@ -835,6 +848,7 @@ class VeoEngine {
 
                 const mediaId = global.googleLabsAuth.uploadedMediaId;
                 global.googleLabsAuth.pendingImageUpload = null;
+                global.googleLabsAuth.imageUploadTriggered = false; // reset sau khi xong
                 global.googleLabsAuth.uploadedMediaId = null;
 
                 if (mediaId && mediaId !== 'FAILED') {
@@ -853,12 +867,14 @@ class VeoEngine {
         // Serialize qua _extensionApiLock — kênh pendingVideoGen/videoGenResult chỉ xử lý 1 request tại 1 lúc
         return new Promise((resolve) => {
             _extensionApiLock = _extensionApiLock.then(async () => {
+                // Reset triggered flag TRƯỚC khi set pendingVideoGen — đảm bảo Extension nhận được lệnh mới
+                global.googleLabsAuth.videoGenTriggered = false;
+                global.googleLabsAuth.videoGenResult = null;
                 global.googleLabsAuth.pendingVideoGen = {
                     url: apiUrl,
                     payload: payload,
                     bearerToken: global.googleLabsAuth.bearerToken
                 };
-                global.googleLabsAuth.videoGenResult = null;
 
                 let waited = 0;
                 while (!global.googleLabsAuth.videoGenResult && waited < timeoutSec) {
@@ -868,6 +884,7 @@ class VeoEngine {
 
                 const result = global.googleLabsAuth.videoGenResult;
                 global.googleLabsAuth.pendingVideoGen = null;
+                global.googleLabsAuth.videoGenTriggered = false; // reset sau khi xong
                 global.googleLabsAuth.videoGenResult = null;
 
                 if (!result) {
@@ -897,6 +914,13 @@ class VeoEngine {
         if (res && res._extError) {
             // Lưu lỗi cuối cùng vào global để caller có thể đọc
             global.googleLabsAuth._lastExtError = res._extError;
+            // Phát hiện lỗi reCAPTCHA từ Extension — throw isRecaptchaExpired để caller tự động retry/reload
+            if (/reCAPTCHA|recaptcha|evaluation.failed|UNUSUAL_ACTIVITY/i.test(String(res._extError))) {
+                sendLog(`[JOBID:${taskId}] ⚠️ Extension: reCAPTCHA bị từ chối (UNUSUAL_ACTIVITY) — tự động F5 và thử lại...`, 'info');
+                const e = new Error('RECAPTCHA_EXPIRED');
+                e.isRecaptchaExpired = true;
+                throw e;
+            }
             return null;
         }
         if (res) {
@@ -1003,10 +1027,11 @@ class VeoEngine {
             _downloadViaExtLock = _downloadViaExtLock.then(() =>
                 new Promise((innerResolve) => { // innerResolve LUÔN được gọi để không block chain
                     const auth = global.googleLabsAuth;
-                    auth.pendingVideoDownload = mediaName;
-                    auth.videoDownloadDone   = false;
-                    auth.videoDownloadError  = null;
-                    auth.videoDownloadPath   = null;
+                    auth.videoDownloadTriggered = false; // reset trước mỗi download mới — tránh cờ cũ block
+                    auth.pendingVideoDownload   = mediaName;
+                    auth.videoDownloadDone      = false;
+                    auth.videoDownloadError     = null;
+                    auth.videoDownloadPath      = null;
 
                     const done = (err, result) => {
                         auth.pendingVideoDownload = null;
@@ -1462,6 +1487,8 @@ class VeoEngine {
                                 // Upload ảnh local qua Extension rồi gen qua Extension (cùng Chrome session)
                                 sendLog(`[JOBID:${task.id}] Uploading ${task.ingredientImages.length} Ingredient image(s)...`, 'info');
                                 for (let iIdx = 0; iIdx < task.ingredientImages.length; iIdx++) {
+                                    const imgPathForLog = task.ingredientImages[iIdx]?.split(/[\\/]/).pop() || '?';
+                                    sendLog(`[JOBID:${task.id}] → Ingredient ${iIdx + 1}: ${imgPathForLog}`, 'info');
                                     const mediaId = await this.uploadImageViaExtension(task.ingredientImages[iIdx], sendLog, task.id, `Ingredient ${iIdx + 1}`);
                                     if (mediaId) ingredientMediaIds.push(mediaId);
                                 }
@@ -1787,9 +1814,16 @@ class VeoEngine {
                                     const downloadUrl = `https://aisandbox-pa.googleapis.com/v1/flowMedia/${mediaName4dl}:download`;
                                     return VeoEngine.downloadMedia(downloadUrl, videoFilePath, true);
                                 }},
-                                // 3. Extension MAIN world fetch — Chrome renderer có thể đọc PINHOLE stream
+                                // 3. tRPC redirect trực tiếp Node.js — KHÔNG cần Chrome Extension
+                                // Gọi labs.google tRPC, đọc Location header 307 → lấy flow-content.google URL thực → download ngay
+                                { label: 'tRPC redirect direct', silent: false, fn: async () => {
+                                    const directUrl = await VeoEngine.resolveMediaUrlDirect(mediaName4dl);
+                                    sendLog(`[JOBID:${task.id}] 🔗 tRPC direct → ${directUrl.slice(0, 80)}`, 'info');
+                                    return VeoEngine.downloadMedia(directUrl, videoFilePath, false);
+                                }},
+                                // 4. Extension MAIN world fetch — Chrome renderer có thể đọc PINHOLE stream (fallback cuối)
                                 { label: 'Extension chrome.downloads', fn: () => this.downloadViaExtension(mediaName4dl, videoFilePath) },
-                                // 4. Fallback 720p — tải video 720p gốc khi mọi cách đều thất bại
+                                // 5. Fallback 720p — tải video 720p gốc khi mọi cách đều thất bại
                                 { label: 'fallback 720p', fn: async () => {
                                     if (!isUpsampled || !origMediaName) throw new Error('not upsampled, no 720p fallback');
                                     sendLog(`[JOBID:${task.id}] ⚠️ Không tải được 1080p — tải 720p thay thế...`, 'info');

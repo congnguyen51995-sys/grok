@@ -38,15 +38,18 @@ global.googleLabsAuth = {
     rawHeaders: [],
     resolveMediaRequest: null,
     resolvedMediaUrl: null,
-    pendingImageUpload: null,   // đường dẫn ảnh chờ Extension upload
-    uploadedMediaId: null,      // UUID trả về từ Extension sau khi upload
-    pendingVideoGen: null,      // {url, payload} chờ Extension thực thi
-    videoGenResult: null,       // kết quả từ Extension sau khi gọi video gen API
+    pendingImageUpload: null,       // đường dẫn ảnh chờ Extension upload
+    imageUploadTriggered: false,    // guard: Extension chỉ nhận lệnh upload 1 lần
+    uploadedMediaId: null,          // UUID trả về từ Extension sau khi upload
+    pendingVideoGen: null,          // {url, payload} chờ Extension thực thi
+    videoGenTriggered: false,       // guard: Extension chỉ nhận lệnh gen 1 lần — tránh gọi API 2 lần
+    videoGenResult: null,           // kết quả từ Extension sau khi gọi video gen API
     // ── DOWNLOAD VIDEO QUA EXTENSION (Chrome full-session) ─────────────────────
-    pendingVideoDownload: null, // mediaName cần tải — Extension phát hiện và tải về
-    videoDownloadDone: false,   // Extension set true khi xong
-    videoDownloadError: null,   // Extension set error string nếu lỗi
-    videoDownloadPath: null,    // đường dẫn file tạm Extension đã lưu (nếu có)
+    pendingVideoDownload: null,     // mediaName cần tải — Extension phát hiện và tải về
+    videoDownloadTriggered: false,  // guard: Extension chỉ tải 1 lần — tránh download 2 lần
+    videoDownloadDone: false,       // Extension set true khi xong
+    videoDownloadError: null,       // Extension set error string nếu lỗi
+    videoDownloadPath: null,        // đường dẫn file tạm Extension đã lưu (nếu có)
 };
 
 // 1. Hứng Token, Cookie & VÂN TAY từ Extension
@@ -79,9 +82,21 @@ expressApp.get('/api/check-request', (req, res) => {
         needToken: needsToken,
         tokenAction: tokenAction,
         resolveMediaUrl: global.googleLabsAuth.resolveMediaRequest || null,
-        needImageUpload: !!global.googleLabsAuth.pendingImageUpload,
-        needVideoGen: !!global.googleLabsAuth.pendingVideoGen,
-        downloadVideo: global.googleLabsAuth.pendingVideoDownload || null
+        // Chỉ gửi lệnh needImageUpload 1 lần — sau khi Extension nhận lệnh, đặt cờ triggered
+        // để các poll tiếp theo không kích hoạt upload lần 2 (tránh cùng ảnh được upload 2 lần)
+        needImageUpload: (global.googleLabsAuth.pendingImageUpload && !global.googleLabsAuth.imageUploadTriggered)
+            ? (global.googleLabsAuth.imageUploadTriggered = true, true)
+            : false,
+        // Chỉ gửi lệnh needVideoGen 1 lần — KHÔNG để Extension gọi Veo API 2 lần cho cùng 1 prompt
+        // Đây là nguyên nhân "1 prompt tạo ra 2 video": Extension poll nhanh thấy needVideoGen=true 2 lần
+        needVideoGen: (global.googleLabsAuth.pendingVideoGen && !global.googleLabsAuth.videoGenTriggered)
+            ? (global.googleLabsAuth.videoGenTriggered = true, true)
+            : false,
+        // Chỉ gửi lệnh downloadVideo 1 lần — sau khi Extension nhận, đặt cờ triggered
+        // để các poll tiếp theo không kích hoạt chrome.downloads lần 2 (tránh file trùng)
+        downloadVideo: (global.googleLabsAuth.pendingVideoDownload && !global.googleLabsAuth.videoDownloadTriggered)
+            ? (global.googleLabsAuth.videoDownloadTriggered = true, global.googleLabsAuth.pendingVideoDownload)
+            : null
     });
 });
 
@@ -93,6 +108,8 @@ expressApp.get('/api/get-upload-image-data', (req, res) => {
     }
     const fileData = fs.readFileSync(imgPath);
     const base64 = fileData.toString('base64');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
     res.json({
         base64,
         projectId: global.googleLabsAuth.projectId,
@@ -105,6 +122,8 @@ expressApp.get('/api/get-pending-video-gen', (req, res) => {
     if (!global.googleLabsAuth.pendingVideoGen) {
         return res.status(404).json({ error: 'No pending video gen' });
     }
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
     res.json(global.googleLabsAuth.pendingVideoGen);
 });
 
@@ -113,6 +132,7 @@ expressApp.post('/api/save-video-gen-result', (req, res) => {
     if (req.body) {
         global.googleLabsAuth.videoGenResult = req.body;
         global.googleLabsAuth.pendingVideoGen = null;
+        global.googleLabsAuth.videoGenTriggered = false; // reset để lần gọi tiếp theo hoạt động bình thường
     }
     res.json({ ok: true });
 });
@@ -122,6 +142,7 @@ expressApp.post('/api/save-media-id', (req, res) => {
     if (req.body && req.body.mediaId) {
         global.googleLabsAuth.uploadedMediaId = req.body.mediaId;
         global.googleLabsAuth.pendingImageUpload = null;
+        global.googleLabsAuth.imageUploadTriggered = false; // reset để lần upload tiếp theo hoạt động bình thường
     }
     res.json({ ok: true });
 });

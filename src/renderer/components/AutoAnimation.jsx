@@ -13,7 +13,7 @@ import {
   FileText, Brain, Layers, Copy, Check, ChevronDown, ChevronUp,
   Video, Scissors, ExternalLink, Cpu, Wand2,
   UploadCloud, Download, Clock, Mic, RefreshCw,
-  Languages, Flame, Terminal, Link, Volume2, VolumeX,
+  Languages, Flame, Terminal, Link, Volume2, VolumeX, X, Users,
 } from 'lucide-react';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -42,6 +42,16 @@ const PLATFORM_RATIO = {
   'Facebook':         '16:9',
 };
 const STYLES    = ['Photorealistic', 'Cinematic 4K', 'Anime / Manga', 'Pixar 3D', 'Studio Ghibli', 'Dark Fantasy', 'Watercolor'];
+// Map style label → exact prompt description dùng làm art_style lock
+const STYLE_MAP = {
+  'Photorealistic': 'Ultra-realistic photography, photorealistic render, 8K resolution, natural skin texture, real-world lighting, hyper-detailed DSLR quality — NO illustration, NO animation, NO cartoon, NO drawing, NO Ghibli, NO anime',
+  'Cinematic 4K':   'Cinematic 4K film quality, anamorphic lens, dramatic depth of field, professional color grading, film grain, Hollywood-level production — NO illustration, NO cartoon, NO anime',
+  'Anime / Manga':  'Japanese anime 2D animation, clean sharp line art, cel-shaded flat coloring, expressive anime eyes, vibrant saturated palette, manga-inspired — NO photorealism, NO 3D render, NO Ghibli watercolor',
+  'Pixar 3D':       'Pixar/Disney 3D CGI, smooth subsurface scattering, warm key lighting, polished 3D render, expressive stylized characters — NO 2D illustration, NO photorealism, NO anime',
+  'Studio Ghibli':  'Studio Ghibli 2D hand-drawn animation, soft watercolor backgrounds, warm muted tones, expressive faces, gentle painterly line art — NO 3D render, NO photorealism, NO dark tones',
+  'Dark Fantasy':   'Dark fantasy digital painting, dramatic chiaroscuro, deep gothic shadows, epic fantasy illustration, moody desaturated palette, detailed brushwork — NO photorealism, NO cartoon',
+  'Watercolor':     'Traditional watercolor painting, soft wet-on-wet washes, gentle color bleeds, textured paper, loose brushstrokes, delicate pastel tones — NO photorealism, NO digital clean render',
+};
 const AUDIENCES = [
   'Người trẻ (Gen Z & Alpha)', 'Dân văn phòng & Công sở',
   'Người mê lịch sử & Văn hóa', 'Người thích chữa lành & Chill',
@@ -4421,10 +4431,11 @@ function UrlToVideoPanel() {
       let _dnaIdx = 1;
 
       charIds.forEach((charId, i) => {
-        const data   = charMap.get(charId);
-        const name   = typeof data === 'object' ? (data.name || charId) : charId;
-        const desc   = typeof data === 'object' ? (data.description || name) : data;
-        const prompt = `Photorealistic reference image, ${name}, ${desc}, front facing or 3/4 angle, white/neutral background, studio lighting, 4K, high detail`;
+        const data      = charMap.get(charId);
+        const name      = typeof data === 'object' ? (data.name || charId) : charId;
+        const desc      = typeof data === 'object' ? (data.description || name) : data;
+        const stylePart = stylePrompt ? `${stylePrompt}. ` : 'Photorealistic, 4K, high detail. ';
+        const prompt    = `${stylePart}Multi-angle character turnaround reference sheet, 8 panels in 2 rows of 4: TOP ROW — [front face portrait] [left side profile] [back head] [right side profile]; BOTTOM ROW — [full body front] [full body 3/4 left] [full body back] [full body 3/4 right]. Plain pure white studio background. CHARACTER: ${name}, ${desc}. Same character consistently across all 8 panels. Professional character design turnaround sheet. No text labels, no arrows, no annotations, no captions, no watermarks.`;
         dnaTasks.push({ id: `dna_c${i}`, prompt, fileIndex: _dnaIdx++ });
         charDnaTaskMap.set(`dna_c${i}`, charId);
       });
@@ -4495,7 +4506,10 @@ function UrlToVideoPanel() {
       const buildU2VPrompt = (scene) => {
         // Strip dòng // comment mà Gemini đôi khi nhúng vào field prompt (vd: // Video: ...)
         const stripComments = (s) => s ? s.replace(/^\/\/[^\n]*/gm, '').trim() : s;
-        const base = stripComments(scene.prompt) || stripComments(scene.action_description) || 'smooth cinematic motion';
+        const rawBase = stripComments(scene.prompt) || stripComments(scene.action_description) || 'smooth cinematic motion';
+        // Inject style lock — prepend style nếu user đã chọn phong cách khác default
+        const styleLockPrefix = stylePrompt ? `MANDATORY VISUAL STYLE: ${stylePrompt}. ` : '';
+        const base = `${styleLockPrefix}${rawBase}`;
         // Lấy lời thoại từ audio.dialogue.lines (mode 6 format)
         const dialogueLines = Array.isArray(scene.audio?.dialogue?.lines)
           ? scene.audio.dialogue.lines : [];
@@ -5409,6 +5423,16 @@ function StoryboardPanel() {
   const [sceneDur,  setSceneDur]  = useState(6);
   const [totalMins, setTotalMins] = useState(1);
 
+  // ── Hồ sơ nhân vật — giống Creator Studio ────────────────────────────────
+  const emptySbChar = () => ({ id: Date.now() + Math.random(), name: '', gender: 'Nữ', age: '', ethnicity: '', appearance: '', clothing: '', role: '' });
+  const [mainChar,  setMainChar]  = useState(() => emptySbChar());
+  const [secChars,  setSecChars]  = useState([]);
+  const [showChars, setShowChars] = useState(false);
+  const addSecChar    = () => { if (secChars.length < 4) setSecChars(p => [...p, emptySbChar()]); };
+  const removeSecChar = (id) => setSecChars(p => p.filter(c => c.id !== id));
+  const updateSecChar = (id, f, v) => setSecChars(p => p.map(c => c.id === id ? { ...c, [f]: v } : c));
+  const hasMainChar   = !!(mainChar.name || mainChar.appearance || mainChar.ethnicity);
+
   // Settings
   const [outputFolder,  setOutputFolder]  = useState('');
   const [aspectRatio,   setAspectRatio]   = useState('16:9');
@@ -5431,9 +5455,10 @@ function StoryboardPanel() {
   const [voiceMap,         setVoiceMap]         = useState({});
   const [charDnaMap,       setCharDnaMap]       = useState({});  // charId → filePath
   const [dnaJobIdToCharId, setDnaJobIdToCharId] = useState({});  // dna jobId → charId (real-time preview)
-  const [sceneJobs,        setSceneJobs]        = useState([]);
-  const [mergedPath,       setMergedPath]       = useState(null);
-  const [logs,             setLogs]             = useState([{ time: new Date().toLocaleTimeString(), text: 'Storyboard Studio sẵn sàng', type: 'success' }]);
+  const [sceneJobs,           setSceneJobs]           = useState([]);
+  const [mergedPath,          setMergedPath]          = useState(null);
+  const [charVoiceOverrides,  setCharVoiceOverrides]  = useState([]); // [voiceId per char index] — 'random'|''|specific id
+  const [logs,                setLogs]                = useState([{ time: new Date().toLocaleTimeString(), text: 'Storyboard Studio sẵn sàng', type: 'success' }]);
 
   const stopRef              = useRef(false);
   const logsEndRef           = useRef(null);
@@ -5450,6 +5475,14 @@ function StoryboardPanel() {
     if (sceneDur !== 8 && videoQuality === '1080p') setVideoQuality('720p');
     if (sceneDur === 10) setVidModel('Omni Flash');
   }, [sceneDur]);
+  // Khi parsedData thay đổi (sau parse): khởi tạo voice override cho từng nhân vật mới
+  // Giữ nguyên giá trị cũ nếu char count không đổi
+  useEffect(() => {
+    if (!parsedData?.characters?.length) return;
+    setCharVoiceOverrides(prev =>
+      parsedData.characters.map((_, i) => (prev[i] !== undefined ? prev[i] : 'random'))
+    );
+  }, [parsedData]);
 
   useEffect(() => {
     window.electronAPI?.getDownloadsDir?.().then(dir => {
@@ -5544,15 +5577,32 @@ function StoryboardPanel() {
     // ── Style lock: ép cứng phong cách, không cho AI tự sáng tạo style khác ──
     const styleLock = `MANDATORY ART STYLE — strictly follow exactly: ${artStyle}. Do NOT switch to 3D render, photorealism, or any other style. Every element must match this art style precisely.`;
 
-    // ── Chỉ lấy nhân vật XUẤT HIỆN trong cảnh này, nhúng desc đầy đủ vào prompt ──
+    // ── Chỉ lấy nhân vật XUẤT HIỆN trong cảnh này, nhúng desc đầy đủ + hard lock vào prompt ──
     const sceneCharIds  = scene.characters_in_scene || [];
     const sceneChars    = (parsed.characters || []).filter(c => sceneCharIds.includes(c.id));
     let charBlock = '';
+    let charReminder = ''; // compact per-panel anchor: ethnicity + hair
     if (sceneChars.length > 0) {
       const descs = sceneChars.map(c =>
-        `CHARACTER "${c.name}": ${c.desc} — EXACT SAME appearance as DNA reference image, same hair length, same clothing colors, same face features, do NOT alter any detail`
-      ).join('. ');
-      charBlock = `CHARACTER CONSISTENCY LOCK — ${descs}.`;
+        `CHARACTER "${c.name}" [ABSOLUTE LOCK — ZERO DEVIATION ALLOWED]: ${c.desc}. ` +
+        `MANDATORY RULE 1 — HAIR: replicate EXACT same hair color, length, and texture from DNA reference portrait (if DNA shows dark/black/brown hair → DO NOT generate blonde, light, or grey hair — this is forbidden). ` +
+        `MANDATORY RULE 2 — FACE: replicate EXACT same facial structure, skin tone, and ethnic features as DNA reference (DO NOT change ethnicity, face shape, or skin tone). ` +
+        `MANDATORY RULE 3 — CLOTHING: replicate EXACT same garment type and colors as described (DO NOT substitute or redesign). ` +
+        `Character must be visually IDENTICAL to the uploaded DNA reference portrait.`
+      ).join(' ');
+      charBlock = `=== CHARACTER APPEARANCE LOCK (ABSOLUTE — NO MODIFICATIONS PERMITTED) === ${descs} ===`;
+
+      // Build compact per-panel reminder: extract ethnicity sentence + hair hint from desc
+      const snippets = sceneChars.map(c => {
+        const d = c.desc || '';
+        // First sentence typically = "[Name] is a [ethnicity] in their [age]."
+        const ethSentence = d.split(/[.!?]\s+/)[0].replace(/^['"]+|['"]+$/g, '').trim();
+        // Extract HAIR section: "HAIR: jet-black shoulder-length straight hair"
+        const hairM = d.match(/HAIR:\s*([\w-]+(?:\s+[\w-]+){0,5})/i);
+        const hairHint = hairM ? `, ${hairM[1].trim()} hair` : '';
+        return `${c.name}(${ethSentence}${hairHint})`;
+      });
+      charReminder = `[EXACT SAME CHARACTER${sceneChars.length > 1 ? 'S' : ''} — DO NOT CHANGE ETHNICITY/FACE/HAIR: ${snippets.join(' & ')}] `;
     }
 
     // ── Setting ──
@@ -5562,97 +5612,111 @@ function StoryboardPanel() {
     const base = [styleLock, charBlock, settingBlock].filter(Boolean).join(' ');
 
     const n = shots.length;
+    // Helper: prepend charReminder to each shot action so every panel independently anchors the character
+    const pA = (shot) => `${charReminder}${shot.action}`;
 
     if (n === 1) {
       // 1 shot → single cinematic frame
-      return `${base} Shot (${shots[0].type}): ${shots[0].action}. Cinematic composition, high detail, full scene visible.`;
+      return `${base} Shot (${shots[0].type}): ${pA(shots[0])}. Cinematic composition, high detail, full scene visible.`;
 
     } else if (n === 2) {
       // 2 shots → 1×2 horizontal strip
-      return `A single image: 1×2 horizontal storyboard strip, two equal panels LEFT | RIGHT, thin black border (4px), no text/labels. ${base} PANEL LEFT (${shots[0].type}): ${shots[0].action}. PANEL RIGHT (${shots[1].type}): ${shots[1].action}. Identical character appearance and art style across both panels.`;
+      return `A single image: 1×2 horizontal storyboard strip, two equal panels LEFT | RIGHT, thin black border (4px), no text/labels. ${base} PANEL LEFT (${shots[0].type}): ${pA(shots[0])}. PANEL RIGHT (${shots[1].type}): ${pA(shots[1])}. Identical character appearance and art style across both panels.`;
 
     } else if (n === 3) {
       // 3 shots → 1×3 horizontal strip
-      return `A single image: 1×3 horizontal storyboard strip, three equal panels LEFT | CENTER | RIGHT, thin black borders (4px), no text/labels/numbers. ${base} PANEL LEFT (${shots[0].type}): ${shots[0].action}. PANEL CENTER (${shots[1].type}): ${shots[1].action}. PANEL RIGHT (${shots[2].type}): ${shots[2].action}. Identical character appearance, proportions, clothing across all panels.`;
+      return `A single image: 1×3 horizontal storyboard strip, three equal panels LEFT | CENTER | RIGHT, thin black borders (4px), no text/labels/numbers. ${base} PANEL LEFT (${shots[0].type}): ${pA(shots[0])}. PANEL CENTER (${shots[1].type}): ${pA(shots[1])}. PANEL RIGHT (${shots[2].type}): ${pA(shots[2])}. Identical character appearance, proportions, clothing across all panels.`;
 
     } else if (n === 4) {
       // 4 shots → 2×2 grid
-      return `A single image: 2×2 grid storyboard of four equal panels, thin black borders (4px), no text/labels/numbers. ${base} TOP-LEFT (${shots[0].type}): ${shots[0].action}. TOP-RIGHT (${shots[1].type}): ${shots[1].action}. BOTTOM-LEFT (${shots[2].type}): ${shots[2].action}. BOTTOM-RIGHT (${shots[3].type}): ${shots[3].action}. All four panels share identical character appearance, proportions, clothing and art style.`;
+      return `A single image: 2×2 grid storyboard of four equal panels, thin black borders (4px), no text/labels/numbers. ${base} TOP-LEFT (${shots[0].type}): ${pA(shots[0])}. TOP-RIGHT (${shots[1].type}): ${pA(shots[1])}. BOTTOM-LEFT (${shots[2].type}): ${pA(shots[2])}. BOTTOM-RIGHT (${shots[3].type}): ${pA(shots[3])}. All four panels share identical character appearance, proportions, clothing and art style.`;
 
     } else {
       // 5 shots → top row 3 panels + bottom row 2 panels centered
       const s = shots.slice(0, 5);
-      return `A single image: storyboard layout with 5 panels — top row: 3 equal panels (LEFT, CENTER, RIGHT), bottom row: 2 equal panels (CENTER-LEFT, CENTER-RIGHT) centered below, thin black borders (4px), no text/labels/numbers. ${base} TOP-LEFT (${s[0].type}): ${s[0].action}. TOP-CENTER (${s[1].type}): ${s[1].action}. TOP-RIGHT (${s[2].type}): ${s[2].action}. BOTTOM-LEFT (${s[3].type}): ${s[3].action}. BOTTOM-RIGHT (${s[4].type}): ${s[4].action}. All five panels share identical character appearance, proportions, clothing and art style.`;
+      return `A single image: storyboard layout with 5 panels — top row: 3 equal panels (LEFT, CENTER, RIGHT), bottom row: 2 equal panels (CENTER-LEFT, CENTER-RIGHT) centered below, thin black borders (4px), no text/labels/numbers. ${base} TOP-LEFT (${s[0].type}): ${pA(s[0])}. TOP-CENTER (${s[1].type}): ${pA(s[1])}. TOP-RIGHT (${s[2].type}): ${pA(s[2])}. BOTTOM-LEFT (${s[3].type}): ${pA(s[3])}. BOTTOM-RIGHT (${s[4].type}): ${pA(s[4])}. All five panels share identical character appearance, proportions, clothing and art style.`;
     }
   };
 
-  // ── Build video motion prompt (language-aware, full character + style lock) ──
+  // ── Build video motion prompt ──
+  // QUAN TRỌNG: Ingredients API dùng ảnh làm VISUAL REFERENCE, không phải start frame.
+  // KHÔNG được dùng từ "storyboard/panel/strip" — Veo sẽ render ảnh storyboard đóng băng.
+  // Phải mô tả CẢNH QUAY cinematic để Veo tạo ra motion thực sự.
   const buildVideoPrompt = (scene, parsed) => {
     const LANG_EN = {
       vi: 'Vietnamese', en: 'English', ja: 'Japanese', zh: 'Chinese',
       ko: 'Korean', fr: 'French', es: 'Spanish', de: 'German', th: 'Thai',
     };
     const langLabel    = LANG_EN[language] || 'Vietnamese';
-    const noTextSuffix = 'no text overlay, no captions, no subtitles, no watermarks, spoken audio only';
-    const silentSuffix = 'natural ambient sounds only, no speech, no voice narration, no text, no captions, no subtitles, no watermarks';
+    const noTextSuffix = 'No text overlay, no captions, no subtitles, no watermarks.';
+    const silentSuffix = 'Natural ambient sounds only. No dialogue, no narration.';
 
-    // ── Style lock ──
-    const artStyle  = parsed?.art_style || '';
-    const styleLock = artStyle
-      ? `MANDATORY ART STYLE: ${artStyle}. Do NOT switch to 3D render or photorealism.`
-      : '';
+    // Unique scene ID — tránh 2 cảnh trùng prompt
+    const sceneId = `[SCENE ${scene.sceneNum || '?'} — "${scene.title || scene.id || ''}"]`;
 
-    // ── Character lock — chỉ nhân vật trong cảnh ──
+    // Style lock
+    const artStyle  = parsed?.art_style || 'Cinematic quality, photorealistic, 8K';
+    const styleLock = `Art style: ${artStyle}.`;
+
+    // Character reference — chỉ mô tả diện mạo để Veo giữ nhất quán, KHÔNG dùng từ "storyboard"
     const sceneCharIds = scene.characters_in_scene || [];
     const sceneChars   = (parsed?.characters || []).filter(c => sceneCharIds.includes(c.id));
-    let charBlock = '';
+    let charBlock    = '';
+    let charReminder = '';
     if (sceneChars.length > 0) {
       const descs = sceneChars.map(c =>
-        `"${c.name}": ${c.desc}`
-      ).join('; ');
-      charBlock = `CHARACTER APPEARANCE LOCK (maintain exactly throughout entire clip) — ${descs}.`;
+        `${c.name}: ${c.desc}. Keep appearance IDENTICAL to reference image — same ethnicity, hair, face, skin tone, clothing.`
+      ).join(' ');
+      charBlock = `Characters: ${descs}`;
+      const snippets = sceneChars.map(c => {
+        const d = c.desc || '';
+        const ethSentence = d.split(/[.!?]\s+/)[0].replace(/^['"]+|['"]+$/g, '').trim();
+        const hairM = d.match(/HAIR:\s*([\w-]+(?:\s+[\w-]+){0,5})/i);
+        const hairHint = hairM ? `, ${hairM[1].trim()} hair` : '';
+        return `${c.name}(${ethSentence}${hairHint})`;
+      });
+      charReminder = `[${snippets.join(' & ')}] `;
     }
 
-    // ── Setting ──
-    const settingBlock = parsed?.setting_anchor ? `SETTING: ${parsed.setting_anchor}` : '';
+    // Setting
+    const settingBlock = parsed?.setting_anchor ? `Setting: ${parsed.setting_anchor}.` : '';
 
-    // ── Shots → camera + motion description ──
+    // ── Shots: mô tả hành động + camera motion ── (KHÔNG dùng "panel/strip/storyboard")
     const shots = scene.shots || [];
-    const motionParts = shots.map((s, i) => {
-      const prefix = shots.length > 1 ? `Shot ${i + 1} (${s.type})` : `${s.type}`;
-      return `${prefix}: ${s.action}`;
-    });
-    const motionBlock = motionParts.join('. ');
-
-    // ── Camera movement hint from shot types ──
-    const camHints = shots.map(s => {
+    const shotDescs = shots.map((s, i) => {
       const t = (s.type || '').toLowerCase();
-      if (t.includes('pan'))       return 'slow horizontal pan';
-      if (t.includes('zoom'))      return 'slow zoom in';
-      if (t.includes('tilt'))      return 'gentle tilt up';
-      if (t.includes('tracking'))  return 'smooth tracking shot';
-      if (t.includes('bird'))      return 'bird\'s-eye view, camera descends slowly';
-      if (t.includes('dutch'))     return 'dutch angle, slight camera roll';
-      if (t.includes('pov'))       return 'first-person POV movement';
-      if (t.includes('wide'))      return 'wide establishing shot, subtle camera drift';
-      if (t.includes('close') || t.includes('cu') || t.includes('ecu')) return 'tight close-up, very subtle push in';
-      return 'cinematic subtle camera motion';
+      let camMotion = 'cinematic subtle camera motion';
+      if (t.includes('pan'))                                        camMotion = 'slow horizontal pan';
+      else if (t.includes('zoom'))                                  camMotion = 'slow zoom in';
+      else if (t.includes('tilt'))                                  camMotion = 'gentle tilt';
+      else if (t.includes('track'))                                 camMotion = 'smooth tracking shot';
+      else if (t.includes('bird'))                                  camMotion = "bird's-eye view descending";
+      else if (t.includes('dutch'))                                 camMotion = 'dutch angle tilt';
+      else if (t.includes('pov'))                                   camMotion = 'first-person POV';
+      else if (t.includes('wide') || t.includes('ws') || t.includes('ews')) camMotion = 'wide shot with subtle drift';
+      else if (t.includes('close') || t.includes('cu') || t.includes('ecu')) camMotion = 'close-up push in';
+      else if (t.includes('crane') || t.includes('dolly'))         camMotion = 'smooth crane/dolly';
+      const label = shots.length > 1 ? `Shot ${i + 1} (${s.type})` : s.type;
+      return `${label}: ${charReminder}${s.action}. Camera: ${camMotion}.`;
     });
-    const uniqueCam = [...new Set(camHints)].join(', ');
+    const motionBlock = shotDescs.join(' ');
 
-    // ── Dialogue / audio ──
+    // Dialogue / Audio
     const dialogue = scene.hasDialogue ? (scene.dialogue || '') : '';
     const hasVoice = dialogue && language !== 'none';
 
-    // ── Assemble ──
-    const header  = [styleLock, charBlock, settingBlock].filter(Boolean).join(' ');
-    const motion  = motionBlock.slice(0, 350) || 'Cinematic animation of the scene';
-    const camNote = `Camera: ${uniqueCam}.`;
+    const base = [sceneId, styleLock, charBlock, settingBlock].filter(Boolean).join(' ');
 
     if (!hasVoice) {
-      return `${header} ${motion}. ${camNote} ${silentSuffix}`.trim();
+      return `Cinematic scene. ${base} ${motionBlock} ${silentSuffix} ${noTextSuffix}`.trim();
     }
-    return `[${langLabel} voice] ${header} ${motion}. ${camNote} Character speaks ${langLabel}: "${dialogue.slice(0, 150)}". Spoken audio matches lip movement. ${noTextSuffix}`.trim();
+
+    const audioBlock =
+      `[SPOKEN DIALOGUE — ${langLabel.toUpperCase()} AUDIO]: ` +
+      `Character speaks ${langLabel}: "${dialogue.slice(0, 200)}". ` +
+      `Generate clear ${langLabel} spoken voice. Lip movement synced to speech.`;
+
+    return `Cinematic scene with ${langLabel} spoken dialogue. ${base} ${motionBlock} ${audioBlock} ${noTextSuffix}`.trim();
   };
 
   // ── Full auto pipeline ───────────────────────────────────────────────────────
@@ -5686,6 +5750,8 @@ function StoryboardPanel() {
           goal,
           tone,
           audience,
+          mainChar:  hasMainChar ? mainChar : null,
+          secChars:  secChars.filter(c => c.name || c.appearance),
         }, (evt) => {
           if (evt.type === 'chunk_done' && evt.total > 25) setGeneratedScript(evt.scriptSoFar || '');
           else if (evt.type === 'key_switch') addLog('🔄 Chuyển API key', 'info');
@@ -5701,18 +5767,40 @@ function StoryboardPanel() {
       setPhase('parse');
       addLog('🎭 Phân tích kịch bản với Gemini...', 'info');
 
-      const PARSE_PROMPT = `You are a professional storyboard director. Analyze this script and output ONLY valid JSON (no markdown fences, no extra text):
+      // Lấy art_style từ style user chọn — không để Gemini tự đoán
+      const selectedArtStyle = STYLE_MAP[style] || `${style}, highly detailed, professional quality`;
+
+      // Build character hint block từ mainChar + secChars (nếu user đã nhập)
+      const definedChars = [hasMainChar ? mainChar : null, ...secChars.filter(c => c.name || c.appearance)].filter(Boolean);
+      const charHintBlock = definedChars.length > 0
+        ? `\n⚠️ PRE-DEFINED CHARACTERS — use these EXACT names and visual details, do NOT rename or redesign:\n` +
+          definedChars.map((c, i) => {
+            const lbl = i === 0 ? '👤 MAIN CHARACTER' : `👥 SECONDARY ${i}`;
+            let s = `${lbl}: ${c.name || '(unnamed)'}`;
+            if (c.gender) s += ` | ${c.gender}`;
+            if (c.age)    s += ` | Age: ${c.age}`;
+            if (c.ethnicity)  s += `\n   Ethnicity/Nationality: ${c.ethnicity}`;
+            if (c.appearance) s += `\n   Appearance: ${c.appearance}`;
+            if (c.clothing)   s += `\n   Clothing & Accessories: ${c.clothing}`;
+            if (c.role)       s += `\n   Role: ${c.role}`;
+            return s;
+          }).join('\n') + '\n'
+        : '';
+
+      const PARSE_PROMPT = `You are a professional storyboard director. Analyze this script and output ONLY valid JSON (no markdown fences, no extra text):${charHintBlock}
+⚠️ CRITICAL: The user has selected this art style: "${selectedArtStyle}"
+You MUST use this EXACT string as the "art_style" value. Do NOT change it, do NOT invent a different style, do NOT use Ghibli, anime, or any other style unless it matches the selection above.
 {
-  "art_style": "EXACT art style string used as a mandatory lock for ALL images — be extremely specific (e.g. 'Studio Ghibli 2D hand-drawn animation, soft watercolor background, expressive anime faces, warm muted color palette, gentle line art, no 3D render, no photorealism'). This string will be injected into every prompt as a style lock.",
-  "character_anchor": "CharName (role): [full English visual desc — exact age, body type, hair color/length/style, clothing with exact colors, skin tone, glasses/accessories, distinctive features]. One line per character.",
+  "art_style": "${selectedArtStyle}",
+  "character_anchor": "CharName (role): [ETHNICITY e.g. 'East Asian Vietnamese woman'] — [exact age, body type, hair color/length/style, clothing with exact colors, skin tone, glasses/accessories, distinctive features]. One line per character. ETHNICITY is mandatory first.",
   "setting_anchor": "Setting: [detailed English: location, time of day, lighting quality, key props, background elements, color palette].",
   "characters": [
     {
       "id": "char_id",
       "name": "Full Name",
       "gender": "male|female|neutral",
-      "desc": "ULTRA-DETAILED English visual desc — must include: exact hair color AND length AND style (e.g. 'black shoulder-length straight hair'), exact clothing with colors (e.g. 'cream turtleneck sweater, sage green wide-leg pants'), skin tone, eye color, height/build, any accessories. This will be used as character lock in every scene prompt.",
-      "dna_prompt": "MANDATORY ART STYLE: [copy exact art_style string here]. Single character full-body reference sheet. Neutral standing pose, arms slightly out, plain white studio background, no background objects. CHARACTER: [copy full desc here — hair, clothing, face, skin, accessories]. Full body visible head to toe. Face clearly shown front-facing. Highly detailed, consistent proportions. NO style deviation allowed."
+      "desc": "ULTRA-DETAILED English visual desc — MANDATORY FORMAT: START with ethnicity+gender sentence: '[Name] is a [EXACT ethnicity — e.g. East Asian/Vietnamese/Korean/Japanese/Chinese woman, South Asian/Indian man, Caucasian/Western woman, Middle Eastern man, Black/African woman] in their [age range e.g. early 20s].' THEN: (1) HAIR: [exact shade — use specific color names: jet-black / deep dark brown / chestnut brown / auburn / platinum blonde / honey blonde / ash grey — NOT just 'dark' or 'light'] [exact length: waist-length / hip-length / shoulder-length / chin-length / short pixie] [exact style: straight / wavy / curly / sleek / voluminous] hair; (2) FACE: [exact skin tone: fair porcelain / light beige / warm olive / medium tan / deep brown / dark ebony] skin, [eye shape — e.g. almond-shaped single-lid East Asian eyes / large round double-lid eyes / deep-set eyes] [exact eye color], [face shape: soft oval / sharp V-line / round / square jaw]; (3) BUILD: [height] [build]; (4) CLOTHING: [exact garment type + fit] in [exact color name]; (5) ACCESSORIES: [list or 'none']. CRITICAL: The ethnicity in the first sentence is the most important — it determines face generation and MUST be specified precisely.",
+      "dna_prompt": "MANDATORY ART STYLE: [copy exact art_style string here]. Multi-angle character turnaround reference sheet, 8 panels in 2 rows of 4: TOP ROW — [front face portrait] [left side profile] [back head] [right side profile]; BOTTOM ROW — [full body front] [full body 3/4 left] [full body back] [full body 3/4 right]. Plain pure white studio background, no scene, no props except own accessories. ⚠️ ETHNICITY CRITICAL: [Name] is a [COPY EXACT ETHNICITY from desc first sentence here — e.g. 'East Asian Vietnamese woman', 'South Asian Indian man', 'Caucasian Western woman'] — this ethnicity determines FACIAL FEATURES and MUST appear as the very first line. CHARACTER FULL DESC: [copy entire desc field here verbatim — exact hair color/style/length, exact face shape, exact skin tone, exact clothing with colors, eye shape and color, distinctive features]. Same character consistently across all 8 panels. Professional character design turnaround sheet. NO style deviation allowed. No text labels, no arrows, no annotations, no captions, no watermarks, no on-screen text."
     }
   ],
   "scenes": [
@@ -5720,9 +5808,10 @@ function StoryboardPanel() {
       "id": "scene_1", "sceneNum": 1, "title": "short title", "setting": "brief English setting",
       "characters_in_scene": ["char_id_1", "char_id_2"],
       "shots": [
-        {"num": 1, "type": "Wide Shot", "action": "Detailed English: who+what+where+expression+body language — always mention character name and their exact clothing/hair so appearance is locked"},
-        {"num": 2, "type": "Close-Up", "action": "..."},
-        {"num": 3, "type": "POV", "action": "..."}
+        {"num": 1, "type": "Wide Shot", "action": "Detailed English: [Character Name] ([ETHNICITY e.g. East Asian Vietnamese young woman], [exact hair: jet-black waist-length wavy hair], [exact clothing: cream oversized t-shirt, blue straight jeans]) — [action]+[setting]+[expression]. FORMAT: always lead with name + ethnicity + hair + clothing in every shot."},
+        {"num": 2, "type": "Close-Up", "action": "Detailed English: [same character name] ([SAME ethnicity reminder], [same hair reminder], [same clothing reminder]) — [close-up action]+[facial emotion]+[detail]"},
+        {"num": 3, "type": "Medium Shot", "action": "Detailed English: [character name] ([ethnicity], [hair color+style], [clothing]) — [action]+[environment detail]"},
+        {"num": 4, "type": "Bird's Eye", "action": "Detailed English: [character name] ([ethnicity], [hair], [clothing]) — [overhead view action]+[setting]"}
       ],
       "hasDialogue": true, "dialogue": "Speaker: dialogue text here", "speakerName": "Character Name"
     }
@@ -5730,12 +5819,12 @@ function StoryboardPanel() {
 }
 Rules:
 - Capture EVERY scene from the script, do not skip any
-- CRITICAL: Extract the EXACT number of shots written in the script for each scene (1 to 5 shots). Do NOT reduce to fewer shots than written. If the script has 4 shots, output all 4. If the script has 5 shots, output all 5.
+- ⚠️ SHOT COUNT IS MANDATORY: Count the EXACT number of shots written in the script for each scene and output ALL of them. If the script has 1 shot → output 1 shot. If 2 shots → 2 shots. If 4 shots → 4 shots. If 5 shots → 5 shots. DO NOT default to 3 shots. DO NOT add or remove shots.
 - Each shot must have a different camera angle/type — never repeat the same shot type consecutively
-- ALL shot action descriptions MUST be in English and highly descriptive
+- ⚠️ EVERY shot action MUST start with: "[Character Name] ([EXACT ETHNICITY from desc, e.g. East Asian Vietnamese woman], [exact hair: jet-black waist-length wavy], [exact clothing: cream t-shirt, blue jeans]) — [action]". NEVER write a shot action without the ethnicity+hair+clothing prefix. This is the single most important rule.
 - characters_in_scene: list the char id(s) of characters who appear in each scene
-- dna_prompt for each character: full standalone image generation prompt in English, designed to produce a consistent character reference image
-- Keep character visual descriptions perfectly consistent with character_anchor across all scenes
+- dna_prompt for each character: must begin with the ethnicity sentence verbatim from desc, then full desc, then the 8-panel turnaround format
+- Keep character visual descriptions perfectly consistent with character_anchor and desc across all scenes
 - Shot types must vary: ECU, CU, MCU, MS, MLS, LS, WS, EWS, POV, OTS, Dutch Angle, Bird's Eye, Low Angle, High Angle, Tracking, Dolly, Handheld, Crane
 Script:
 ` + finalScript;
@@ -5753,57 +5842,99 @@ Script:
 
       const jsonStr = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
       const parsed  = JSON.parse(jsonStr);
+      // Force override art_style bằng style user chọn — Gemini không được tự thay đổi
+      parsed.art_style = selectedArtStyle;
       setParsedData(parsed);
 
       const scenes = parsed.scenes || [];
-      addLog(`✅ Phân tích xong: ${scenes.length} cảnh, ${parsed.characters?.length || 0} nhân vật`, 'success');
+      addLog(`✅ Phân tích xong: ${scenes.length} cảnh, ${parsed.characters?.length || 0} nhân vật — style: ${style}`, 'success');
       if (!scenes.length) throw new Error('Không tìm thấy cảnh nào trong kịch bản!');
       if (stopRef.current) throw new Error('Đã dừng.');
 
-      // ── 3. Build voice map ───────────────────────────────────────────────────
+      // ── 3. Build voice map — dùng charVoiceOverrides nếu user đã chọn thủ công ──────────────
       const usedVoices = new Set();
       const vm = {};
-      for (const char of (parsed.characters || [])) {
-        const gender = detectCharGender(char.id, char.desc || '');
-        const voice  = pickVoiceByGender(gender, usedVoices);
-        if (voice) { vm[char.id] = voice; usedVoices.add(voice); }
+      const charsArr = parsed.characters || [];
+      for (let ci = 0; ci < charsArr.length; ci++) {
+        const char     = charsArr[ci];
+        const override = charVoiceOverrides[ci]; // undefined = chưa set, '' = không voice, 'random' = auto, else specific id
+        if (override === '' || override === null) continue;     // tắt giọng cho nhân vật này
+        if (!override || override === 'random') {
+          // Auto chọn theo giới tính
+          const gender = detectCharGender(char.id, char.desc || '');
+          const voice  = pickVoiceByGender(gender, usedVoices);
+          if (voice) { vm[char.id] = voice; usedVoices.add(voice); }
+        } else {
+          // Dùng voice user đã chọn thủ công
+          vm[char.id] = override;
+          usedVoices.add(override);
+        }
       }
       setVoiceMap(vm);
       const vmStr = Object.entries(vm).map(([k, v]) => `${k}→${v}`).join(', ');
-      addLog(`🎙 Phân công giọng: ${vmStr || 'không có lời thoại'}`, 'info');
+      addLog(`🎙 Phân công giọng: ${vmStr || 'không có / tắt tất cả'}`, 'info');
 
-      // ── Batch helper: gửi tối đa 2 task/lần, thử lại tối đa 10 lần cho task lỗi ──
-      const MAX_RETRY  = 10;
-      const BATCH_SIZE = 2; // chỉ gửi 2 task mỗi lần để tránh spam
+      // ── Batch helper — CÙNG pattern với Veo Studio: gửi tất cả 1 lần, guard chống gửi trùng ──
+      // Không dùng BATCH_SIZE — veo-engine tự giới hạn MAX_WORKERS=5 song song
+      // Khi retry: đổi task ID mới (_r1, _r2...) → server không nhận nhầm là request cũ
+      const MAX_RETRY = 10;
       const runVeoBatch = async (baseParams, tasks) => {
-        const resultMap = {}; // taskId → file
-        let pending = [...tasks];
-        for (let attempt = 1; attempt <= MAX_RETRY && pending.length > 0; attempt++) {
+        // Map taskId → index trong tasks[] gốc (để ghép kết quả về đúng vị trí)
+        const taskIdxMap = new Map();
+        tasks.forEach((t, i) => taskIdxMap.set(t.id, i));
+        const orderedResults = new Array(tasks.length).fill(null);
+
+        // Dedup: loại task trùng prompt+voice+ingredient trước khi gửi
+        let pendingTasks = dedupTasksByPrompt([...tasks], addLog);
+        // Guard: mỗi task ID chỉ được gửi 1 lần duy nhất — tránh gửi cùng 1 prompt 2 lần
+        const filterUnsent = makeSubmitGuard();
+
+        for (let attempt = 1; attempt <= MAX_RETRY && pendingTasks.length > 0; attempt++) {
           if (stopRef.current) throw new Error('Đã dừng.');
           if (attempt > 1) {
-            addLog(`🔄 Thử lại ${pending.length} task (lần ${attempt}/${MAX_RETRY})...`, 'info');
-            await new Promise(r => setTimeout(r, 1500));
+            addLog(`🔄 Thử lại ${pendingTasks.length} task (lần ${attempt}/${MAX_RETRY}) — chờ 10s...`, 'info');
+            await sleep(10000);
           }
-          const stillFailed = [];
-          // Gửi từng nhóm 2 task, đợi xong nhóm này mới gửi nhóm tiếp theo
-          for (let i = 0; i < pending.length; i += BATCH_SIZE) {
-            if (stopRef.current) throw new Error('Đã dừng.');
-            const chunk = pending.slice(i, i + BATCH_SIZE);
-            addLog(`📤 Gửi ${chunk.length} task (${i + 1}–${Math.min(i + BATCH_SIZE, pending.length)}/${pending.length})...`, 'info');
-            const r = await window.electronAPI.runVeo({ ...baseParams, tasks: chunk });
-            const files = r?.files || [];
-            for (const task of chunk) {
-              const f = files.find(x => x.id === task.id && !x.isError && x.filePath);
-              if (f) resultMap[task.id] = f;
-              else stillFailed.push(task);
-            }
-          }
-          pending = stillFailed;
-          if (pending.length > 0 && attempt < MAX_RETRY)
-            addLog(`⚠️ ${pending.length} task chưa xong, thử lại lần ${attempt + 1}...`, 'info');
+
+          const safeTasks = filterUnsent(pendingTasks, addLog);
+          if (!safeTasks.length) { addLog('⚠️ Tất cả task đã gửi trước đó — bỏ qua retry', 'info'); break; }
+
+          addLog(`📤 Gửi ${safeTasks.length} task lên Veo (lần ${attempt})...`, 'info');
+          const r = await window.electronAPI.runVeo({ ...baseParams, tasks: safeTasks });
+          const files = r?.files || [];
+
+          const succeeded = files.filter(f => !f.isError && f.filePath);
+          const failedIds = new Set(files.filter(f => f.isError).map(f => f.id));
+
+          // Lưu kết quả vào đúng vị trí theo index gốc
+          succeeded.forEach(f => {
+            const idx = taskIdxMap.get(f.id);
+            if (idx !== undefined) orderedResults[idx] = f;
+          });
+
+          if (succeeded.length > 0)
+            addLog(`✅ Lần ${attempt}: ${succeeded.length}/${safeTasks.length} thành công`, 'success');
+
+          // Chỉ retry những task server báo lỗi rõ ràng — đổi ID mới để tránh server nhầm với request cũ
+          pendingTasks = safeTasks
+            .filter(t => failedIds.has(t.id))
+            .map(t => {
+              const newId = `${t.id}_r${attempt}`;
+              taskIdxMap.set(newId, taskIdxMap.get(t.id));
+              taskIdxMap.delete(t.id);
+              return { ...t, id: newId };
+            });
+
+          if (pendingTasks.length > 0 && attempt < MAX_RETRY)
+            addLog(`⚠️ ${pendingTasks.length} task lỗi → sẽ thử lại lần ${attempt + 1}...`, 'info');
         }
-        if (pending.length > 0)
-          addLog(`❌ ${pending.length} task thất bại sau ${MAX_RETRY} lần thử — bỏ qua`, 'error');
+
+        if (pendingTasks.length > 0)
+          addLog(`❌ ${pendingTasks.length} task thất bại sau ${MAX_RETRY} lần — bỏ qua`, 'error');
+
+        // Map kết quả về theo task ID gốc (trước khi đổi ID retry)
+        const resultMap = {};
+        tasks.forEach((t, i) => { if (orderedResults[i]) resultMap[t.id] = orderedResults[i]; });
         return resultMap;
       };
 
@@ -5816,7 +5947,7 @@ Script:
         const dnasMeta = characters.map((c, i) => ({ charId: c.id, name: c.name, taskId: `dna_c${i}_${dnaTs}` }));
         const dnaTasks = characters.map((c, i) => ({
           id:        `dna_c${i}_${dnaTs}`,
-          prompt:    c.dna_prompt || `MANDATORY ART STYLE: ${parsed.art_style || 'Cinematic quality'}. Single character full-body reference sheet. Neutral standing pose, arms slightly out, plain white studio background. CHARACTER: ${c.desc}. Full body visible head to toe. Face clearly shown front-facing. Highly detailed, consistent proportions. NO style deviation.`,
+          prompt:    c.dna_prompt || `MANDATORY ART STYLE: ${parsed.art_style || 'Cinematic quality'}. Multi-angle character turnaround reference sheet, 8 panels in 2 rows of 4: TOP ROW — [front face portrait] [left side profile] [back head] [right side profile]; BOTTOM ROW — [full body front] [full body 3/4 left] [full body back] [full body 3/4 right]. Plain pure white studio background, no scene, no props except own accessories. CHARACTER: ${c.desc}. Same character consistently across all 8 panels. Professional character design turnaround sheet. NO style deviation. No text labels, no arrows, no annotations, no captions, no watermarks, no on-screen text.`,
           fileIndex: i + 1,
         }));
 
@@ -5881,9 +6012,13 @@ Script:
       addLog(`🖼 Batch tạo ${jobs.length} ảnh cảnh (thử lại tối đa ${MAX_RETRY} lần)...`, 'info');
       setSceneJobs(jobs.map(j => ({ ...j, imgStatus: 'running' })));
 
+      // Mỗi cảnh dùng đúng prompt ảnh của cảnh đó + DNA nhân vật xuất hiện trong cảnh
       const imgTasks = jobs.map((job, i) => {
+        const dnaFiles = job.sceneDnaImgs.map(p => p.split(/[\\/]/).pop()).join(', ') || 'none';
+        addLog(`[Storyboard] Cảnh ${job.sceneNum} (jobs[${i}]): tạo ảnh + DNA=[${dnaFiles}]`, 'info');
         const t = { id: job.imgJobId, prompt: job.prompt, fileIndex: i + 1 };
-        if (job.sceneDnaImgs.length > 0) t.ingredientImages = job.sceneDnaImgs;
+        // Dùng referenceImages (không phải ingredientImages) để VeoEngine thực sự dùng DNA làm tham chiếu
+        if (job.sceneDnaImgs.length > 0) t.referenceImages = job.sceneDnaImgs;
         return t;
       });
       const imgResults = await runVeoBatch(
@@ -5892,8 +6027,12 @@ Script:
       );
       for (let i = 0; i < jobs.length; i++) {
         const f = imgResults[jobs[i].imgJobId];
-        if (f) { jobs[i] = { ...jobs[i], imgStatus: 'done', imgPath: f.filePath }; addLog(`✅ Ảnh cảnh ${jobs[i].sceneNum} → ${f.filePath.split(/[\\/]/).pop()}`, 'success'); }
-        else      jobs[i] = { ...jobs[i], imgStatus: 'error' };
+        if (f) {
+          jobs[i] = { ...jobs[i], imgStatus: 'done', imgPath: f.filePath };
+          addLog(`✅ Ảnh cảnh ${jobs[i].sceneNum} → ${f.filePath.split(/[\\/]/).pop()}`, 'success');
+        } else {
+          jobs[i] = { ...jobs[i], imgStatus: 'error' };
+        }
       }
       setSceneJobs([...jobs]);
       sceneJobsRef.current = [...jobs];
@@ -5904,11 +6043,20 @@ Script:
       // ── 7. Batch tạo tất cả video ─────────────────────────────────────────────
       setPhase('gen_videos');
       const jobsWithImg = jobs.filter(j => j.imgPath);
-      addLog(`🎬 Batch tạo ${jobsWithImg.length} video Ingredie (thử lại tối đa ${MAX_RETRY} lần)...`, 'info');
+      addLog(`🎬 Batch tạo ${jobsWithImg.length} video từ scene image (thử lại tối đa ${MAX_RETRY} lần)...`, 'info');
       setSceneJobs(jobs.map(j => j.imgPath ? { ...j, vidStatus: 'running' } : j));
 
-      const vidTasks = jobsWithImg.map((job, i) => {
-        const t = { id: job.vidJobId, prompt: job.videoPrompt, ingredientImages: [job.imgPath], fileIndex: jobs.indexOf(job) + 1 };
+      // Đảm bảo cảnh N dùng đúng promptN + ảnhN — không được lệch thứ tự
+      const vidTasks = jobsWithImg.map((job) => {
+        const sceneIdx = jobs.indexOf(job); // index gốc trong jobs[]
+        const imgFile  = job.imgPath?.split(/[\\/]/).pop() || '(none)';
+        addLog(`[Storyboard] Cảnh ${job.sceneNum} (jobs[${sceneIdx}]): videoPrompt="${job.videoPrompt.substring(0, 60)}..." + ảnh="${imgFile}"`, 'info');
+        if (!job.imgPath) throw new Error(`❌ Cảnh ${job.sceneNum}: imgPath null — không thể tạo video (logic error)`);
+        // Video PHẢI animate từ ảnh cảnh thực tế (job.imgPath) — KHÔNG dùng DNA turnaround sheet
+        // DNA chỉ dùng làm referenceImages cho bước tạo ẢNH, không dùng cho bước tạo VIDEO
+        const videoIngredients = [job.imgPath];
+        addLog(`[Storyboard] Cảnh ${job.sceneNum}: video ingredient = ${job.imgPath.split(/[\\/]/).pop()} (scene image)`, 'info');
+        const t = { id: job.vidJobId, prompt: job.videoPrompt, ingredientImages: videoIngredients, fileIndex: sceneIdx + 1 };
         if (job.voiceId) t.voiceId = job.voiceId;
         return t;
       });
@@ -6093,6 +6241,114 @@ Script:
                 </div>
               </div>
             </div>
+
+            {/* ── Hồ sơ nhân vật — giống Creator Studio ─────────────────── */}
+            <div className="border border-slate-800/60 rounded-xl overflow-hidden">
+              <button onClick={() => setShowChars(v => !v)} disabled={isRunning}
+                className="w-full flex items-center justify-between px-3 py-2.5 hover:bg-slate-800/40 transition-colors">
+                <span className="text-[10px] font-bold text-purple-400 uppercase tracking-wider flex items-center gap-1.5">
+                  <Users size={10} className="text-purple-400"/>
+                  Hồ sơ nhân vật
+                  {hasMainChar && (
+                    <span className="ml-1 px-1.5 py-0.5 bg-purple-500/20 text-purple-300 rounded text-[9px]">
+                      {1 + secChars.filter(c => c.name || c.appearance).length} NV đã nhập
+                    </span>
+                  )}
+                </span>
+                <ChevronRight size={12} className={cn('text-slate-500 transition-transform', showChars && 'rotate-90')}/>
+              </button>
+              {showChars && (
+                <div className="px-3 pb-3 space-y-3 border-t border-slate-800/60">
+                  <p className="text-[9px] text-slate-600 pt-2 leading-relaxed">Định nghĩa nhân vật trước — Gemini sẽ dùng CHÍNH XÁC tên, ngoại hình, trang phục này khi viết kịch bản và tạo ảnh.</p>
+
+                  {/* Nhân vật chính */}
+                  <div className="p-2.5 bg-purple-500/5 border border-purple-500/20 rounded-xl space-y-2">
+                    <div className="flex items-center gap-1.5">
+                      <div className="w-1.5 h-1.5 rounded-full bg-purple-400"/>
+                      <span className="text-[10px] font-bold text-purple-400">Nhân vật chính</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <input placeholder="Tên nhân vật" value={mainChar.name}
+                        onChange={e => setMainChar(p => ({ ...p, name: e.target.value }))}
+                        disabled={isRunning}
+                        className="col-span-2 bg-[#0a1020] border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-purple-500/60"/>
+                      <select value={mainChar.gender} onChange={e => setMainChar(p => ({ ...p, gender: e.target.value }))}
+                        disabled={isRunning}
+                        className="bg-[#0a1020] border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-purple-500/60">
+                        <option>Nữ</option><option>Nam</option><option>Khác</option>
+                      </select>
+                      <input placeholder="Tuổi (VD: 22)" value={mainChar.age}
+                        onChange={e => setMainChar(p => ({ ...p, age: e.target.value }))}
+                        disabled={isRunning}
+                        className="bg-[#0a1020] border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-purple-500/60"/>
+                    </div>
+                    <input placeholder="Sắc tộc / Quốc tịch (VD: Người Việt, East Asian, Korean...)" value={mainChar.ethnicity}
+                      onChange={e => setMainChar(p => ({ ...p, ethnicity: e.target.value }))}
+                      disabled={isRunning}
+                      className="w-full bg-[#0a1020] border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-purple-500/60"/>
+                    <textarea placeholder="Ngoại hình chi tiết: khuôn mặt, kiểu tóc, màu tóc, màu mắt, vóc dáng, đặc điểm nhận dạng..."
+                      value={mainChar.appearance} onChange={e => setMainChar(p => ({ ...p, appearance: e.target.value }))}
+                      rows={3} disabled={isRunning}
+                      className="w-full bg-[#0a1020] border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-purple-500/60 resize-none leading-relaxed"/>
+                    <textarea placeholder="Trang phục & phụ kiện (màu sắc cụ thể, chất liệu, vũ khí nếu có...)"
+                      value={mainChar.clothing} onChange={e => setMainChar(p => ({ ...p, clothing: e.target.value }))}
+                      rows={2} disabled={isRunning}
+                      className="w-full bg-[#0a1020] border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-purple-500/60 resize-none"/>
+                    <input placeholder="Vai trò trong kịch bản (tuỳ chọn — VD: chính diện, phản diện...)" value={mainChar.role}
+                      onChange={e => setMainChar(p => ({ ...p, role: e.target.value }))}
+                      disabled={isRunning}
+                      className="w-full bg-[#0a1020] border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-purple-500/60"/>
+                  </div>
+
+                  {/* Nhân vật phụ */}
+                  {secChars.map((c, i) => (
+                    <div key={c.id} className="p-2.5 bg-indigo-500/5 border border-indigo-500/20 rounded-xl space-y-1.5">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-1.5">
+                          <div className="w-1.5 h-1.5 rounded-full bg-indigo-400"/>
+                          <span className="text-[10px] font-bold text-indigo-400">Nhân vật phụ {i + 1}</span>
+                        </div>
+                        <button onClick={() => removeSecChar(c.id)} disabled={isRunning}
+                          className="text-slate-600 hover:text-red-400 transition-colors p-0.5">
+                          <X size={11}/>
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <input placeholder="Tên" value={c.name}
+                          onChange={e => updateSecChar(c.id, 'name', e.target.value)} disabled={isRunning}
+                          className="col-span-2 bg-[#0a1020] border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-indigo-500/60"/>
+                        <select value={c.gender} onChange={e => updateSecChar(c.id, 'gender', e.target.value)} disabled={isRunning}
+                          className="bg-[#0a1020] border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-indigo-500/60">
+                          <option>Nữ</option><option>Nam</option><option>Khác</option>
+                        </select>
+                        <input placeholder="Tuổi" value={c.age}
+                          onChange={e => updateSecChar(c.id, 'age', e.target.value)} disabled={isRunning}
+                          className="bg-[#0a1020] border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-indigo-500/60"/>
+                      </div>
+                      <input placeholder="Sắc tộc / Quốc tịch" value={c.ethnicity}
+                        onChange={e => updateSecChar(c.id, 'ethnicity', e.target.value)} disabled={isRunning}
+                        className="w-full bg-[#0a1020] border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-indigo-500/60"/>
+                      <textarea placeholder="Ngoại hình chi tiết"
+                        value={c.appearance} onChange={e => updateSecChar(c.id, 'appearance', e.target.value)}
+                        rows={2} disabled={isRunning}
+                        className="w-full bg-[#0a1020] border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-indigo-500/60 resize-none"/>
+                      <textarea placeholder="Trang phục & phụ kiện"
+                        value={c.clothing} onChange={e => updateSecChar(c.id, 'clothing', e.target.value)}
+                        rows={1} disabled={isRunning}
+                        className="w-full bg-[#0a1020] border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-indigo-500/60 resize-none"/>
+                    </div>
+                  ))}
+
+                  {secChars.length < 4 && (
+                    <button onClick={addSecChar} disabled={isRunning}
+                      className="w-full py-2 border border-dashed border-slate-700 hover:border-indigo-500/50 text-slate-600 hover:text-indigo-400 rounded-lg text-[10px] transition-colors disabled:opacity-40">
+                      + Thêm nhân vật phụ
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
             {generatedScript && (
               <div className="bg-[#0a1020] border border-slate-800 rounded-lg p-2">
                 <p className="text-[9px] font-bold text-slate-600 uppercase mb-1">Kịch bản đã tạo</p>
@@ -6220,29 +6476,67 @@ Script:
             )}
           </div>
 
-          {/* Characters parsed */}
+          {/* Characters parsed — với voice selection per character */}
           {parsedData?.characters?.length > 0 && (
             <div className="border-t border-slate-800/60 pt-4">
-              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-2">
-                Nhân vật {Object.keys(charDnaMap).length > 0 && <span className="text-emerald-400">({Object.keys(charDnaMap).length} DNA ✓)</span>}
-              </label>
-              {parsedData.characters.map((c, i) => (
-                <div key={i} className="bg-[#0a1020] border border-slate-800 rounded-lg p-2 mb-1.5 flex gap-2">
-                  {charDnaMap[c.id] ? (
-                    <button onClick={() => window.electronAPI?.openFile?.(charDnaMap[c.id])} title="Mở ảnh DNA">
-                      <img src={toFUrl(charDnaMap[c.id])} alt="" className="w-10 h-10 rounded-lg object-cover border border-slate-700 shrink-0"/>
+              {/* Header + quick-set buttons */}
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                  Nhân vật {Object.keys(charDnaMap).length > 0 && <span className="text-emerald-400">({Object.keys(charDnaMap).length} DNA ✓)</span>}
+                </label>
+                {!isRunning && (
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => setCharVoiceOverrides(parsedData.characters.map(() => 'random'))}
+                      className="text-[8px] text-violet-400 hover:text-violet-300 px-1.5 py-0.5 bg-violet-900/20 hover:bg-violet-900/30 rounded transition-colors">
+                      🎲 Tất cả auto
                     </button>
-                  ) : (
-                    <div className="w-10 h-10 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center shrink-0">
-                      {phase === 'gen_dna' ? <Loader2 size={10} className="text-cyan-400 animate-spin"/> : <Brain size={10} className="text-slate-600"/>}
+                    <button
+                      onClick={() => setCharVoiceOverrides(parsedData.characters.map(() => ''))}
+                      className="text-[8px] text-slate-500 hover:text-slate-400 px-1.5 py-0.5 bg-slate-800/50 hover:bg-slate-700/50 rounded transition-colors">
+                      🔇 Tắt tất cả
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {parsedData.characters.map((c, i) => (
+                <div key={i} className="bg-[#0a1020] border border-slate-800 rounded-lg p-2 mb-1.5">
+                  {/* Row 1: avatar + name + desc */}
+                  <div className="flex gap-2 mb-1.5">
+                    {charDnaMap[c.id] ? (
+                      <button onClick={() => window.electronAPI?.openFile?.(charDnaMap[c.id])} title="Mở ảnh DNA">
+                        <img src={toFUrl(charDnaMap[c.id])} alt="" className="w-10 h-10 rounded-lg object-cover border border-slate-700 shrink-0"/>
+                      </button>
+                    ) : (
+                      <div className="w-10 h-10 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center shrink-0">
+                        {phase === 'gen_dna' ? <Loader2 size={10} className="text-cyan-400 animate-spin"/> : <Brain size={10} className="text-slate-600"/>}
+                      </div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[10px] font-bold text-pink-300 truncate mb-0.5">{c.name}</p>
+                      <p className="text-[9px] text-slate-500 leading-relaxed line-clamp-1">{c.desc}</p>
                     </div>
-                  )}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-1.5 mb-0.5">
-                      <p className="text-[10px] font-bold text-pink-300 truncate">{c.name}</p>
-                      {voiceMap[c.id] && <span className="text-[9px] text-violet-400 bg-violet-900/30 px-1.5 py-0.5 rounded-full shrink-0">🎙 {voiceMap[c.id]}</span>}
-                    </div>
-                    <p className="text-[9px] text-slate-500 leading-relaxed line-clamp-2">{c.desc}</p>
+                  </div>
+                  {/* Row 2: voice selector */}
+                  <div className="flex items-center gap-1.5">
+                    <Volume2 size={9} className="text-violet-500 shrink-0"/>
+                    <select
+                      value={charVoiceOverrides[i] ?? 'random'}
+                      onChange={e => {
+                        const v = [...charVoiceOverrides];
+                        v[i] = e.target.value;
+                        setCharVoiceOverrides(v);
+                      }}
+                      disabled={isRunning}
+                      className="flex-1 bg-slate-800/60 border border-violet-500/30 rounded-lg px-1.5 py-1 text-[9px] text-violet-300 focus:outline-none focus:border-violet-500/60 disabled:opacity-50">
+                      {VOICE_LIST.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
+                    </select>
+                    {voiceMap[c.id] && (
+                      <span className="text-[8px] text-violet-400 bg-violet-900/30 px-1.5 py-0.5 rounded-full shrink-0 whitespace-nowrap">
+                        ✓ {voiceMap[c.id]}
+                      </span>
+                    )}
                   </div>
                 </div>
               ))}

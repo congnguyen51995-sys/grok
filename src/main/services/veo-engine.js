@@ -82,6 +82,11 @@ class VeoEngine {
                         if (res.statusCode === 403 && data.includes('reCAPTCHA')) {
                             const e = new Error('RECAPTCHA_EXPIRED');
                             e.isRecaptchaExpired = true;
+                            if (data.includes('UNUSUAL_ACTIVITY')) {
+                                e.isUnusualActivity = true;
+                                // Cooldown 60s cho toàn bộ worker — Google đang rate-limit
+                                global.googleLabsAuth._recaptchaUnusualActivityUntil = Date.now() + 60000;
+                            }
                             return reject(e);
                         }
                         reject(new Error(`API Error ${res.statusCode}: ${data.substring(0, 100)}`));
@@ -105,6 +110,13 @@ class VeoEngine {
         return new Promise((resolve, reject) => {
             _recaptchaLock = _recaptchaLock.then(async () => {
                 try {
+                    // Nếu đang trong cooldown UNUSUAL_ACTIVITY — chờ hết thời gian rồi mới lấy token
+                    const cooldownUntil = global.googleLabsAuth._recaptchaUnusualActivityUntil || 0;
+                    if (Date.now() < cooldownUntil) {
+                        const waitMs = cooldownUntil - Date.now();
+                        if (sendLog) sendLog(`[JOBID:${jobId}] 🛑 UNUSUAL_ACTIVITY cooldown — chờ ${Math.ceil(waitMs / 1000)}s trước khi lấy reCAPTCHA mới...`, 'warn');
+                        await new Promise(r => setTimeout(r, waitMs));
+                    }
                     if (sendLog) sendLog(`[JOBID:${jobId}] Đang lấy mã bảo mật ReCaptcha...`, 'info');
                     global.googleLabsAuth.recaptchaAction = action;
                     global.googleLabsAuth.recaptchaToken = null;
@@ -916,9 +928,16 @@ class VeoEngine {
             global.googleLabsAuth._lastExtError = res._extError;
             // Phát hiện lỗi reCAPTCHA từ Extension — throw isRecaptchaExpired để caller tự động retry/reload
             if (/reCAPTCHA|recaptcha|evaluation.failed|UNUSUAL_ACTIVITY/i.test(String(res._extError))) {
-                sendLog(`[JOBID:${taskId}] ⚠️ Extension: reCAPTCHA bị từ chối (UNUSUAL_ACTIVITY) — tự động F5 và thử lại...`, 'info');
+                const isUnusual = /UNUSUAL_ACTIVITY/i.test(String(res._extError));
+                if (isUnusual) {
+                    global.googleLabsAuth._recaptchaUnusualActivityUntil = Date.now() + 60000;
+                    sendLog(`[JOBID:${taskId}] 🛑 Extension: UNUSUAL_ACTIVITY — áp cooldown 60s cho toàn bộ worker...`, 'warn');
+                } else {
+                    sendLog(`[JOBID:${taskId}] ⚠️ Extension: reCAPTCHA bị từ chối — tự động thử lại...`, 'info');
+                }
                 const e = new Error('RECAPTCHA_EXPIRED');
                 e.isRecaptchaExpired = true;
+                e.isUnusualActivity = isUnusual;
                 throw e;
             }
             return null;
@@ -1297,7 +1316,7 @@ class VeoEngine {
 
             sendLog(`Khởi động động cơ API...`, 'info');
 
-            const MAX_WORKERS = 5;
+            const MAX_WORKERS = 2; // Giới hạn 2 worker đồng thời — tránh UNUSUAL_ACTIVITY rate-limit từ Google
             let activeJobs = 0;
 
             // Trả về số thứ tự 1-based từ task.fileIndex hoặc task.id
@@ -1348,8 +1367,12 @@ class VeoEngine {
                                 break; // thành công → thoát loop
                             } catch (e) {
                                 if (e.isRecaptchaExpired && tokenTry < 3) {
-                                    sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, tự động lấy token mới (${tokenTry}/3)...`, 'info');
-                                    await VeoEngine.randDelay(2000, 4000);
+                                    if (e.isUnusualActivity) {
+                                        sendLog(`[JOBID:${task.id}] 🛑 UNUSUAL_ACTIVITY — cooldown 60s đã áp, lần ${tokenTry}/3...`, 'warn');
+                                    } else {
+                                        sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, tự động lấy token mới (${tokenTry}/3)...`, 'info');
+                                        await VeoEngine.randDelay(2000, 4000);
+                                    }
                                     continue;
                                 }
                                 if (e.isRecaptchaExpired && !imgAutoReloaded) {
@@ -1471,8 +1494,13 @@ class VeoEngine {
                                         break;
                                     } catch (e) {
                                         if (e.isRecaptchaExpired && tokenTry < 3) {
-                                            sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, lấy token mới (${tokenTry}/3)...`, 'info');
-                                            await VeoEngine.randDelay(2000, 4000); continue;
+                                            if (e.isUnusualActivity) {
+                                                sendLog(`[JOBID:${task.id}] 🛑 UNUSUAL_ACTIVITY — cooldown 60s đã áp, lần ${tokenTry}/3...`, 'warn');
+                                            } else {
+                                                sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, lấy token mới (${tokenTry}/3)...`, 'info');
+                                                await VeoEngine.randDelay(2000, 4000);
+                                            }
+                                            continue;
                                         }
                                         if (e.isRecaptchaExpired && !ingr1AutoReloaded) {
                                             ingr1AutoReloaded = true;
@@ -1505,8 +1533,13 @@ class VeoEngine {
                                         break;
                                     } catch (e) {
                                         if (e.isRecaptchaExpired && tokenTry < 3) {
-                                            sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, lấy token mới (${tokenTry}/3)...`, 'info');
-                                            await VeoEngine.randDelay(2000, 4000); continue;
+                                            if (e.isUnusualActivity) {
+                                                sendLog(`[JOBID:${task.id}] 🛑 UNUSUAL_ACTIVITY — cooldown 60s đã áp, lần ${tokenTry}/3...`, 'warn');
+                                            } else {
+                                                sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, lấy token mới (${tokenTry}/3)...`, 'info');
+                                                await VeoEngine.randDelay(2000, 4000);
+                                            }
+                                            continue;
                                         }
                                         if (e.isRecaptchaExpired && !ingr2AutoReloaded) {
                                             ingr2AutoReloaded = true;
@@ -1555,13 +1588,24 @@ class VeoEngine {
                                         break;
                                     } catch (e) {
                                         const msg = e.message || '';
-                                        if (e.isRecaptchaExpired && !i2vAutoReloaded) {
-                                            i2vAutoReloaded = true;
-                                            sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, tự động lấy token mới...`, 'info');
-                                            const ok = await this.reloadLabsAndWait(sendLog, task.id);
-                                            if (ok) { i2vRetry = 0; continue; }
+                                        if (e.isRecaptchaExpired) {
+                                            if (e.isUnusualActivity) {
+                                                // UNUSUAL_ACTIVITY — cooldown đã set, acquireRecaptcha sẽ tự chờ — không cần F5
+                                                if (i2vRetry < 2) {
+                                                    i2vRetry++;
+                                                    sendLog(`[JOBID:${task.id}] 🛑 UNUSUAL_ACTIVITY — chờ cooldown rồi thử lại ${i2vRetry}/2...`, 'warn');
+                                                    continue;
+                                                }
+                                                throw new Error("UNUSUAL_ACTIVITY rate-limit liên tục — vui lòng thử lại sau vài phút.");
+                                            }
+                                            if (!i2vAutoReloaded) {
+                                                i2vAutoReloaded = true;
+                                                sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, tự động F5 Google Labs...`, 'info');
+                                                const ok = await this.reloadLabsAndWait(sendLog, task.id);
+                                                if (ok) { i2vRetry = 0; continue; }
+                                            }
+                                            throw new Error("Token hết hạn — đã tự động F5 Google Labs nhưng vẫn lỗi.");
                                         }
-                                        if (e.isRecaptchaExpired) throw new Error("Token hết hạn — đã tự động F5 Google Labs nhưng vẫn lỗi.");
                                         if ((msg.includes('500') || msg.includes('503') || msg.includes('timeout')) && i2vRetry < 2) {
                                             i2vRetry++;
                                             sendLog(`[JOBID:${task.id}] ⚠️ Server lỗi, thử lại ${i2vRetry}/2 (lấy mã mới)...`, 'info');
@@ -1583,13 +1627,24 @@ class VeoEngine {
                                         break;
                                     } catch (e) {
                                         const msg = e.message || '';
-                                        if (e.isRecaptchaExpired && !t2vAutoReloaded) {
-                                            t2vAutoReloaded = true;
-                                            sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, tự động lấy token mới...`, 'info');
-                                            const ok = await this.reloadLabsAndWait(sendLog, task.id);
-                                            if (ok) { t2vRetry = 0; continue; }
+                                        if (e.isRecaptchaExpired) {
+                                            if (e.isUnusualActivity) {
+                                                // UNUSUAL_ACTIVITY — cooldown đã set, acquireRecaptcha sẽ tự chờ — không cần F5
+                                                if (t2vRetry < 2) {
+                                                    t2vRetry++;
+                                                    sendLog(`[JOBID:${task.id}] 🛑 UNUSUAL_ACTIVITY — chờ cooldown rồi thử lại ${t2vRetry}/2...`, 'warn');
+                                                    continue;
+                                                }
+                                                throw new Error("UNUSUAL_ACTIVITY rate-limit liên tục — vui lòng thử lại sau vài phút.");
+                                            }
+                                            if (!t2vAutoReloaded) {
+                                                t2vAutoReloaded = true;
+                                                sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, tự động F5 Google Labs...`, 'info');
+                                                const ok = await this.reloadLabsAndWait(sendLog, task.id);
+                                                if (ok) { t2vRetry = 0; continue; }
+                                            }
+                                            throw new Error("Token hết hạn — đã tự động F5 Google Labs nhưng vẫn lỗi.");
                                         }
-                                        if (e.isRecaptchaExpired) throw new Error("Token hết hạn — đã tự động F5 Google Labs nhưng vẫn lỗi.");
                                         if ((msg.includes('500') || msg.includes('503') || msg.includes('timeout')) && t2vRetry < 2) {
                                             t2vRetry++;
                                             sendLog(`[JOBID:${task.id}] ⚠️ Server lỗi, thử lại ${t2vRetry}/2 (lấy mã mới)...`, 'info');

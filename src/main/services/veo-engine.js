@@ -1297,7 +1297,7 @@ class VeoEngine {
 
             sendLog(`Khởi động động cơ API...`, 'info');
 
-            const MAX_WORKERS = 5;
+            const MAX_WORKERS = 1; // sequential: xong download rồi mới gửi lệnh tiếp theo
             let activeJobs = 0;
 
             // Trả về số thứ tự 1-based từ task.fileIndex hoặc task.id
@@ -1864,18 +1864,10 @@ class VeoEngine {
             };
 
             const executeWorkers = async () => {
-                const workers = [];
+                // Sequential: gửi 1 lệnh → chờ download xong → mới gửi lệnh tiếp theo
                 for (let i = 0; i < tasks.length; i++) {
-                    const task = tasks[i];
-                    while (activeJobs >= MAX_WORKERS) await new Promise(r => setTimeout(r, 1000));
-                    activeJobs++;
-                    // Stagger ngẫu nhiên 8–18s giữa mỗi lần khởi động task
-                    // Task đầu tiên không cần chờ; từ task thứ 2 trở đi mới delay
-                    if (i > 0) await VeoEngine.randDelay(8000, 18000);
-                    const worker = processTask(task).finally(() => { activeJobs--; });
-                    workers.push(worker);
+                    await processTask(tasks[i]);
                 }
-                await Promise.all(workers);
             };
 
             await executeWorkers();

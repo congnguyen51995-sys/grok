@@ -1297,7 +1297,7 @@ class VeoEngine {
 
             sendLog(`Khởi động động cơ API...`, 'info');
 
-            const MAX_WORKERS = 1; // sequential: xong download rồi mới gửi lệnh tiếp theo
+            const MAX_WORKERS = mediaType === 'Image' ? 5 : 1;
             let activeJobs = 0;
 
             // Trả về số thứ tự 1-based từ task.fileIndex hoặc task.id
@@ -1864,24 +1864,37 @@ class VeoEngine {
             };
 
             const executeWorkers = async () => {
-                // Sequential + per-task retry tối đa 10 lần
-                for (const task of tasks) {
-                    let taskDone = false;
-                    for (let attempt = 1; attempt <= 10 && !taskDone; attempt++) {
-                        const prevLen = results.length;
-                        await processTask(task);
-                        // Kiểm tra task vừa push kết quả thành công hay lỗi
-                        const newResults = results.slice(prevLen);
-                        if (newResults.some(r => !r.isError)) {
-                            taskDone = true; // có ít nhất 1 kết quả thành công → sang task tiếp
-                        } else {
-                            results.splice(prevLen); // xóa kết quả lỗi, sẽ thử lại
-                            if (attempt < 10) {
-                                sendLog(`[JOBID:${task.id}] 🔁 Thất bại lần ${attempt}/10 — thử lại sau 5s...`, 'warn');
-                                await new Promise(r => setTimeout(r, 5000));
+                if (mediaType === 'Image') {
+                    // Ảnh: chạy 5 task song song (như cũ)
+                    const workers = [];
+                    for (let i = 0; i < tasks.length; i++) {
+                        const task = tasks[i];
+                        while (activeJobs >= MAX_WORKERS) await new Promise(r => setTimeout(r, 1000));
+                        activeJobs++;
+                        if (i > 0) await VeoEngine.randDelay(8000, 18000);
+                        const w = processTask(task).finally(() => { activeJobs--; });
+                        workers.push(w);
+                    }
+                    await Promise.all(workers);
+                } else {
+                    // Video: sequential — xong download rồi mới gửi lệnh tiếp, retry tối đa 10 lần
+                    for (const task of tasks) {
+                        let taskDone = false;
+                        for (let attempt = 1; attempt <= 10 && !taskDone; attempt++) {
+                            const prevLen = results.length;
+                            await processTask(task);
+                            const newResults = results.slice(prevLen);
+                            if (newResults.some(r => !r.isError)) {
+                                taskDone = true;
                             } else {
-                                sendLog(`[JOBID:${task.id}] ❌ Đã thử 10 lần vẫn lỗi — bỏ qua task này`, 'error');
-                                results.push({ id: task.id, prompt: task.prompt, isError: true });
+                                results.splice(prevLen); // xóa kết quả lỗi, thử lại
+                                if (attempt < 10) {
+                                    sendLog(`[JOBID:${task.id}] 🔁 Thất bại lần ${attempt}/10 — thử lại sau 5s...`, 'warn');
+                                    await new Promise(r => setTimeout(r, 5000));
+                                } else {
+                                    sendLog(`[JOBID:${task.id}] ❌ Đã thử 10 lần vẫn lỗi — bỏ qua task này`, 'error');
+                                    results.push({ id: task.id, prompt: task.prompt, isError: true });
+                                }
                             }
                         }
                     }

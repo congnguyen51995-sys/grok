@@ -1877,25 +1877,44 @@ class VeoEngine {
                     }
                     await Promise.all(workers);
                 } else {
-                    // Video: sequential — xong download rồi mới gửi lệnh tiếp, retry tối đa 10 lần
-                    for (const task of tasks) {
-                        let taskDone = false;
-                        for (let attempt = 1; attempt <= 10 && !taskDone; attempt++) {
+                    // Video: batch 5 task song song → chờ cả batch xong (download) → retry task lỗi → batch tiếp
+                    const BATCH_SIZE = 5;
+                    const MAX_RETRIES = 10;
+                    for (let batchStart = 0; batchStart < tasks.length; batchStart += BATCH_SIZE) {
+                        const batch = tasks.slice(batchStart, batchStart + BATCH_SIZE);
+                        let pendingTasks = [...batch];
+
+                        for (let attempt = 1; attempt <= MAX_RETRIES && pendingTasks.length > 0; attempt++) {
+                            sendLog(`📦 Batch ${Math.floor(batchStart / BATCH_SIZE) + 1} — chạy ${pendingTasks.length} task${attempt > 1 ? ` (retry lần ${attempt})` : ''}...`, 'info');
                             const prevLen = results.length;
-                            await processTask(task);
+
+                            // Chạy tất cả pending task song song, chờ hết batch
+                            await Promise.all(pendingTasks.map(task => processTask(task)));
+
+                            // Tìm task thành công / lỗi
                             const newResults = results.slice(prevLen);
-                            if (newResults.some(r => !r.isError)) {
-                                taskDone = true;
-                            } else {
-                                results.splice(prevLen); // xóa kết quả lỗi, thử lại
-                                if (attempt < 10) {
-                                    sendLog(`[JOBID:${task.id}] 🔁 Thất bại lần ${attempt}/10 — thử lại sau 5s...`, 'warn');
+                            const succeededIds = new Set(newResults.filter(r => !r.isError).map(r => r.id));
+                            const failedTasks = pendingTasks.filter(t => !succeededIds.has(t.id));
+
+                            if (failedTasks.length > 0) {
+                                // Xóa kết quả lỗi của các task sẽ retry
+                                const failedIds = new Set(failedTasks.map(t => t.id));
+                                for (let j = results.length - 1; j >= prevLen; j--) {
+                                    if (failedIds.has(results[j]?.id) && results[j]?.isError) {
+                                        results.splice(j, 1);
+                                    }
+                                }
+                                if (attempt < MAX_RETRIES) {
+                                    sendLog(`🔁 ${failedTasks.length} task lỗi — thử lại lần ${attempt + 1}/${MAX_RETRIES} sau 5s...`, 'warn');
                                     await new Promise(r => setTimeout(r, 5000));
                                 } else {
-                                    sendLog(`[JOBID:${task.id}] ❌ Đã thử 10 lần vẫn lỗi — bỏ qua task này`, 'error');
-                                    results.push({ id: task.id, prompt: task.prompt, isError: true });
+                                    sendLog(`❌ ${failedTasks.length} task thử ${MAX_RETRIES} lần vẫn lỗi — bỏ qua`, 'error');
+                                    for (const t of failedTasks) {
+                                        results.push({ id: t.id, prompt: t.prompt, isError: true });
+                                    }
                                 }
                             }
+                            pendingTasks = failedTasks;
                         }
                     }
                 }

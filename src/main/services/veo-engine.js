@@ -1864,9 +1864,27 @@ class VeoEngine {
             };
 
             const executeWorkers = async () => {
-                // Sequential: gửi 1 lệnh → chờ download xong → mới gửi lệnh tiếp theo
-                for (let i = 0; i < tasks.length; i++) {
-                    await processTask(tasks[i]);
+                // Sequential + per-task retry tối đa 10 lần
+                for (const task of tasks) {
+                    let taskDone = false;
+                    for (let attempt = 1; attempt <= 10 && !taskDone; attempt++) {
+                        const prevLen = results.length;
+                        await processTask(task);
+                        // Kiểm tra task vừa push kết quả thành công hay lỗi
+                        const newResults = results.slice(prevLen);
+                        if (newResults.some(r => !r.isError)) {
+                            taskDone = true; // có ít nhất 1 kết quả thành công → sang task tiếp
+                        } else {
+                            results.splice(prevLen); // xóa kết quả lỗi, sẽ thử lại
+                            if (attempt < 10) {
+                                sendLog(`[JOBID:${task.id}] 🔁 Thất bại lần ${attempt}/10 — thử lại sau 5s...`, 'warn');
+                                await new Promise(r => setTimeout(r, 5000));
+                            } else {
+                                sendLog(`[JOBID:${task.id}] ❌ Đã thử 10 lần vẫn lỗi — bỏ qua task này`, 'error');
+                                results.push({ id: task.id, prompt: task.prompt, isError: true });
+                            }
+                        }
+                    }
                 }
             };
 

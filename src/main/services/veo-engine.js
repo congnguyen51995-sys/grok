@@ -1879,7 +1879,7 @@ class VeoEngine {
                 } else {
                     // Video: batch 5 task song song → chờ cả batch xong (download) → retry task lỗi → batch tiếp
                     const BATCH_SIZE = 5;
-                    const MAX_RETRIES = 10;
+                    const MAX_RETRIES = 20;
                     for (let batchStart = 0; batchStart < tasks.length; batchStart += BATCH_SIZE) {
                         const batch = tasks.slice(batchStart, batchStart + BATCH_SIZE);
                         let pendingTasks = [...batch];

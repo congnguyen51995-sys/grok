@@ -117,6 +117,35 @@ export async function transcribeAudioChunked(apiKeys, totalDuration, extractChun
   return { fullText, segments: allSegments };
 }
 
+// ─── Loại bỏ từ/câu lặp trong transcript (stutter TTS hoặc sub trùng timestamp) ──
+// VD: "But here's the But here's the cold" → "But here's the cold"
+//     "Don't miss a single one. Don't miss a single one." → "Don't miss a single one."
+//     "and and avoid" → "and avoid"
+function cleanDialogueText(text) {
+  if (!text || typeof text !== 'string') return text;
+  let s = text.replace(/\s+/g, ' ').trim();
+
+  // Pass 1: Xóa stutter-restart — cùng N từ liên tiếp (n=7 xuống 2)
+  for (let n = 7; n >= 2; n--) {
+    const w    = `[\\w'’\\-]+`;
+    const grp  = `(?:${w}\\s+){${n - 1}}${w}`;
+    const re   = new RegExp(`(${grp})[,.]?\\s+\\1`, 'gi');
+    let prev;
+    do { prev = s; s = s.replace(re, '$1'); } while (s !== prev);
+  }
+
+  // Pass 2: Xóa từ đơn lặp liên tiếp (kể cả có dấu phẩy giữa)
+  // "and, and" → "and"  |  "scientific, scientific" → "scientific"
+  s = s.replace(/\b(\w+)[,.]?\s+\1\b/gi, '$1');
+
+  // Pass 3: Xóa câu/mệnh đề trùng liên tiếp
+  const parts   = s.split(/(?<=[.!?])\s+/);
+  const norm    = (t) => t.replace(/[.,!?'"]/g, '').trim().toLowerCase();
+  const deduped = parts.filter((p, i) => i === 0 || norm(p) !== norm(parts[i - 1]));
+
+  return deduped.join(' ').replace(/\s+/g, ' ').trim();
+}
+
 // ─── 2. Chia audio thành chunks theo timeline cố định (port từ Python) ────────
 export function createTimeBasedChunks(segments, totalAudioSeconds, chunkDuration = 8) {
   const totalChunks = Math.ceil(totalAudioSeconds / chunkDuration);
@@ -126,16 +155,26 @@ export function createTimeBasedChunks(segments, totalAudioSeconds, chunkDuration
     const chunkStart = i * chunkDuration;
     const chunkEnd   = Math.min((i + 1) * chunkDuration, totalAudioSeconds);
 
-    const texts = segments
+    const rawTexts = segments
       .filter(seg => seg.start < chunkEnd && seg.end > chunkStart)
       .map(seg => seg.text);
+
+    // Bước 1: Loại bỏ subtitle trùng liên tiếp (cùng text, khác timestamp)
+    // VD: sub#40 "Don't miss a single one." và sub#41 "Don't miss a single one." → giữ 1
+    const norm       = (t) => t.replace(/[.,!?'"]/g, '').trim().toLowerCase();
+    const dedupTexts = rawTexts.filter((t, idx) => idx === 0 || norm(t) !== norm(rawTexts[idx - 1]));
+
+    // Bước 2: Làm sạch stutter/lặp trong text đã ghép
+    const joined = dedupTexts.length > 0
+      ? cleanDialogueText(dedupTexts.join(' '))
+      : '[Không có lời thoại - Âm thanh môi trường]';
 
     chunks.push({
       scene:     i + 1,
       time:      `${chunkStart}s - ${chunkEnd}s`,
       timeStart: chunkStart,
       timeEnd:   chunkEnd,
-      exactText: texts.length > 0 ? texts.join(' ') : '[Không có lời thoại - Âm thanh môi trường]'
+      exactText: joined,
     });
   }
 

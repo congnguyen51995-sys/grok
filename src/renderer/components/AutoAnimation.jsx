@@ -98,6 +98,30 @@ const VOICE_LIST = [
 ];
 // Pool giọng để random (loại bỏ '', 'random')
 const VOICE_POOL         = VOICE_LIST.filter(v => v.id && v.id !== 'random');
+// ─── Clean dialogue text — loại bỏ stutter/lặp từ transcript hoặc TTS ──────
+// VD: "But here's the But here's the cold" → "But here's the cold"
+//     "Don't miss it. Don't miss it."      → "Don't miss it."
+//     "and and avoid"                       → "and avoid"
+function cleanDialogueText(text) {
+  if (!text || typeof text !== 'string') return text;
+  let s = text.replace(/\s+/g, ' ').trim();
+  // Pass 1: Xóa stutter-restart — cùng N từ lặp liên tiếp (n=7 xuống 2)
+  for (let n = 7; n >= 2; n--) {
+    const w   = `[\\w''\\-]+`;
+    const grp = `(?:${w}\\s+){${n - 1}}${w}`;
+    const re  = new RegExp(`(${grp})[,.]?\\s+\\1`, 'gi');
+    let prev;
+    do { prev = s; s = s.replace(re, '$1'); } while (s !== prev);
+  }
+  // Pass 2: Xóa từ đơn lặp (kể cả có dấu phẩy giữa)
+  s = s.replace(/\b(\w+)[,.]?\s+\1\b/gi, '$1');
+  // Pass 3: Xóa câu trùng liên tiếp
+  const parts   = s.split(/(?<=[.!?])\s+/);
+  const norm    = t => t.replace(/[.,!?'"]/g, '').trim().toLowerCase();
+  const deduped = parts.filter((p, i) => i === 0 || norm(p) !== norm(parts[i - 1]));
+  return deduped.join(' ').replace(/\s+/g, ' ').trim();
+}
+
 // ─── Dedup helper — dùng chung cho mọi panel ───────────────────────────────
 // Loại bỏ tasks trùng prompt trước khi gửi server; track submittedIds để chặn re-send
 function dedupTasksByPrompt(tasks, logFn) {
@@ -506,7 +530,8 @@ function IdeaToVideoPanel() {
 
       const buildVideoPrompt = (sceneObj) => {
         const base     = sceneObj?.promptText || sceneObj?.fullData?.final_prompt || 'smooth cinematic motion';
-        const dialogue = (sceneObj?.fullData?.dialogue || '').trim();
+        // cleanDialogueText: loại bỏ stutter/lặp từ transcript trước khi đưa vào TTS prompt
+        const dialogue = cleanDialogueText((sceneObj?.fullData?.dialogue || '').trim());
         const LANG_EN = {
           vi: 'Vietnamese', 'vi-VN': 'Vietnamese',
           en: 'English',    'en-US': 'English',
@@ -1356,7 +1381,8 @@ function ScriptToVideoPanel() {
 
       const buildVideoPrompt = (sceneObj) => {
         const base     = sceneObj?.promptText || sceneObj?.fullData?.final_prompt || 'smooth cinematic motion';
-        const dialogue = (sceneObj?.fullData?.dialogue || '').trim();
+        // cleanDialogueText: loại bỏ stutter/lặp từ transcript trước khi đưa vào TTS prompt
+        const dialogue = cleanDialogueText((sceneObj?.fullData?.dialogue || '').trim());
         const LANG_EN  = { vi:'Vietnamese','vi-VN':'Vietnamese', en:'English','en-US':'English', ja:'Japanese','ja-JP':'Japanese', zh:'Chinese','zh-CN':'Chinese', ko:'Korean','ko-KR':'Korean', fr:'French','fr-FR':'French', es:'Spanish','es-ES':'Spanish', de:'German','de-DE':'German', th:'Thai','th-TH':'Thai' };
         const langLabel_ = LANG_EN[language] || LANG_EN[language?.split('-')[0]] || 'Vietnamese';
         const noTextSuffix = 'no text, no captions, no subtitles, no watermarks, no on-screen text, no dialogue text overlay, spoken audio only';
@@ -5701,8 +5727,8 @@ function StoryboardPanel() {
     });
     const motionBlock = shotDescs.join(' ');
 
-    // Dialogue / Audio
-    const dialogue = scene.hasDialogue ? (scene.dialogue || '') : '';
+    // Dialogue / Audio — cleanDialogueText loại bỏ stutter/lặp trước khi đưa vào TTS
+    const dialogue = scene.hasDialogue ? cleanDialogueText(scene.dialogue || '') : '';
     const hasVoice = dialogue && language !== 'none';
 
     const base = [sceneId, styleLock, charBlock, settingBlock].filter(Boolean).join(' ');

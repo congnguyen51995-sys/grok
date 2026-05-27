@@ -1721,8 +1721,104 @@ ipcMain.handle('video:mixAudio', async (event, { videoPath, audioPath, outputPat
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts'); const cryptoNode = require('crypto');
 if (typeof global.crypto === 'undefined') global.crypto = cryptoNode.webcrypto || cryptoNode;
 function createTTSInstance() { return new MsEdgeTTS(); }
+
+// Split long text into chunks at natural boundaries to bypass Edge TTS service limits
+function splitTextForTTS(text, maxChars = 3000) {
+    if (text.length <= maxChars) return [text];
+    const chunks = [];
+    const paragraphs = text.split(/\n\n+/);
+    let current = '';
+    for (const para of paragraphs) {
+        const sep = current ? '\n\n' : '';
+        if (current.length + sep.length + para.length > maxChars) {
+            if (current.trim()) { chunks.push(current.trim()); current = ''; }
+            if (para.length > maxChars) {
+                // Split oversized paragraph by sentence boundaries
+                const sentences = para.split(/(?<=[.!?।。！？])\s+/);
+                for (const sent of sentences) {
+                    const sp = current ? ' ' : '';
+                    if (current.length + sp.length + sent.length > maxChars) {
+                        if (current.trim()) { chunks.push(current.trim()); current = ''; }
+                    }
+                    current += (current ? ' ' : '') + sent;
+                }
+            } else { current = para; }
+        } else { current += sep + para; }
+    }
+    if (current.trim()) chunks.push(current.trim());
+    return chunks.filter(c => c.trim());
+}
+
+// Generate TTS stream to file (self-contained, no external variable dependency)
+function edgeTTSChunk(text, voice, outputPath) {
+    return new Promise(async (resolve, reject) => {
+        try {
+            const { MsEdgeTTS: MET, OUTPUT_FORMAT: OF } = require('msedge-tts');
+            const tts = new MET();
+            await tts.setMetadata(voice, OF.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+            const { audioStream } = await tts.toStream(text);
+            const dir = path.dirname(outputPath);
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+            const fileStream = fs.createWriteStream(outputPath);
+            audioStream.on('data', chunk => fileStream.write(chunk));
+            audioStream.on('close', () => { fileStream.end(); resolve(); });
+            audioStream.on('error', err => { fileStream.destroy(); reject(err); });
+        } catch (e) { reject(e); }
+    });
+}
+
 ipcMain.handle('tts:get-voices', async () => { try { const tts = createTTSInstance(); const voices = await tts.getVoices(); if (voices && voices.length > 0) return voices; throw new Error("Empty list"); } catch (error) { return [ { ShortName: "vi-VN-HoaiMyNeural", Gender: "Female", Locale: "vi-VN" }, { ShortName: "vi-VN-NamMinhNeural", Gender: "Male", Locale: "vi-VN" } ]; } });
-ipcMain.handle('tts:generate', async (event, { text, voice, outputPath }) => { try { const dir = path.dirname(outputPath); if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); const tts = createTTSInstance(); await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3); return new Promise(async (resolve) => { try { const { audioStream } = await tts.toStream(text); const fileStream = fs.createWriteStream(outputPath); audioStream.on('data', (chunk) => fileStream.write(chunk)); audioStream.on('close', () => { fileStream.end(); resolve({ success: true, path: outputPath }); }); audioStream.on('error', (err) => { fileStream.end(); resolve({ success: false, error: err.message }); }); } catch (streamErr) { resolve({ success: false, error: streamErr.message }); } }); } catch (err) { return { success: false, error: err.message }; } });
+
+ipcMain.handle('tts:generate', async (event, { text, voice, outputPath }) => {
+    try {
+        const dir = path.dirname(outputPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const vLog = (msg, type = 'info') => { try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('voice-log', { time: new Date().toLocaleTimeString(), text: msg, type }); } catch(_) {} };
+        const chunks = splitTextForTTS(text, 3000);
+        if (chunks.length === 1) {
+            // Short text — direct single request
+            return new Promise(async (resolve) => {
+                try {
+                    const tts = createTTSInstance();
+                    await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+                    const { audioStream } = await tts.toStream(text);
+                    const fileStream = fs.createWriteStream(outputPath);
+                    audioStream.on('data', (chunk) => fileStream.write(chunk));
+                    audioStream.on('close', () => { fileStream.end(); resolve({ success: true, path: outputPath }); });
+                    audioStream.on('error', (err) => { fileStream.end(); resolve({ success: false, error: err.message }); });
+                } catch (streamErr) { resolve({ success: false, error: streamErr.message }); }
+            });
+        }
+        // Long text — split into chunks, generate each, then concat
+        vLog(`🎙️ [Edge TTS] Văn bản dài (${text.length} ký tự) → chia thành ${chunks.length} đoạn`, 'info');
+        const tmpDir = require('path').join(require('os').tmpdir(), `edge_tts_${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+        const chunkPaths = [];
+        try {
+            for (let i = 0; i < chunks.length; i++) {
+                const chunkPath = require('path').join(tmpDir, `chunk_${i}.mp3`);
+                vLog(`🎙️ [Edge TTS] Xử lý đoạn ${i + 1}/${chunks.length} (${chunks[i].length} ký tự)...`, 'info');
+                await edgeTTSChunk(chunks[i], voice, chunkPath);
+                chunkPaths.push(chunkPath);
+            }
+            // Concatenate all chunks with ffmpeg
+            const ffmpegBin = require('ffmpeg-static');
+            const { spawnSync: spawnS } = require('child_process');
+            if (chunkPaths.length === 1) {
+                fs.copyFileSync(chunkPaths[0], outputPath);
+            } else {
+                const listFile = require('path').join(tmpDir, 'concat.txt');
+                fs.writeFileSync(listFile, chunkPaths.map(p => `file '${p.replace(/\\/g, '/')}'`).join('\n'), 'utf8');
+                const res = spawnS(ffmpegBin, ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', outputPath]);
+                if (res.status !== 0) throw new Error((res.stderr || res.stdout || Buffer.alloc(0)).toString().slice(-300) || 'ffmpeg concat thất bại');
+            }
+            vLog(`✅ [Edge TTS] Ghép ${chunks.length} đoạn hoàn tất → ${outputPath}`, 'success');
+            return { success: true, path: outputPath };
+        } finally {
+            try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+        }
+    } catch (err) { return { success: false, error: err.message }; }
+});
 ipcMain.handle('tts:preview', async (event, voiceName) => { try { const tempPath = path.join(app.getPath('temp'), `grok_preview_${Date.now()}.mp3`); const tts = createTTSInstance(); await tts.setMetadata(voiceName, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3); return new Promise(async (resolve) => { try { const { audioStream } = await tts.toStream("Xin chào, đây là giọng đọc thử nghiệm."); const fileStream = fs.createWriteStream(tempPath); audioStream.on('data', (chunk) => fileStream.write(chunk)); audioStream.on('close', () => { fileStream.end(); resolve({ success: true, path: tempPath }); }); audioStream.on('error', () => resolve({ success: false })); } catch (e) { resolve({ success: false }); } }); } catch (err) { return { success: false }; } });
 
 const ffmpegPath = require('ffmpeg-static'); const { spawn } = require('child_process'); const ffprobePath = require('ffprobe-static').path;

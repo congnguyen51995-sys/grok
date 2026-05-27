@@ -1,6 +1,6 @@
 {
   "name": "fluxy-thanh-cong-media",
-  "version": "2.4.1",
+  "version": "3.5.6",
   "description": "Fluxy - Thành Công Media - Desktop app for AI content automation",
   "main": "src/main/main.js",
   "type": "commonjs",

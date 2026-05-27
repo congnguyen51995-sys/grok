@@ -6,7 +6,28 @@ const LLM_MODEL        = 'gemini-2.5-flash';
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ─── 1. Transcribe audio via Gemini multimodal ────────────────────────────────
+// ─── Auto-retry helper ─────────────────────────────────────────────────────────
+// Dùng cho lỗi tạm thời (Gemini trả rỗng, JSON lỗi, network timeout).
+// KHÔNG thay thế retryWithKeyRotation — dùng bổ sung bên ngoài để vòng lặp
+// key-rotation chạy lại từ đầu sau khi đã ngủ một lúc.
+async function retryOnError(fn, maxAttempts = 3, baseDelayMs = 2000) {
+  let lastErr;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (attempt < maxAttempts - 1) {
+        console.warn(`[audioToVideo retry ${attempt + 1}/${maxAttempts - 1}]`, e.message);
+        await sleep(baseDelayMs * (attempt + 1));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// ─── 1. Transcribe 1 chunk audio via Gemini multimodal ───────────────────────
+// Prompt gọn tối đa để tiết kiệm input tokens (~60 tokens thay vì ~130 tokens cũ)
 export async function transcribeAudio(apiKeys, base64, mimeType, onSwitch) {
   return retryWithKeyRotation(async (key) => {
     const ai = new GoogleGenAI({ apiKey: key });
@@ -17,30 +38,17 @@ export async function transcribeAudio(apiKeys, base64, mimeType, onSwitch) {
         parts: [
           { inlineData: { data: base64, mimeType } },
           {
-            text: `Transcribe this audio file exactly in its original spoken language. Do NOT translate.
-Listen carefully and split into segments at natural speech pauses/sentences with accurate timestamps.
-
-Return ONLY valid JSON (no markdown, no extra text):
-{
-  "text": "complete transcript of all spoken words",
-  "segments": [
-    {"start": 0.0, "end": 3.5, "text": "first phrase"},
-    {"start": 3.5, "end": 7.2, "text": "second phrase"}
-  ]
-}
-
-Rules:
-- "text": full concatenated transcript
-- "segments": one entry per sentence/clause with start/end in seconds
-- If no speech detected: {"text": "", "segments": []}
-- Return ONLY the JSON object`
+            text: `Transcribe in original spoken language (no translation). Return ONLY JSON:
+{"text":"full transcript","segments":[{"start":0.0,"end":3.5,"text":"sentence"},...]}`
           }
         ]
       }],
-      config: { maxOutputTokens: 8192, thinkingConfig: { thinkingBudget: 0 } }
+      // 90s audio → tối đa ~1200 tokens output; 2000 đủ dư, tránh lãng phí quota
+      config: { maxOutputTokens: 2000, thinkingConfig: { thinkingBudget: 0 } }
     });
 
-    const raw = (response?.text || '').trim();
+    const raw = (response?.text || '').trim()
+      .replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
     if (!raw) throw new Error('Gemini trả về rỗng khi transcribe audio');
 
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
@@ -51,67 +59,91 @@ Rules:
       .map(s => ({ start: parseFloat(s.start) || 0, end: parseFloat(s.end) || 0, text: (s.text || '').trim() }))
       .filter(s => s.text);
 
-    // Fallback: nếu Gemini không trả về segments, tạo segment đơn từ toàn bộ text
-    // Dùng end: -1 để caller biết đây là fallback (sẽ được cap theo chunk duration)
     const fullText = parsed.text || segments.map(s => s.text).join(' ');
     if (segments.length === 0 && fullText) {
-      segments.push({ start: 0, end: -1, text: fullText }); // -1 = "đến hết chunk"
+      segments.push({ start: 0, end: -1, text: fullText });
     }
-
     return { fullText, segments };
   }, apiKeys, { onSwitch });
 }
 
-// ─── 1b. Transcribe toàn bộ audio theo từng CHUNK 60s ────────────────────────
-// Giải quyết vấn đề: gửi cả file → Gemini cắt output giữa chừng → SRT thiếu/sai
-// Cách làm: chia nhỏ → transcribe từng phần → cộng offset timestamp → ghép lại
+// ─── 1b. Transcribe toàn bộ audio — chunk 90s, xử lý 2 chunk song song ────────
+// Tối ưu quota:
+//   • CHUNK_SECS 90s → giảm 33% số API call (77 → 52 với file 76 phút)
+//   • PARALLEL 2   → 2 chunk chạy đồng thời, dùng 2 key cùng lúc, nhanh 2×
+//   • Prompt gọn   → giảm ~50% input tokens mỗi call
 export async function transcribeAudioChunked(apiKeys, totalDuration, extractChunkFn, onProgress, onChunkDone) {
-  const CHUNK_SECS = 60; // 60s/chunk: đủ nhỏ để Gemini xử lý chính xác, đủ lớn để câu không bị cắt đôi
+  const CHUNK_SECS = 90;
+  const PARALLEL   = Math.min(2, (apiKeys || []).length || 1); // tối đa 2, không vượt số key
   const totalChunks = Math.ceil(totalDuration / CHUNK_SECS);
   const allSegments = [];
   let fullText = '';
 
-  for (let i = 0; i < totalChunks; i++) {
-    const startSec  = i * CHUNK_SECS;
-    const durSec    = Math.min(CHUNK_SECS, totalDuration - startSec);
-    const startStr  = `${Math.floor(startSec/60)}:${String(Math.floor(startSec%60)).padStart(2,'0')}`;
-    const endStr    = `${Math.floor((startSec+durSec)/60)}:${String(Math.floor((startSec+durSec)%60)).padStart(2,'0')}`;
+  const fmt = sec => `${Math.floor(sec/60)}:${String(Math.floor(sec%60)).padStart(2,'0')}`;
 
-    onProgress?.(`Phần ${i+1}/${totalChunks}: ${startStr}–${endStr}`);
-
-    // Trích xuất chunk audio
-    const chunkAudio = await extractChunkFn(startSec, durSec);
-    if (!chunkAudio.success) {
-      onChunkDone?.(i + 1, totalChunks, 0, `Lỗi extract: ${chunkAudio.error}`);
-      continue; // bỏ qua chunk lỗi, không dừng toàn bộ
+  for (let i = 0; i < totalChunks; i += PARALLEL) {
+    // ── Tập hợp slots trong batch này ─────────────────────────────────────────
+    const slots = [];
+    for (let p = 0; p < PARALLEL && (i + p) < totalChunks; p++) {
+      const idx      = i + p;
+      const startSec = idx * CHUNK_SECS;
+      const durSec   = Math.min(CHUNK_SECS, totalDuration - startSec);
+      slots.push({ idx, startSec, durSec });
     }
 
-    // Transcribe chunk (retry tự động bằng retryWithKeyRotation bên trong)
-    let result;
-    try {
-      result = await transcribeAudio(apiKeys, chunkAudio.base64, chunkAudio.mimeType, null);
-    } catch (e) {
-      onChunkDone?.(i + 1, totalChunks, 0, `Lỗi transcribe: ${e.message}`);
-      continue;
+    const rangeStr = slots.length > 1
+      ? `${slots[0].idx + 1}–${slots[slots.length - 1].idx + 1}`
+      : `${slots[0].idx + 1}`;
+    onProgress?.(`Phần ${rangeStr}/${totalChunks}: ${fmt(slots[0].startSec)}–${fmt(slots[slots.length-1].startSec + slots[slots.length-1].durSec)}`);
+
+    // ── Extract audio song song ────────────────────────────────────────────────
+    const extracted = await Promise.all(
+      slots.map(slot =>
+        extractChunkFn(slot.startSec, slot.durSec)
+          .then(r  => ({ ...slot, ...r }))
+          .catch(e => ({ ...slot, success: false, error: e.message }))
+      )
+    );
+
+    // ── Transcribe song song (key rotation bên trong + outer retry cho lỗi tạm thời) ─
+    const transcribed = await Promise.all(
+      extracted.map(ex => {
+        if (!ex.success) return Promise.resolve({ ...ex, ok: false });
+        // retryOnError: tối đa 3 lần (2 retry) — phòng Gemini trả rỗng / JSON lỗi
+        return retryOnError(() => transcribeAudio(apiKeys, ex.base64, ex.mimeType, null), 3, 2000)
+          .then(r  => ({ ...ex, ok: true, result: r }))
+          .catch(e => ({ ...ex, ok: false, err: e.message }));
+      })
+    );
+
+    // ── Gộp kết quả theo đúng thứ tự chunk ───────────────────────────────────
+    for (const t of transcribed) {
+      const { idx, startSec, durSec, success, error, ok, err, result } = t;
+      const chunkEndSec = startSec + durSec;
+
+      if (!success) {
+        onChunkDone?.(idx + 1, totalChunks, 0, `Lỗi extract: ${error}`);
+        continue;
+      }
+      if (!ok) {
+        onChunkDone?.(idx + 1, totalChunks, 0, `Lỗi transcribe: ${err}`);
+        continue;
+      }
+
+      const offsetSegs = (result.segments || []).map(s => ({
+        start: parseFloat((Math.min(s.start, durSec) + startSec).toFixed(3)),
+        end:   s.end === -1 ? chunkEndSec
+                            : parseFloat((Math.min(s.end, durSec) + startSec).toFixed(3)),
+        text:  s.text
+      })).filter(s => s.text && s.end > s.start);
+
+      allSegments.push(...offsetSegs);
+      if (result.fullText) fullText += (fullText ? ' ' : '') + result.fullText;
+      onChunkDone?.(idx + 1, totalChunks, offsetSegs.length);
     }
 
-    // Cộng offset startSec vào từng segment, cap end <= startSec + durSec
-    const chunkEndSec = startSec + durSec;
-    const offsetSegments = (result.segments || []).map(s => ({
-      start: parseFloat((Math.min(s.start, durSec) + startSec).toFixed(3)),
-      end:   s.end === -1
-               ? chunkEndSec                                           // fallback → đến hết chunk
-               : parseFloat((Math.min(s.end, durSec) + startSec).toFixed(3)),
-      text:  s.text
-    })).filter(s => s.text && s.end > s.start);
-
-    allSegments.push(...offsetSegments);
-    if (result.fullText) fullText += (fullText ? ' ' : '') + result.fullText;
-
-    onChunkDone?.(i + 1, totalChunks, offsetSegments.length);
-
-    // Nghỉ nhỏ giữa các chunk để tránh rate limit
-    if (i < totalChunks - 1) await sleep(500);
+    // Delay nhỏ giữa các batch song song (tránh RPM spike)
+    if (i + PARALLEL < totalChunks) await sleep(400);
   }
 
   return { fullText, segments: allSegments };
@@ -235,26 +267,37 @@ CONTENT CONTEXT (use this to keep prompts consistent and accurate):
 - Summary: ${overallContext.context_summary || ''}
 ` : '';
 
-  const systemInstruction = `You are an expert Video Prompt Engineer for Google Veo video generation.
+  const systemInstruction = `You are an expert Video Prompt Engineer for Google Veo 3 video generation.
 
-Write ONE dynamic Veo_Video_Prompt for a ${targetDuration}-second scene.
+Write ONE complete, detailed Veo_Video_Prompt for a ${targetDuration}-second scene.
 ${contextBlock}
-CRITICAL RULES:
-1. STRICT ALIGNMENT: Visually translate the dialogue to imagery. Every object/action/number in text MUST appear in the prompt.
-2. USE CONTENT CONTEXT: Your prompt must reflect the overall topic, tone, and visual themes of the full content.
-3. DYNAMIC ACTION SEQUENCE: If text has 2-3 ideas, chain camera movements:
-   "Starts with [Scene A], then camera pans/zooms to [Scene B], and finally [Scene C]"
-   Keywords: "Starts with", "then camera pans", "quickly zooms", "transitions to", "reveals"
-4. PACING FOR ${targetDuration}s: ${pacingMap[targetDuration] || pacingMap[8]}
-5. DATA VISUALIZATION: Numbers → holographic text, glowing overlays, infographic
-6. END FORMAT: Always end with "aspect ratio 16:9, cinematic shot"
-7. NO STATIC SCENES for multi-idea dialogues
+━━━ REQUIRED PROMPT STRUCTURE (ALL elements must be present) ━━━
+A complete Veo prompt MUST include ALL of the following in one flowing paragraph:
 
-LANGUAGE RULE (ZERO TOLERANCE):
-- Output MUST BE 100% IN ENGLISH. Translate meaning from ANY input language.
-- NO non-English words in the output whatsoever.
+1. SUBJECT & ACTION — Who/what is the main subject? What are they doing? Be specific.
+2. ENVIRONMENT/SETTING — Where is the scene? (indoor/outdoor, location type, background details)
+3. CAMERA MOVEMENT — Exact camera technique: dolly in, slow pan left/right, aerial zoom out, tracking shot, crane shot, push-in, pull-back, orbit, handheld shake, static locked shot, etc.
+4. LIGHTING — Natural/artificial, direction (front/back/side lit), quality (soft/harsh), time of day (golden hour, midday, night, neon-lit, etc.)
+5. COLOR PALETTE — Dominant colors, tone (warm/cool/desaturated/vivid/cinematic)
+6. VISUAL STYLE — Film look: cinematic, documentary, hyper-real, stylized, photorealistic, etc.
+7. MOOD/ATMOSPHERE — Emotional quality: tense, uplifting, melancholic, epic, serene, mysterious
+8. AUDIO CUES (Veo 3 native audio) — Ambient sounds, music tone, voice-over style, sound effects relevant to the scene
+9. END TAG — Always close with: "aspect ratio 16:9, cinematic shot"
 
-Return ONLY the Veo_Video_Prompt string. No JSON, no numbering, no explanations.`;
+━━━ CONTENT ALIGNMENT RULES ━━━
+- STRICT ALIGNMENT: Every key object, action, or number mentioned in the dialogue MUST appear visually in the prompt.
+- DYNAMIC MOVEMENT: For 2+ ideas in dialogue, chain camera movements:
+  "Starts with [Scene A], then camera pans to [Scene B], transitioning to [Scene C]"
+  Transition keywords: "Starts with", "then camera pans", "quickly zooms to", "transitions to", "reveals", "pulls back to reveal"
+- PACING FOR ${targetDuration}s: ${pacingMap[targetDuration] || pacingMap[8]}
+- DATA/NUMBERS: Visualize as glowing holographic overlays, floating infographics, or on-screen text.
+- NO STATIC SCENES when dialogue contains 2+ distinct ideas.
+
+━━━ LANGUAGE RULE (ZERO TOLERANCE) ━━━
+- Output MUST BE 100% IN ENGLISH — translate meaning from ANY input language.
+- NO non-English words anywhere in the output.
+
+Return ONLY the Veo_Video_Prompt string. No JSON, no numbering, no label, no explanations. Just the prompt paragraph.`;
 
   return retryWithKeyRotation(async (key) => {
     const ai = new GoogleGenAI({ apiKey: key });
@@ -263,63 +306,195 @@ Return ONLY the Veo_Video_Prompt string. No JSON, no numbering, no explanations.
       contents: [{
         role: 'user',
         parts: [{
-          text: `Scene ${chunk.scene} | Time: ${chunk.time}\n\nText to visualize:\n"${chunk.exactText}"\n\nWrite ONE dynamic Veo_Video_Prompt for this ${targetDuration}-second scene.`
+          text: `Scene ${chunk.scene} | Time: ${chunk.time}
+
+DIALOGUE/NARRATION TO VISUALIZE:
+"${chunk.exactText}"
+
+Write ONE complete Veo_Video_Prompt for this ${targetDuration}-second scene.
+REMINDER: Include ALL 9 required elements — Subject, Environment, Camera Movement, Lighting, Color Palette, Visual Style, Mood, Audio Cues, and end with "aspect ratio 16:9, cinematic shot".`
         }]
       }],
       config: {
         systemInstruction,
-        maxOutputTokens: 512,
+        maxOutputTokens: 1024,
         thinkingConfig: { thinkingBudget: 0 },
         temperature: 0.7
       }
     });
 
-    const prompt = (response?.text || '').trim().replace(/^["']|["']$/g, '');
+    const raw = (response?.text || '').trim();
+    // Strip markdown code fences if Gemini wraps output
+    const prompt = raw
+      .replace(/^```[a-z]*\n?/i, '')
+      .replace(/\n?```$/i, '')
+      .replace(/^["']|["']$/g, '')
+      .trim();
     if (!prompt) throw new Error('Gemini trả về rỗng khi tạo prompt');
+    // Sanity check: prompt must end with cinematic tag (ensure it's not truncated)
+    if (!prompt.toLowerCase().includes('cinematic') && prompt.length < 80)
+      throw new Error('Prompt quá ngắn hoặc bị cắt — thử lại');
     return prompt;
   }, apiKeys, { onSwitch });
 }
 
-// ─── 5. Xử lý toàn bộ chunks theo batch ──────────────────────────────────────
-export async function analyzeScenes(apiKeys, chunks, targetDuration, overallContext, onSceneProgress, onSceneReady) {
-  const results = [];
-  const BATCH_SIZE  = 3;
-  const BATCH_DELAY = 3000; // ms giữa các batch
+// ─── 5a. Tạo Veo prompt cho nhiều scene trong 1 API call ─────────────────────
+// Gộp N scene → 1 request → nhận JSON array N prompts → tiết kiệm 5× số request
+async function generateVeoPromptBatch(apiKeys, chunks, targetDuration, overallContext, onSwitch) {
+  const pacingMap = {
+    5:  '5 seconds: FAST, SHARP action. Quick cuts, abrupt zooms. No slow pans.',
+    8:  '8 seconds: Standard Veo 3 pace. Balance between action and transition.',
+    10: '10 seconds: SLOW, SMOOTH pan/zoom. Detailed description. Slow cinematic movements.'
+  };
+  const contextBlock = overallContext ? `
+CONTENT CONTEXT (keep all prompts consistent with this):
+- Topic: ${overallContext.topic || ''}
+- Tone: ${overallContext.tone || ''}
+- Key entities: ${(overallContext.key_entities || []).join(', ')}
+- Visual themes: ${(overallContext.visual_themes || []).join(', ')}
+- Recommended style: ${overallContext.recommended_visual_style || ''}
+- Summary: ${overallContext.context_summary || ''}
+` : '';
 
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
+  const systemInstruction = `You are an expert Video Prompt Engineer for Google Veo 3 video generation.
+${contextBlock}
+For each scene provided, write ONE complete Veo_Video_Prompt for a ${targetDuration}-second clip.
+
+━━━ EACH PROMPT MUST INCLUDE ALL 9 ELEMENTS ━━━
+1. SUBJECT & ACTION — specific subject and what they are doing
+2. ENVIRONMENT/SETTING — location, indoor/outdoor, background details
+3. CAMERA MOVEMENT — dolly in/out, pan, orbit, tracking, crane, aerial, handheld, etc.
+4. LIGHTING — direction, quality, time of day, artificial/natural
+5. COLOR PALETTE — dominant colors and overall tone
+6. VISUAL STYLE — cinematic, documentary, photorealistic, hyper-real, etc.
+7. MOOD/ATMOSPHERE — emotional quality of the scene
+8. AUDIO CUES — ambient sounds, music tone, voice-over style (Veo 3 native audio)
+9. END TAG — always close with: "aspect ratio 16:9, cinematic shot"
+
+━━━ RULES ━━━
+- STRICT ALIGNMENT: every object/action/number in dialogue MUST appear in the prompt.
+- DYNAMIC MOVEMENT: chain camera movements for 2+ ideas: "Starts with X, then pans to Y, reveals Z"
+- PACING: ${pacingMap[targetDuration] || pacingMap[8]}
+- NUMBERS/DATA: visualize as glowing holographic overlays or floating infographics.
+- LANGUAGE: 100% English output only. Translate from ANY input language.
+
+━━━ OUTPUT FORMAT ━━━
+Return ONLY a valid JSON array with exactly ${chunks.length} strings — one prompt per scene, in order:
+["<prompt for scene 1>", "<prompt for scene 2>", ...]
+No markdown, no extra text, no explanation outside the JSON array.`;
+
+  const scenesText = chunks.map(c =>
+    `Scene ${c.scene} | Time: ${c.time}\nDialogue: "${c.exactText}"`
+  ).join('\n\n---\n\n');
+
+  return retryWithKeyRotation(async (key) => {
+    const ai = new GoogleGenAI({ apiKey: key });
+    const response = await ai.models.generateContent({
+      model: LLM_MODEL,
+      contents: [{
+        role: 'user',
+        parts: [{
+          text: `${scenesText}\n\nWrite ONE complete Veo_Video_Prompt for EACH of the ${chunks.length} scenes above.\nReturn ONLY a JSON array of ${chunks.length} prompt strings, in order.`
+        }]
+      }],
+      config: {
+        systemInstruction,
+        maxOutputTokens: chunks.length * 450,
+        thinkingConfig: { thinkingBudget: 0 },
+        temperature: 0.7
+      }
+    });
+
+    const raw = (response?.text || '').trim()
+      .replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+
+    const arrMatch = raw.match(/\[[\s\S]*\]/);
+    if (!arrMatch) throw new Error('Batch: không tìm thấy JSON array trong kết quả');
+
+    const prompts = JSON.parse(arrMatch[0]);
+    if (!Array.isArray(prompts) || prompts.length !== chunks.length)
+      throw new Error(`Batch: nhận ${prompts?.length ?? 0} prompts thay vì ${chunks.length}`);
+
+    return prompts.map(p =>
+      String(p).replace(/^["']|["']$/g, '').trim()
+    );
+  }, apiKeys, { onSwitch });
+}
+
+// ─── 5b. Xử lý toàn bộ chunks — batch 5 scene/call, fallback đơn lẻ ──────────
+export async function analyzeScenes(apiKeys, chunks, targetDuration, overallContext, onSceneProgress, onSceneReady) {
+  const results   = [];
+  const BATCH     = 5;      // 5 scene/call → giảm 5× số request → key lâu hết hơn
+  const DELAY_MS  = 1200;   // delay giữa các batch (nhỏ hơn trước vì ít call hơn)
+
+  for (let i = 0; i < chunks.length; i += BATCH) {
+    const batchChunks = chunks.slice(i, i + BATCH);
     onSceneProgress?.(i + 1, chunks.length);
 
+    let batchPrompts = null;
     try {
-      const veoPrompt = await generateVeoPrompt(
-        apiKeys, chunk, targetDuration, overallContext,
-        ({ fromIdx, toIdx }) => onSceneProgress?.(i + 1, chunks.length, `Key ${fromIdx + 1}→${toIdx + 1}`)
+      // retryOnError: 2 lần (1 retry) — phòng Gemini trả JSON lỗi / mảng sai số
+      batchPrompts = await retryOnError(
+        () => generateVeoPromptBatch(
+          apiKeys, batchChunks, targetDuration, overallContext,
+          ({ fromIdx, toIdx }) => onSceneProgress?.(i + 1, chunks.length, `Key ${fromIdx + 1}→${toIdx + 1}`)
+        ),
+        2, 3000
       );
-
-      const sceneData = {
-        sceneNumber:    chunk.scene,
-        timeEstimation: chunk.time,
-        dialogue:       chunk.exactText,
-        veoVideoPrompt: veoPrompt
-      };
-      results.push(sceneData);
-      onSceneReady?.(sceneData, false);
-    } catch (e) {
-      const fallback = {
-        sceneNumber:    chunk.scene,
-        timeEstimation: chunk.time,
-        dialogue:       chunk.exactText,
-        veoVideoPrompt: 'Cinematic establishing shot, smooth camera movement, aspect ratio 16:9, cinematic shot',
-        error:          e.message
-      };
-      results.push(fallback);
-      onSceneReady?.(fallback, true);
+    } catch (batchErr) {
+      // Batch thất bại sau retry → fallback từng scene đơn lẻ trong batch này
+      console.warn('[analyzeScenes] Batch lỗi sau retry, fallback đơn lẻ:', batchErr.message);
     }
 
-    // Delay giữa các batch (không delay sau chunk cuối)
-    if ((i + 1) % BATCH_SIZE === 0 && i + 1 < chunks.length) {
-      await sleep(BATCH_DELAY);
+    for (let j = 0; j < batchChunks.length; j++) {
+      const chunk     = batchChunks[j];
+      const sceneIdx  = i + j;
+      onSceneProgress?.(sceneIdx + 1, chunks.length);
+
+      if (batchPrompts && batchPrompts[j]) {
+        // Thành công từ batch
+        const sceneData = {
+          sceneNumber:    chunk.scene,
+          timeEstimation: chunk.time,
+          dialogue:       chunk.exactText,
+          veoVideoPrompt: batchPrompts[j]
+        };
+        results.push(sceneData);
+        onSceneReady?.(sceneData, false);
+      } else {
+        // Fallback: gọi đơn lẻ — tự động retry tối đa 3 lần trước khi dùng hardcoded fallback
+        try {
+          const veoPrompt = await retryOnError(
+            () => generateVeoPrompt(
+              apiKeys, chunk, targetDuration, overallContext,
+              ({ fromIdx, toIdx }) => onSceneProgress?.(sceneIdx + 1, chunks.length, `Key ${fromIdx + 1}→${toIdx + 1}`)
+            ),
+            3, 2500
+          );
+          const sceneData = {
+            sceneNumber:    chunk.scene,
+            timeEstimation: chunk.time,
+            dialogue:       chunk.exactText,
+            veoVideoPrompt: veoPrompt
+          };
+          results.push(sceneData);
+          onSceneReady?.(sceneData, false);
+        } catch (e) {
+          const fallback = {
+            sceneNumber:    chunk.scene,
+            timeEstimation: chunk.time,
+            dialogue:       chunk.exactText,
+            veoVideoPrompt: 'Cinematic establishing shot, smooth camera movement, aspect ratio 16:9, cinematic shot',
+            error:          e.message
+          };
+          results.push(fallback);
+          onSceneReady?.(fallback, true);
+        }
+      }
     }
+
+    // Delay giữa các batch (không delay sau batch cuối)
+    if (i + BATCH < chunks.length) await sleep(DELAY_MS);
   }
 
   return results;

@@ -158,11 +158,13 @@ export default function VoiceStudio({ dark = true }) {
     const [ovLanguage,         setOvLanguage]         = useState('');
     const [ovSelectedProfile,  setOvSelectedProfile]  = useState('');
     const [ovInstruct,         setOvInstruct]         = useState('');
-    const [ovNumStep,          setOvNumStep]          = useState(16);
+    const [ovNumStep,          setOvNumStep]          = useState(10);  // giảm từ 16→10 để tiết kiệm RAM
     const [ovGuidance,         setOvGuidance]         = useState(2.0);
     const [ovSpeed,            setOvSpeed]            = useState(1.0);
     const [ovEffectPreset,     setOvEffectPreset]     = useState('broadcast');
     const [ovGenerating,       setOvGenerating]       = useState(false);
+    const [ovFlushing,         setOvFlushing]         = useState(false);
+    const [ovOomError,         setOvOomError]         = useState(false);  // true khi gặp lỗi OOM
     const [ovAudioUrl,         setOvAudioUrl]         = useState(null);
     const [ovAudioDur,         setOvAudioDur]         = useState(null);
     const [ovHistory,          setOvHistory]          = useState([]);
@@ -202,12 +204,24 @@ export default function VoiceStudio({ dark = true }) {
         { v: 'it',  l: '🇮🇹 Italiano' },
         { v: 'id',  l: '🇮🇩 Bahasa Indonesia' },
     ];
-    const OV_PRESETS = ['broadcast','voice','podcast','raw'];
+    // Phải khớp với EFFECT_PRESETS trong backend/services/audio_dsp.py
+    const OV_PRESETS = [
+        { id: 'broadcast', label: '📻 Broadcast'   },
+        { id: 'cinematic', label: '🎬 Cinematic'   },
+        { id: 'podcast',   label: '🎙️ Podcast'     },
+        { id: 'warm',      label: '☀️ Warm'        },
+        { id: 'bright',    label: '✨ Bright'      },
+        { id: 'raw',       label: '🔇 Raw'         },
+    ];
 
     // ── Omni Voice helpers ────────────────────────────────────────────────────
     const ovFetch = async (path, opts = {}) => {
         const r = await fetch(`${OV_BASE}${path}`, opts);
-        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        if (!r.ok) {
+            let detail = `${r.status} ${r.statusText}`;
+            try { const j = await r.clone().json(); detail = j.detail || j.message || detail; } catch {}
+            throw new Error(detail);
+        }
         return r;
     };
 
@@ -330,6 +344,7 @@ export default function VoiceStudio({ dark = true }) {
     const ovGenerate = async () => {
         if (!ovText.trim()) return;
         setOvGenerating(true);
+        setOvOomError(false);
         if (ovAudioUrl) { URL.revokeObjectURL(ovAudioUrl); setOvAudioUrl(null); }
         try {
             const fd = new FormData();
@@ -342,7 +357,11 @@ export default function VoiceStudio({ dark = true }) {
             fd.append('speed',          String(ovSpeed));
             fd.append('effect_preset',  ovEffectPreset);
             const r = await fetch(`${OV_BASE}/generate`, { method: 'POST', body: fd });
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            if (!r.ok) {
+                let detail = `HTTP ${r.status}`;
+                try { const j = await r.json(); detail = j.detail || j.message || detail; } catch {}
+                throw new Error(detail);
+            }
             const blob   = await r.blob();
             const url    = URL.createObjectURL(blob);
             const audioId = r.headers.get('X-Audio-Id') || '';
@@ -359,7 +378,15 @@ export default function VoiceStudio({ dark = true }) {
             const hist = await (await ovFetch('/history')).json();
             setOvHistory((hist?.history || hist || []).slice(0, 30));
         } catch (e) {
-            alert('Lỗi tạo giọng: ' + e.message);
+            const msg = e.message || '';
+            const isOom = /out of memory|not enough memory|alloc_cpu|DefaultCPUAllocator|allocate \d+ bytes/i.test(msg);
+            if (isOom) {
+                setOvOomError(true);
+                // Tự động giảm steps nếu > 8
+                if (ovNumStep > 8) setOvNumStep(8);
+            } else {
+                alert('Lỗi tạo giọng: ' + msg);
+            }
         } finally { setOvGenerating(false); }
     };
 
@@ -374,7 +401,11 @@ export default function VoiceStudio({ dark = true }) {
             if (ovProfInstruct) fd.append('instruct',  ovProfInstruct);
             if (ovProfLang)     fd.append('language',  ovProfLang);
             const r = await fetch(`${OV_BASE}/profiles`, { method: 'POST', body: fd });
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            if (!r.ok) {
+                let detail = `HTTP ${r.status}`;
+                try { const j = await r.json(); detail = j.detail || j.message || detail; } catch {}
+                throw new Error(detail);
+            }
             const prof = await r.json();
             setOvProfiles(p => [prof, ...p]);
             setOvSelectedProfile(prof.id);
@@ -442,6 +473,22 @@ export default function VoiceStudio({ dark = true }) {
             alert(`✅ Đã lưu: ${folder}\\${name}`);
         } catch (e) { alert('Lỗi lưu file: ' + e.message); }
         finally { setOvSaving(false); }
+    };
+
+    // Flush RAM + unload model để giải phóng bộ nhớ khi bị OOM
+    const ovFlushMemory = async () => {
+        setOvFlushing(true);
+        try {
+            const r = await fetch(`${OV_BASE}/system/flush-memory?unload_model=true`, { method: 'POST' });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const j = await r.json();
+            setOvOomError(false);
+            alert(`✅ Đã giải phóng bộ nhớ — RAM: ${j.ram_after?.toFixed(1) ?? '?'} GB. Model sẽ được tải lại lần tạo tiếp theo.`);
+        } catch (e) {
+            alert('Lỗi flush RAM: ' + e.message);
+        } finally {
+            setOvFlushing(false);
+        }
     };
 
     useEffect(() => {
@@ -2277,7 +2324,7 @@ export default function VoiceStudio({ dark = true }) {
                           <label className="text-[9px] text-slate-600 mb-1.5 block">Effect Preset</label>
                           <select value={ovEffectPreset} onChange={e => setOvEffectPreset(e.target.value)}
                             className="w-full bg-slate-800 border border-slate-700 text-slate-300 text-[10px] rounded-lg px-2 py-1.5 outline-none">
-                            {OV_PRESETS.map(p => <option key={p} value={p}>{p}</option>)}
+                            {OV_PRESETS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
                           </select>
                         </div>
                       </div>
@@ -2294,12 +2341,33 @@ export default function VoiceStudio({ dark = true }) {
                       </button>
                     </div>
 
+                    {/* OOM warning banner */}
+                    {ovOomError && (
+                      <div className="bg-amber-950/60 border border-amber-700/60 rounded-xl p-3 space-y-2">
+                        <p className="text-amber-300 text-[11px] font-bold">⚠️ Hết RAM — model không đủ bộ nhớ để tạo giọng</p>
+                        <p className="text-amber-400/80 text-[10px]">Đã tự động giảm Diffusion Steps xuống 8. Nhấn <strong>Flush RAM</strong> để giải phóng bộ nhớ rồi thử lại.</p>
+                        <button onClick={ovFlushMemory} disabled={ovFlushing}
+                          className="w-full py-2 bg-amber-700 hover:bg-amber-600 disabled:bg-slate-700 disabled:text-slate-500 text-white text-xs font-bold rounded-lg flex items-center justify-center gap-2 transition-colors">
+                          {ovFlushing ? <><Loader2 size={12} className="animate-spin"/> Đang flush...</>
+                                      : <>🧹 Flush RAM & Unload Model</>}
+                        </button>
+                      </div>
+                    )}
+
                     {/* Generate button */}
-                    <button onClick={ovGenerate} disabled={ovGenerating || !ovText.trim()}
-                      className="w-full py-3 bg-gradient-to-r from-rose-600 to-violet-600 hover:from-rose-500 hover:to-violet-500 disabled:from-slate-700 disabled:to-slate-700 disabled:text-slate-500 text-white text-sm font-bold rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg shadow-rose-900/20">
-                      {ovGenerating ? <><Loader2 size={14} className="animate-spin"/> Đang tạo giọng...</>
-                                    : <><Volume2 size={14}/> ▶ Tạo giọng nói</>}
-                    </button>
+                    <div className="flex gap-2">
+                      <button onClick={ovGenerate} disabled={ovGenerating || !ovText.trim()}
+                        className="flex-1 py-3 bg-gradient-to-r from-rose-600 to-violet-600 hover:from-rose-500 hover:to-violet-500 disabled:from-slate-700 disabled:to-slate-700 disabled:text-slate-500 text-white text-sm font-bold rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg shadow-rose-900/20">
+                        {ovGenerating ? <><Loader2 size={14} className="animate-spin"/> Đang tạo giọng...</>
+                                      : <><Volume2 size={14}/> ▶ Tạo giọng nói</>}
+                      </button>
+                      {/* Flush button luôn hiện để giải phóng RAM bất cứ lúc nào */}
+                      <button onClick={ovFlushMemory} disabled={ovFlushing || ovGenerating}
+                        title="Giải phóng RAM & unload model"
+                        className="px-3 py-3 bg-slate-700/80 hover:bg-amber-700 disabled:bg-slate-800 disabled:text-slate-600 text-slate-300 text-xs rounded-xl flex items-center justify-center transition-colors">
+                        {ovFlushing ? <Loader2 size={13} className="animate-spin"/> : '🧹'}
+                      </button>
+                    </div>
 
                     {/* Audio player */}
                     {ovAudioUrl && (

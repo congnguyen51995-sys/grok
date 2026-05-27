@@ -601,12 +601,13 @@ function IdeaToVideoPanel() {
             if (charMediaMap[speakChar]) task.ingredientMediaIds = [charMediaMap[speakChar]];
             else task.ingredientImages = [charImgMap[speakChar]];
           } else if (hasMediaIds && sceneMediaIds.length > 0) {
-            task.ingredientMediaIds = sceneMediaIds;
+            // Cap tối đa 6 — ưu tiên nhân vật trước (chars → env → objects)
+            task.ingredientMediaIds = sceneMediaIds.slice(0, 6);
           } else if (sceneImgPaths.length > 0) {
-            task.ingredientImages = sceneImgPaths;
+            task.ingredientImages = sceneImgPaths.slice(0, 6);
           }
           const refLabels = [...sceneCharIds, ...(sceneEnvId?[sceneEnvId]:[]), ...sceneObjIds];
-          const refCount  = speakChar ? `1 (${speakChar}+${task.voiceId})` : (sceneMediaIds.length || sceneImgPaths.length);
+          const refCount  = speakChar ? `1 (${speakChar}+${task.voiceId})` : (task.ingredientMediaIds?.length || task.ingredientImages?.length || 0);
           addLog(`[Veo] Cảnh ${i+1}: ${refLabels.length > 0 ? `${refLabels.join(', ')} → ${refCount} ảnh DNA` : 'không có tham chiếu → text-to-video'}`, 'info');
           return task;
         });
@@ -1428,10 +1429,14 @@ function ScriptToVideoPanel() {
             task.voiceId=charVoiceMap[speakChar];
             if (charMediaMap[speakChar]) task.ingredientMediaIds=[charMediaMap[speakChar]];
             else task.ingredientImages=[charImgMap[speakChar]];
-          } else if (hasMediaIds&&sceneMediaIds.length>0) task.ingredientMediaIds=sceneMediaIds;
-          else if (sceneImgPaths.length>0) task.ingredientImages=sceneImgPaths;
+          } else if (hasMediaIds&&sceneMediaIds.length>0) {
+            // Cap tối đa 6 — ưu tiên nhân vật trước (chars → env → objects)
+            task.ingredientMediaIds=sceneMediaIds.slice(0,6);
+          } else if (sceneImgPaths.length>0) {
+            task.ingredientImages=sceneImgPaths.slice(0,6);
+          }
           const refLabels=[...sceneCharIds,...(sceneEnvId?[sceneEnvId]:[]),...sceneObjIds];
-          const refCount=speakChar?`1 (${speakChar}+${task.voiceId})`:(sceneMediaIds.length||sceneImgPaths.length);
+          const refCount=speakChar?`1 (${speakChar}+${task.voiceId})`:(task.ingredientMediaIds?.length||task.ingredientImages?.length||0);
           addLog(`[Veo] Cảnh ${i+1}: ${refLabels.length>0?`${refLabels.join(', ')} → ${refCount} ảnh DNA`:'không tham chiếu → text-to-video'}`, 'info');
           return task;
         });
@@ -1892,14 +1897,24 @@ function AudioToVideoPanel() {
   const [makeVideo,    setMakeVideo]    = useState(() => _s.makeVideo !== undefined ? _s.makeVideo : true);
   const [useTransition, setUseTransition] = useState(true);
 
+  // Auto-save prompt file
+  const [autoSavePrompt, setAutoSavePrompt] = useState(() => _s.autoSavePrompt !== undefined ? _s.autoSavePrompt : true);
+  const [promptDir,      setPromptDir]      = useState(() => _s.promptDir || '');
+  const promptDirRef      = useRef('');
+  const autoSavePromptRef = useRef(true);
+  useEffect(() => { promptDirRef.current      = promptDir;      }, [promptDir]);
+  useEffect(() => { autoSavePromptRef.current = autoSavePrompt; }, [autoSavePrompt]);
+
   // Ghi nhớ settings khi thay đổi
-  useEffect(() => { saveAtvSettings({ sceneDur });    }, [sceneDur]);
-  useEffect(() => { saveAtvSettings({ vidSceneDur }); }, [vidSceneDur]);
-  useEffect(() => { saveAtvSettings({ vidRatio });    }, [vidRatio]);
-  useEffect(() => { saveAtvSettings({ vidModel });      }, [vidModel]);
-  useEffect(() => { saveAtvSettings({ vidQuality });   }, [vidQuality]);
-  useEffect(() => { saveAtvSettings({ vidDir });      }, [vidDir]);
-  useEffect(() => { saveAtvSettings({ makeVideo });   }, [makeVideo]);
+  useEffect(() => { saveAtvSettings({ sceneDur });        }, [sceneDur]);
+  useEffect(() => { saveAtvSettings({ vidSceneDur });     }, [vidSceneDur]);
+  useEffect(() => { saveAtvSettings({ vidRatio });        }, [vidRatio]);
+  useEffect(() => { saveAtvSettings({ vidModel });        }, [vidModel]);
+  useEffect(() => { saveAtvSettings({ vidQuality });      }, [vidQuality]);
+  useEffect(() => { saveAtvSettings({ vidDir });          }, [vidDir]);
+  useEffect(() => { saveAtvSettings({ makeVideo });       }, [makeVideo]);
+  useEffect(() => { saveAtvSettings({ autoSavePrompt }); }, [autoSavePrompt]);
+  useEffect(() => { saveAtvSettings({ promptDir });       }, [promptDir]);
 
   // Pipeline
   const [running,    setRunning]   = useState(false);
@@ -1970,7 +1985,8 @@ function AudioToVideoPanel() {
   // Đổi thời lượng cảnh
   const handleSceneDurChange = (d) => {
     setSceneDur(d);
-    if ([4,6,8].includes(d)) setVidSceneDur(d);
+    if ([4,6,8,10].includes(d)) setVidSceneDur(d);
+    if (d === 10) setVidModel('Omni Flash');
   };
 
   const handleReset = () => {
@@ -1986,7 +2002,7 @@ function AudioToVideoPanel() {
   const handleResume = () => { pauseRef.current = false; setPaused(false); addLog('▶️ Tiếp tục...', 'info'); };
   const checkPause   = async () => { while (pauseRef.current) { if (stopRef.current) throw new Error('Đã dừng.'); await sleep(500); } };
 
-  const vidDurs = [4, 6, 8];
+  const vidDurs = [4, 6, 8, 10];
 
   const handleStart = async () => {
     // Capture tất cả settings tại thời điểm bấm Start — tránh stale closure
@@ -1998,7 +2014,6 @@ function AudioToVideoPanel() {
     const _vidModel       = vidModel;
     const _vidQuality     = vidQuality;
     const _vidDir         = vidDir;
-    const _vidProfileId   = vidProfileId;
     const _makeVideo      = makeVideo;
 
     if (!filePath)           { setError('Vui lòng chọn file audio hoặc video.'); return; }
@@ -2029,30 +2044,33 @@ function AudioToVideoPanel() {
 
       // ── 2. Nén + Bóc tách audio ───────────────────────────────────────────
       setActive('extract');
-      addLog('Đang nén + bóc tách audio (FFmpeg 16kbps mono 16kHz)...', 'info');
-
-      const ext = await window.electronAPI.extractAudio(filePath);
-      if (!ext.success) throw new Error(`Lỗi bóc tách audio: ${ext.error}`);
-      if (stopRef.current) throw new Error('Đã dừng.');
-
-      const kb = Math.round((ext.compressedSize || 0) / 1024);
-      addLog(`✅ Bóc tách xong — file nén: ${kb} KB`, 'success');
+      // Dùng chunked transcription (60s/chunk) → không cần nén toàn bộ file
+      // Tránh giới hạn Gemini inline data (~20MB) với file dài nhiều phút
+      const _totalChunks60 = Math.ceil(totalSec / 60);
+      addLog(`Chia audio thành ${_totalChunks60} phần (60s/phần) để gửi Gemini...`, 'info');
       markDone('extract');
 
-      // ── 3. Gemini AI: Transcribe + Phân tích tổng quát ───────────────────
+      // ── 3. Gemini AI: Transcribe từng chunk 60s + Phân tích tổng quát ─────
       setActive('transcribe'); setActiveTab('transcript');
-      addLog('Đang gửi audio lên Gemini (2.5 Flash Preview) để chuyển văn bản...', 'info');
+      addLog(`Đang gửi audio lên Gemini — ${_totalChunks60} phần × 60s...`, 'info');
 
-      const result = await transcribeAudio(
+      const result = await transcribeAudioChunked(
         apiKeys,
-        ext.base64,
-        ext.mimeType,
-        ({ fromIdx, toIdx }) => addLog(`🔄 Chuyển key ${fromIdx + 1}→${toIdx + 1}`, 'info')
+        totalSec,
+        async (startSec, durationSec) =>
+          window.electronAPI.extractAudioChunk({ filePath, startSec, durationSec }),
+        (msg) => addLog(`  ⏳ ${msg}`, 'info'),
+        (done, total, segCount, errMsg) => {
+          if (errMsg) addLog(`  ⚠️ Phần ${done}/${total}: ${errMsg}`, 'error');
+          else        addLog(`  ✅ Phần ${done}/${total}: ${segCount} câu thoại`, 'success');
+        }
       );
       if (stopRef.current) throw new Error('Đã dừng.');
 
+      if (!result || (!result.segments?.length && !result.fullText?.trim()))
+        throw new Error('Không nhận được kết quả transcription từ Gemini. Kiểm tra API Key và thử lại.');
       setTranscript(result);
-      addLog(`✅ Transcript xong — ${result.segments.length} đoạn, ${result.fullText.split(' ').length} từ`, 'success');
+      addLog(`✅ Transcript xong — ${result.segments.length} đoạn, ${(result.fullText || '').split(' ').length} từ`, 'success');
 
       // Phân tích tổng quát (vẫn trong bước 3, dùng transcript text thay vì audio)
       addLog('Đang phân tích tổng quát nội dung...', 'info');
@@ -2107,6 +2125,22 @@ function AudioToVideoPanel() {
       const failCount = generatedScenes.filter(s => s.error).length;
       addLog(`🎉 Hoàn tất ${generatedScenes.length} prompts${failCount ? ` (${failCount} lỗi)` : ''}`, 'success');
       markDone('generate');
+
+      // ── Tự động lưu file prompt vào thư mục ──────────────────────────────
+      if (autoSavePromptRef.current && promptDirRef.current) {
+        try {
+          const ts   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+          const base = fileName.replace(/\.[^.]+$/, '');
+          const txtPath = `${promptDirRef.current}\\veo_prompts_${base}_${ts}.txt`;
+          const content = exportToTxt(generatedScenes);
+          const wr = await window.electronAPI.saveTextFile({ content, filePath: txtPath });
+          if (wr?.success) addLog(`💾 Đã lưu prompt tự động → ${txtPath}`, 'success');
+          else             addLog(`⚠️ Lưu prompt tự động thất bại: ${wr?.error || 'lỗi không xác định'}`, 'error');
+        } catch (e) {
+          addLog(`⚠️ Lưu prompt tự động thất bại: ${e.message}`, 'error');
+        }
+      }
+
       if (stopRef.current) throw new Error('Đã dừng.');
 
       // ── 5. Tạo Video ──────────────────────────────────────────────────────
@@ -2582,22 +2616,20 @@ function AudioToVideoPanel() {
           <div>
             <p className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1.5">Thời lượng mỗi cảnh</p>
             <div className="flex gap-1.5">
-              {[4, 6, 8].map(d => {
-                const autoLabel = d === 4 ? '→Veo' : d === 8 ? '→Veo' : null;
+              {[4, 6, 8, 10].map(d => {
+                const autoLabel = d === 10 ? 'Omni' : '→Veo';
                 return (
                   <button key={d} disabled={running} onClick={() => handleSceneDurChange(d)}
                     className={cn('flex-1 py-1.5 rounded-lg text-[10px] font-bold border transition-all flex flex-col items-center leading-none gap-0.5',
                       sceneDur === d ? 'bg-blue-600 border-blue-500 text-white' : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
                     <span>{d}s</span>
-                    {autoLabel && <span className={cn('text-[7px] font-semibold', sceneDur === d ? 'text-blue-200' : 'text-slate-700')}>{autoLabel}</span>}
+                    <span className={cn('text-[7px] font-semibold', sceneDur === d ? 'text-blue-200' : 'text-slate-700')}>{autoLabel}</span>
                   </button>
                 );
               })}
             </div>
             <p className="text-[8px] text-slate-700 mt-1">
-              {sceneDur === 4 ? '→ Tự động chọn Veo' :
-               sceneDur === 6 ? '→ Tự động chọn Veo' :
-               sceneDur === 8 ? '→ Tự động chọn Veo' : ''}
+              {sceneDur === 10 ? '⚡ Chỉ dùng Omni Flash' : '→ Tự động chọn Veo'}
             </p>
           </div>
 
@@ -2619,6 +2651,20 @@ function AudioToVideoPanel() {
             </div>
           )}
 
+          {/* ── Tự động lưu prompt ── */}
+          <div className="border-t border-slate-800/60 pt-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider">Tự động lưu prompt</label>
+              <button onClick={() => setAutoSavePrompt(v => !v)} disabled={running}
+                className={cn('w-9 h-5 rounded-full transition-all relative', autoSavePrompt ? 'bg-emerald-600' : 'bg-slate-700')}>
+                <span className={cn('absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all', autoSavePrompt ? 'left-4' : 'left-0.5')}/>
+              </button>
+            </div>
+            {autoSavePrompt && (
+              <FolderRow label="Thư mục lưu prompt" value={promptDir} onChange={setPromptDir} />
+            )}
+          </div>
+
           {/* ── Video Generation Settings ── */}
           <div className="border-t border-slate-800/60 pt-3 space-y-3">
             <div className="flex items-center justify-between">
@@ -2636,10 +2682,11 @@ function AudioToVideoPanel() {
                   <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1 block">Thời lượng mỗi video</label>
                   <div className="flex gap-1.5">
                     {vidDurs.map(d => (
-                      <button key={d} disabled={running} onClick={() => setVidSceneDur(d)}
-                        className={cn('flex-1 py-1.5 rounded-lg text-[10px] font-bold border transition-all',
+                      <button key={d} disabled={running} onClick={() => { setVidSceneDur(d); if (d === 10) setVidModel('Omni Flash'); }}
+                        className={cn('flex-1 py-1.5 rounded-lg text-[10px] font-bold border transition-all flex flex-col items-center leading-none gap-0.5',
                           vidSceneDur === d ? 'bg-violet-600 border-violet-500 text-white' : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
-                        {d}s
+                        <span>{d}s</span>
+                        {d === 10 && <span className={cn('text-[7px] font-semibold', vidSceneDur === d ? 'text-violet-200' : 'text-slate-700')}>Omni</span>}
                       </button>
                     ))}
                   </div>
@@ -2663,10 +2710,18 @@ function AudioToVideoPanel() {
                 {videoEngine === 'veo' && (
                   <>
                     <div>
-                      <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1 block">Model Veo</label>
-                      <select value={vidModel} onChange={e => setVidModel(e.target.value)} disabled={running}
-                        className="w-full bg-slate-800/50 border border-slate-700/60 rounded-lg px-2 py-1.5 text-[10px] text-slate-300 focus:outline-none">
-                        {VID_MDL_AUDIO.map(m => <option key={m}>{m}</option>)}
+                      <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1 block">
+                        Model Veo{vidSceneDur === 10 && <span className="ml-1.5 text-amber-400 normal-case">⚡ 10s chỉ dùng Omni Flash</span>}
+                      </label>
+                      <select value={vidSceneDur === 10 ? 'Omni Flash' : vidModel}
+                        onChange={e => { if (vidSceneDur !== 10) setVidModel(e.target.value); }}
+                        disabled={running || vidSceneDur === 10}
+                        className={cn('w-full bg-slate-800/50 border rounded-lg px-2 py-1.5 text-[10px] focus:outline-none',
+                          vidSceneDur === 10 ? 'border-amber-500/50 text-amber-300 cursor-not-allowed opacity-80' : 'border-slate-700/60 text-slate-300')}>
+                        {vidSceneDur === 10
+                          ? <option>Omni Flash</option>
+                          : VID_MDL_AUDIO.map(m => <option key={m}>{m}</option>)
+                        }
                       </select>
                     </div>
                     <div>
@@ -4594,10 +4649,11 @@ function UrlToVideoPanel() {
       // ── 4. Generate Videos ───────────────────────────────────────────────────
       setActive('video'); setActiveTab('video');
 
-      // Global fallback DNA pool — dùng khi cảnh không có nhân vật riêng
+      // Global DNA pool check — bao gồm cả nhân vật lẫn bối cảnh
       const globalMediaIds = Object.values(charMediaMap).filter(Boolean);
       const globalImgPaths = Object.values(charImgMap).filter(Boolean);
-      const hasDnaPool = globalMediaIds.length > 0 || globalImgPaths.length > 0;
+      const hasDnaPool = globalMediaIds.length > 0 || globalImgPaths.length > 0
+        || Object.values(envMediaMap).some(Boolean) || Object.values(envImgMap).some(Boolean);
 
       const langInfo = langLabel ? `ngôn ngữ: ${langLabel}` : 'không thoại';
 
@@ -4620,62 +4676,117 @@ function UrlToVideoPanel() {
       const veoTaskMap = new Map();
       const orderedVPaths = new Array(dedupedScenes.length).fill(null);
 
+      // ── Smart DNA selector — prompt-aware, priority-based, max 6 ─────────────
+      // P1=nhân vật cảnh (speaking first) → P2=bối cảnh cảnh → P3=nhân vật trong prompt
+      //   → P4=bối cảnh trong prompt → P5=random fill
+      const selectDNAForScene = (scene, prompt) => {
+        const MAX = 6;
+        const promptLow = (prompt || '').toLowerCase();
+        const picked = [];
+        const seen = new Set();
+
+        const tryAdd = (id, type) => {
+          if (seen.has(id) || picked.length >= MAX) return;
+          const mediaId = type === 'char' ? charMediaMap[id] : envMediaMap[id];
+          const imgPath  = type === 'char' ? charImgMap[id]  : envImgMap[id];
+          if (!mediaId && !imgPath) return;
+          seen.add(id);
+          picked.push({ id, type, mediaId, imgPath });
+        };
+
+        // P1: character_lock — nhân vật speaking (có voice) lên trước
+        const charLockArr = Array.isArray(scene.character_lock) ? scene.character_lock : [];
+        [...charLockArr]
+          .sort((a, b) => (charVoiceMap[b?.id] ? 1 : 0) - (charVoiceMap[a?.id] ? 1 : 0))
+          .forEach(c => { if (c?.id) tryAdd(c.id, 'char'); });
+
+        // P2: bối cảnh chính của cảnh
+        const bg = scene.background;
+        if (bg && typeof bg === 'object' && bg.id) tryAdd(bg.id, 'env');
+
+        // P3: nhân vật được nhắc tới trong prompt (theo tên hoặc id)
+        if (picked.length < MAX) {
+          [...new Set([...Object.keys(charMediaMap), ...Object.keys(charImgMap)])]
+            .filter(id => !seen.has(id))
+            .forEach(id => {
+              const d = charMap?.get?.(id);
+              const name = (typeof d === 'object' ? d?.name : d) || '';
+              const idNorm = id.toLowerCase().replace(/_/g, ' ');
+              const nmNorm = name.toLowerCase();
+              if (
+                (idNorm.length > 2 && promptLow.includes(idNorm)) ||
+                (nmNorm.length > 2 && promptLow.includes(nmNorm)) ||
+                nmNorm.split(/\s+/).filter(w => w.length > 3).some(w => promptLow.includes(w))
+              ) tryAdd(id, 'char');
+            });
+        }
+
+        // P4: bối cảnh được nhắc tới trong prompt
+        if (picked.length < MAX) {
+          [...new Set([...Object.keys(envMediaMap), ...Object.keys(envImgMap)])]
+            .filter(id => !seen.has(id))
+            .forEach(id => {
+              const norm = id.replace(/^env_/, '').toLowerCase().replace(/_/g, ' ');
+              if (norm.split(/\s+/).filter(w => w.length > 3).some(w => promptLow.includes(w)))
+                tryAdd(id, 'env');
+            });
+        }
+
+        // P5: random fill — chars còn lại rồi envs
+        if (picked.length < MAX) {
+          const remaining = [];
+          const rSeen = new Set(seen);
+          for (const id of [...new Set([...Object.keys(charMediaMap), ...Object.keys(charImgMap)])]) {
+            if (!rSeen.has(id)) { rSeen.add(id); remaining.push({ id, type: 'char' }); }
+          }
+          for (const id of [...new Set([...Object.keys(envMediaMap), ...Object.keys(envImgMap)])]) {
+            if (!rSeen.has(id)) { rSeen.add(id); remaining.push({ id, type: 'env' }); }
+          }
+          [...remaining].sort(() => Math.random() - 0.5)
+            .forEach(({ id, type }) => tryAdd(id, type));
+        }
+
+        // Ưu tiên UUID (đã upload) hơn local path
+        const withMedia = picked.filter(e => e.mediaId);
+        const withPath  = picked.filter(e => !e.mediaId && e.imgPath);
+        return withMedia.length > 0
+          ? { mediaIds: withMedia.map(e => e.mediaId), imgPaths: [], labels: withMedia.map(e => e.id) }
+          : { mediaIds: [], imgPaths: withPath.map(e => e.imgPath), labels: withPath.map(e => e.id) };
+      };
+
       let pendingTasks = dedupedScenes.map((scene, i) => {
         const tid = `vid_${i}`;
         veoTaskMap.set(tid, i);
 
-        // Collect scene-specific DNA
+        // Collect scene-specific data
         const charLockArr  = Array.isArray(scene.character_lock) ? scene.character_lock : [];
         const sceneCharIds = charLockArr.map(c => c?.id).filter(Boolean);
-        const sceneEnvId   = (scene.background && typeof scene.background === 'object') ? scene.background.id : null;
-
-        const sceneMediaIds = [
-          ...sceneCharIds.map(id => charMediaMap[id]),
-          sceneEnvId ? envMediaMap[sceneEnvId] : null,
-        ].filter(Boolean);
-        const sceneImgPaths = [
-          ...sceneCharIds.map(id => charImgMap[id]),
-          sceneEnvId ? envImgMap[sceneEnvId] : null,
-        ].filter(Boolean);
 
         const prompt = buildU2VPrompt(scene);
         const task = { id: tid, prompt };
 
-        // ── Luôn dùng Ingredients mode — không bao giờ T2V ──────────────────
-        // Ưu tiên: 1) nhân vật có voice → 1 ảnh + giọng
-        //          2) DNA riêng của cảnh (mediaId ưu tiên)
-        //          3) DNA fallback toàn bộ (mediaId ưu tiên)
+        // ── Smart DNA selection — prompt-aware, max 6 ────────────────────────────
+        // P1: nhân vật nói (voice) → 1 ảnh + giọng (Veo phát audio cho nhân vật này)
+        // P2+: selectDNAForScene → chọn thông minh theo prompt, nhân vật cảnh, bối cảnh
         const speakChar = sceneCharIds.find(id => charVoiceMap[id] && (charMediaMap[id] || charImgMap[id]));
 
         if (speakChar) {
-          // Nhân vật nói: 1 ảnh + voice (nhất quán với charVoiceMap)
           task.voiceId = charVoiceMap[speakChar];
           if (charMediaMap[speakChar]) task.ingredientMediaIds = [charMediaMap[speakChar]];
           else                         task.ingredientImages   = [charImgMap[speakChar]];
           addLog(`[Veo] Cảnh ${i + 1}: 🎙️ ${speakChar} (${task.voiceId}) + Ingredients`, 'info');
-
-        } else if (sceneMediaIds.length > 0) {
-          // Cảnh có nhân vật nhưng không có voice → dùng DNA của cảnh (mediaId)
-          task.ingredientMediaIds = sceneMediaIds;
-          addLog(`[Veo] Cảnh ${i + 1}: 🖼️ ${sceneCharIds.join(', ')} → ${sceneMediaIds.length} mediaId`, 'info');
-
-        } else if (sceneImgPaths.length > 0) {
-          // Cảnh có nhân vật, chỉ có path ảnh (không có UUID)
-          task.ingredientImages = sceneImgPaths;
-          addLog(`[Veo] Cảnh ${i + 1}: 🖼️ ${sceneCharIds.join(', ')} → ${sceneImgPaths.length} ảnh DNA`, 'info');
-
-        } else if (globalMediaIds.length > 0) {
-          // Cảnh không có nhân vật riêng → dùng toàn bộ DNA pool (mediaId)
-          task.ingredientMediaIds = globalMediaIds;
-          addLog(`[Veo] Cảnh ${i + 1}: 🔄 fallback → ${globalMediaIds.length} DNA pool (mediaId)`, 'info');
-
-        } else if (globalImgPaths.length > 0) {
-          // Cảnh không có nhân vật riêng → dùng toàn bộ DNA pool (path ảnh)
-          task.ingredientImages = globalImgPaths;
-          addLog(`[Veo] Cảnh ${i + 1}: 🔄 fallback → ${globalImgPaths.length} DNA pool (ảnh)`, 'info');
-
+        } else if (hasDnaPool) {
+          const dna = selectDNAForScene(scene, prompt);
+          if (dna.mediaIds.length > 0) {
+            task.ingredientMediaIds = dna.mediaIds;
+            addLog(`[Veo] Cảnh ${i + 1}: 🖼️ [${dna.labels.join(', ')}] → ${dna.mediaIds.length} DNA`, 'info');
+          } else if (dna.imgPaths.length > 0) {
+            task.ingredientImages = dna.imgPaths;
+            addLog(`[Veo] Cảnh ${i + 1}: 🖼️ [${dna.labels.join(', ')}] → ${dna.imgPaths.length} DNA ảnh`, 'info');
+          } else {
+            addLog(`[Veo] Cảnh ${i + 1}: ⚠️ không có DNA phù hợp → text-to-video`, 'info');
+          }
         } else {
-          // Không có DNA nào cả — buộc T2V (trường hợp DNA step hoàn toàn thất bại)
           addLog(`[Veo] Cảnh ${i + 1}: ⚠️ không có DNA → text-to-video`, 'info');
         }
 

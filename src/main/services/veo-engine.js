@@ -244,6 +244,9 @@ class VeoEngine {
 
     static generateIngredientsPayload(prompt, aspectRatio, model, projectId, recaptchaToken, ingredientMediaIds, voiceId = null, duration = '8s') {
         const sessionId = `;${Date.now()}`;
+        // Veo Ingredients API giới hạn tối đa 6 reference images — cap phòng thủ
+        const MAX_REF = 6;
+        const safeIds = (ingredientMediaIds || []).slice(0, MAX_REF);
         const req = {
             "aspectRatio": this.mapAspectRatioForVideo(aspectRatio),
             "textInput": {
@@ -254,7 +257,7 @@ class VeoEngine {
             "videoModelKey": this.mapVideoModelKeyR2V(model, duration),
             "metadata": {},
             "seed": Math.floor(Math.random() * 99999),
-            "referenceImages": ingredientMediaIds.map(id => ({
+            "referenceImages": safeIds.map(id => ({
                 "mediaId": id,
                 "imageUsageType": "IMAGE_USAGE_TYPE_ASSET"
             }))

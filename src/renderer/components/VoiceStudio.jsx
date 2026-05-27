@@ -573,13 +573,26 @@ export default function VoiceStudio({ dark = true }) {
     const _kokoroLS = () => { try { return JSON.parse(localStorage.getItem(KOKORO_LS) || '{}'); } catch { return {}; } };
     const kokoroPersist = (patch) => {
         const cur = _kokoroLS();
-        localStorage.setItem(KOKORO_LS, JSON.stringify({ ...cur, ...patch }));
+        localStorage.setItem(KOKORO_LS, JSON.stringify({ ...cur, ...patch, _v: 2 }));
     };
 
-    const [kokoroMode,        setKokoroMode]        = useState(() => _kokoroLS().mode    || 'api');
-    const [kokoroUrl,         setKokoroUrl]          = useState(() => _kokoroLS().url     || 'http://localhost:8880');
+    // Migration: old code defaulted to 'api' + localhost — upgrade to free HF mode
+    const [kokoroMode,        setKokoroMode]        = useState(() => {
+        const s = _kokoroLS();
+        if ((s._v || 1) < 2) return 'hf';   // first-time or old default → migrate to HF
+        return s.mode || 'hf';
+    });
+    const [kokoroUrl,         setKokoroUrl]          = useState(() => {
+        const s = _kokoroLS();
+        if ((s._v || 1) < 2) return 'https://hexgrad-kokoro-tts.hf.space'; // migrate
+        return s.url || 'https://hexgrad-kokoro-tts.hf.space';
+    });
     const [kokoroHfToken,     setKokoroHfToken]      = useState(() => _kokoroLS().hfToken || '');
-    const [kokoroHfFn,        setKokoroHfFn]         = useState(() => _kokoroLS().hfFn    || 'generate_first');
+    const [kokoroHfFn,        setKokoroHfFn]         = useState(() => {
+        const s = _kokoroLS();
+        if ((s._v || 1) < 2) return 'predict'; // migrate from old incorrect 'generate_first'
+        return s.hfFn || 'predict';
+    });
     const [kokoroVoice,       setKokoroVoice]        = useState(() => _kokoroLS().voice   || 'af_heart');
     const [kokoroSpeed,       setKokoroSpeed]        = useState(() => _kokoroLS().speed   ?? 1.0);
     const [kokoroFormat,      setKokoroFormat]       = useState(() => _kokoroLS().format  || 'mp3');
@@ -611,11 +624,22 @@ export default function VoiceStudio({ dark = true }) {
                     throw new Error(`HTTP ${r.status}`);
                 }
             } else {
-                // HF Space: ping /info
+                // HF Space: ping /info và auto-discover function name
                 const r = await fetch(`${baseUrl}/info`, { signal: AbortSignal.timeout(8000) });
                 if (r.ok) {
+                    let detectedFn = null;
+                    try {
+                        const info = await r.json();
+                        const namedEps = info.named_endpoints || {};
+                        const candidates = ['predict', 'generate', 'generate_first', 'infer', 'synthesize', 'tts'];
+                        detectedFn = candidates.find(fn => fn in namedEps) || null;
+                        if (detectedFn) {
+                            setKokoroHfFn(detectedFn);
+                            kokoroPersist({ hfFn: detectedFn });
+                        }
+                    } catch {}
                     setKokoroConnStatus('ok');
-                    setKokoroConnMsg(`✅ HF Space sẵn sàng`);
+                    setKokoroConnMsg(`✅ HF Space sẵn sàng${detectedFn ? ` · endpoint: ${detectedFn}` : ''}`);
                 } else {
                     throw new Error(`HTTP ${r.status}`);
                 }
@@ -647,15 +671,25 @@ export default function VoiceStudio({ dark = true }) {
                 const hdrs = { 'Content-Type': 'application/json' };
                 if (kokoroHfToken) hdrs['Authorization'] = `Bearer ${kokoroHfToken}`;
 
-                const submitRes = await fetch(`${baseUrl}/call/${kokoroHfFn}`, {
-                    method: 'POST', headers: hdrs,
-                    body: JSON.stringify({ data: [kokoroText.trim(), kokoroVoice, kokoroSpeed] })
-                });
+                // Try current fn name then fallbacks (handles spaces with different Gradio fn names)
+                const fnCandidates = [kokoroHfFn, 'predict', 'generate', 'generate_first', 'infer']
+                    .filter((f, i, a) => f && a.indexOf(f) === i);
+                let submitRes = null, usedFn = kokoroHfFn;
+                for (const fn of fnCandidates) {
+                    const r = await fetch(`${baseUrl}/call/${fn}`, {
+                        method: 'POST', headers: hdrs,
+                        body: JSON.stringify({ data: [kokoroText.trim(), kokoroVoice, kokoroSpeed] })
+                    });
+                    if (r.status !== 404) { submitRes = r; usedFn = fn; break; }
+                }
+                if (!submitRes) throw new Error(`Không tìm được endpoint trên HF Space — thử lại sau hoặc kiểm tra URL`);
                 if (!submitRes.ok) throw new Error(`HF submit lỗi: ${submitRes.status} ${submitRes.statusText}`);
+                // Remember working function name for next time
+                if (usedFn !== kokoroHfFn) { setKokoroHfFn(usedFn); kokoroPersist({ hfFn: usedFn }); }
                 const { event_id } = await submitRes.json();
                 if (!event_id) throw new Error('Không nhận được event_id từ HF Space');
 
-                const sseRes = await fetch(`${baseUrl}/call/${kokoroHfFn}/${event_id}`,
+                const sseRes = await fetch(`${baseUrl}/call/${usedFn}/${event_id}`,
                     { headers: kokoroHfToken ? { 'Authorization': `Bearer ${kokoroHfToken}` } : {} }
                 );
                 if (!sseRes.ok) throw new Error(`HF stream lỗi: ${sseRes.status}`);
@@ -2874,13 +2908,24 @@ export default function VoiceStudio({ dark = true }) {
                                 <p className="text-[9px] text-slate-600 mt-0.5">82M params · {KOKORO_VOICES.length} giọng · 10 ngôn ngữ · Không cần API Key</p>
                             </div>
                             <div className="flex items-center bg-slate-800 rounded-lg p-0.5 gap-0.5 shrink-0">
-                                <button onClick={() => { setKokoroMode('api'); kokoroPersist({ mode: 'api' }); }}
-                                    className={`px-3 py-1 rounded-md text-[10px] font-bold transition-all ${kokoroMode === 'api' ? 'bg-orange-600 text-white' : 'text-slate-400 hover:text-white'}`}>
+                                <button onClick={() => {
+                                    const newUrl = (kokoroUrl.includes('hf.space') || kokoroUrl.includes('huggingface'))
+                                        ? 'http://localhost:8880' : kokoroUrl;
+                                    setKokoroMode('api'); setKokoroUrl(newUrl);
+                                    kokoroPersist({ mode: 'api', url: newUrl });
+                                    setKokoroConnStatus('idle'); setKokoroConnMsg('');
+                                }} className={`px-3 py-1 rounded-md text-[10px] font-bold transition-all ${kokoroMode === 'api' ? 'bg-orange-600 text-white' : 'text-slate-400 hover:text-white'}`}>
                                     🖥️ Local API
                                 </button>
-                                <button onClick={() => { setKokoroMode('hf'); kokoroPersist({ mode: 'hf' }); }}
-                                    className={`px-3 py-1 rounded-md text-[10px] font-bold transition-all ${kokoroMode === 'hf' ? 'bg-violet-600 text-white' : 'text-slate-400 hover:text-white'}`}>
-                                    🤗 HF Space
+                                <button onClick={() => {
+                                    const newUrl = (kokoroUrl.includes('localhost') || kokoroUrl.includes('127.0.0.1'))
+                                        ? 'https://hexgrad-kokoro-tts.hf.space' : kokoroUrl;
+                                    setKokoroMode('hf'); setKokoroUrl(newUrl);
+                                    kokoroPersist({ mode: 'hf', url: newUrl });
+                                    setKokoroConnStatus('idle'); setKokoroConnMsg('');
+                                }} className={`px-3 py-1 rounded-md text-[10px] font-bold transition-all flex flex-col items-center leading-tight ${kokoroMode === 'hf' ? 'bg-violet-600 text-white' : 'text-slate-400 hover:text-white'}`}>
+                                    <span>🤗 HF Space</span>
+                                    <span className={`text-[8px] font-normal ${kokoroMode === 'hf' ? 'text-violet-200' : 'text-slate-600'}`}>Miễn phí</span>
                                 </button>
                             </div>
                         </div>
@@ -2916,7 +2961,7 @@ export default function VoiceStudio({ dark = true }) {
                                         <label className="text-[9px] font-bold text-slate-600 uppercase tracking-wider mb-1 block">Function name</label>
                                         <input value={kokoroHfFn}
                                             onChange={e => { setKokoroHfFn(e.target.value); kokoroPersist({ hfFn: e.target.value }); }}
-                                            placeholder="generate_first"
+                                            placeholder="predict"
                                             className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-400 focus:outline-none font-mono"
                                         />
                                     </div>
@@ -2961,8 +3006,8 @@ export default function VoiceStudio({ dark = true }) {
                                     <>💡 Chạy local (CPU): <code className="text-orange-400 font-mono select-all">docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest</code>
                                     <span className="mx-1.5 text-slate-700">·</span>GPU: <code className="text-orange-400 font-mono">kokoro-fastapi-gpu:latest</code></>
                                 ) : (
-                                    <>💡 Miễn phí, không cần key. Space mặc định: <code className="text-violet-400 font-mono">hexgrad/Kokoro-TTS</code>
-                                    <span className="mx-1.5 text-slate-700">·</span>Có thể chậm nếu queue đầy — thêm HF Token để ưu tiên hơn.</>
+                                    <>✅ <span className="text-violet-400 font-semibold">Miễn phí · Không cần cài đặt gì</span> · Space: <code className="text-violet-400 font-mono">hexgrad/Kokoro-TTS</code>
+                                    <span className="mx-1.5 text-slate-700">·</span>Nhấn <span className="text-slate-400">🔌 Test</span> để kiểm tra kết nối. Nếu chậm: thêm HF Token để tăng tốc.</>
                                 )}
                             </div>
                         </div>

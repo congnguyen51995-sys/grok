@@ -34,6 +34,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   extendChain:    (data) => ipcRenderer.invoke('veo:extend-chain', data),
   onVeoLog:       (cb)   => ipcRenderer.on('veo-log', (_e, data) => cb(data)),
   checkVeoCookie: (cookie) => ipcRenderer.invoke('veo:check-cookie', cookie),
+  // ── Proxy xoay ─────────────────────────────────────────────────────────────
+  veoProxyGet:    ()          => ipcRenderer.invoke('veo:proxy-get'),
+  veoProxySet:    (data)      => ipcRenderer.invoke('veo:proxy-set', data),
+  veoProxyToggle: (enabled)   => ipcRenderer.invoke('veo:proxy-toggle', enabled),
+  veoProxyTest:   (url)       => ipcRenderer.invoke('veo:proxy-test', url),
   // ── CÁC HÀM CŨ ────────────────────────────────────────────────────────────
   getJobs:    ()         => ipcRenderer.invoke('db:get-jobs'),
   createJob:  (jobData)  => ipcRenderer.invoke('db:create-job', jobData),

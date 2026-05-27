@@ -75,6 +75,56 @@ export default function VeoStudio({ dark = true }) {
     const [logOpen, setLogOpen] = useState(false);
     const logsEndRef = useRef(null);
 
+    // ── Proxy xoay state ─────────────────────────────────────────────────────
+    const [proxyEnabled, setProxyEnabled] = useState(false);
+    const [proxyList, setProxyList]       = useState([]); // [{url,label,enabled,failCount}]
+    const [proxyInput, setProxyInput]     = useState(''); // textarea input (1 proxy per line)
+    const [proxyOpen, setProxyOpen]       = useState(false); // panel collapse
+    const [proxyTestResults, setProxyTestResults] = useState({}); // url → {ok,ms,error,testing}
+
+    // Load proxy settings khi mount
+    useEffect(() => {
+        window.electronAPI?.veoProxyGet?.().then(data => {
+            if (data) {
+                setProxyEnabled(!!data.enabled);
+                setProxyList(Array.isArray(data.proxies) ? data.proxies : []);
+            }
+        }).catch(() => {});
+    }, []);
+
+    const saveProxies = async (list, enabled) => {
+        const result = await window.electronAPI?.veoProxySet?.({ proxies: list, enabled });
+        if (result) { setProxyList(result.proxies || []); setProxyEnabled(!!result.enabled); }
+    };
+
+    const handleProxyToggle = async (val) => {
+        setProxyEnabled(val);
+        await window.electronAPI?.veoProxyToggle?.(val);
+    };
+
+    const handleProxyApply = async () => {
+        const lines = proxyInput.split('\n').map(l => l.trim()).filter(Boolean);
+        const newList = lines.map(url => ({ url, label: '', enabled: true, failCount: 0 }));
+        await saveProxies(newList, proxyEnabled);
+        setProxyInput('');
+    };
+
+    const handleProxyRemove = async (url) => {
+        const newList = proxyList.filter(p => p.url !== url);
+        await saveProxies(newList, proxyEnabled);
+    };
+
+    const handleProxyToggleEntry = async (url, val) => {
+        const newList = proxyList.map(p => p.url === url ? { ...p, enabled: val } : p);
+        await saveProxies(newList, proxyEnabled);
+    };
+
+    const handleProxyTest = async (url) => {
+        setProxyTestResults(prev => ({ ...prev, [url]: { testing: true } }));
+        const res = await window.electronAPI?.veoProxyTest?.(url) || { ok: false, error: 'API không khả dụng' };
+        setProxyTestResults(prev => ({ ...prev, [url]: { ...res, testing: false } }));
+    };
+
     const aspectRatios = ['16:9', '4:3', '1:1', '3:4', '9:16'];
     const genCounts = ['1x', 'x2', 'x3', 'x4'];
     const imageQualities = ['1K', '2K', '4K']; 
@@ -687,6 +737,105 @@ export default function VeoStudio({ dark = true }) {
                         )}
                     </div>
                     {/* HẾT KHỐI TRẠNG THÁI */}
+
+                    {/* ── PROXY XOAY PANEL ───────────────────────────────── */}
+                    <div className="bg-[#1e293b]/60 border border-slate-700/60 rounded-lg overflow-hidden">
+                        {/* Header */}
+                        <button onClick={() => setProxyOpen(v => !v)}
+                            className="w-full flex items-center justify-between px-3 py-2 hover:bg-slate-700/30 transition-colors">
+                            <span className="flex items-center gap-2 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                <span className="text-sm">🔄</span> Proxy Xoay
+                                {proxyEnabled && proxyList.filter(p=>p.enabled).length > 0 && (
+                                    <span className="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-[8px] px-1.5 py-0.5 rounded font-bold">
+                                        BẬT · {proxyList.filter(p=>p.enabled).length} proxy
+                                    </span>
+                                )}
+                                {proxyEnabled && proxyList.filter(p=>p.enabled).length === 0 && (
+                                    <span className="bg-amber-500/20 text-amber-400 border border-amber-500/30 text-[8px] px-1.5 py-0.5 rounded font-bold">
+                                        BẬT · Chưa có proxy
+                                    </span>
+                                )}
+                            </span>
+                            <span className="flex items-center gap-2">
+                                {/* Toggle bật/tắt */}
+                                <span onClick={e => { e.stopPropagation(); handleProxyToggle(!proxyEnabled); }}
+                                    className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors cursor-pointer ${proxyEnabled ? 'bg-emerald-500' : 'bg-slate-600'}`}>
+                                    <span className={`inline-block h-3 w-3 rounded-full bg-white shadow transition-transform ${proxyEnabled ? 'translate-x-3.5' : 'translate-x-0.5'}`} />
+                                </span>
+                                {proxyOpen ? <ChevronUp size={12} className="text-slate-500"/> : <ChevronDown size={12} className="text-slate-500"/>}
+                            </span>
+                        </button>
+
+                        {proxyOpen && (
+                            <div className="px-3 pb-3 space-y-2 border-t border-slate-700/40 pt-2">
+                                {/* Hướng dẫn */}
+                                <p className="text-[9px] text-slate-500 leading-relaxed">
+                                    Mỗi dòng 1 proxy. Hỗ trợ: <code className="text-slate-400">host:port</code> hoặc <code className="text-slate-400">http://user:pass@host:port</code>
+                                </p>
+
+                                {/* Textarea nhập proxy */}
+                                <textarea
+                                    value={proxyInput}
+                                    onChange={e => setProxyInput(e.target.value)}
+                                    placeholder={'192.168.1.1:8080\nhttp://user:pass@proxy.vn:3128\n...'}
+                                    rows={4}
+                                    className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-2.5 py-2 text-[10px] text-slate-300 font-mono focus:outline-none focus:border-blue-500 resize-none"
+                                />
+                                <button onClick={handleProxyApply}
+                                    className="w-full py-1.5 bg-blue-600/80 hover:bg-blue-600 text-white text-[10px] font-bold rounded-lg transition-colors">
+                                    ➕ Thêm / Cập nhật
+                                </button>
+
+                                {/* Danh sách proxy hiện tại */}
+                                {proxyList.length > 0 && (
+                                    <div className="space-y-1 max-h-48 overflow-y-auto custom-scrollbar">
+                                        {proxyList.map((p, i) => {
+                                            const tr = proxyTestResults[p.url] || {};
+                                            return (
+                                                <div key={i} className={`flex items-center gap-1.5 bg-[#0f172a] border rounded-lg px-2 py-1.5 text-[9px] ${p.enabled ? 'border-slate-700' : 'border-slate-800 opacity-50'}`}>
+                                                    {/* Enable toggle */}
+                                                    <span onClick={() => handleProxyToggleEntry(p.url, !p.enabled)}
+                                                        className={`shrink-0 relative inline-flex h-3 w-5 items-center rounded-full transition-colors cursor-pointer ${p.enabled ? 'bg-emerald-500' : 'bg-slate-600'}`}>
+                                                        <span className={`inline-block h-2 w-2 rounded-full bg-white shadow transition-transform ${p.enabled ? 'translate-x-2.5' : 'translate-x-0.5'}`} />
+                                                    </span>
+                                                    {/* URL */}
+                                                    <span className="flex-1 text-slate-300 font-mono truncate" title={p.url}>{p.url}</span>
+                                                    {/* Fail indicator */}
+                                                    {p.failCount > 0 && (
+                                                        <span className="text-amber-400 shrink-0" title={`${p.failCount} lỗi liên tiếp`}>⚠{p.failCount}</span>
+                                                    )}
+                                                    {/* Test result */}
+                                                    {tr.testing && <Loader2 size={9} className="animate-spin text-slate-400 shrink-0"/>}
+                                                    {!tr.testing && tr.ok === true  && <span className="text-emerald-400 shrink-0" title={`OK ${tr.ms}ms`}>✅{tr.ms}ms</span>}
+                                                    {!tr.testing && tr.ok === false && <span className="text-red-400 shrink-0 max-w-[50px] truncate" title={tr.error}>❌</span>}
+                                                    {/* Test button */}
+                                                    <button onClick={() => handleProxyTest(p.url)} disabled={tr.testing}
+                                                        className="shrink-0 text-[8px] bg-slate-700 hover:bg-slate-600 text-slate-300 px-1.5 py-0.5 rounded transition-colors">
+                                                        Test
+                                                    </button>
+                                                    {/* Remove */}
+                                                    <button onClick={() => handleProxyRemove(p.url)}
+                                                        className="shrink-0 text-slate-600 hover:text-red-400 transition-colors">
+                                                        <X size={10}/>
+                                                    </button>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                                {proxyList.length === 0 && (
+                                    <p className="text-[9px] text-slate-600 text-center py-1">Chưa có proxy nào</p>
+                                )}
+                                {proxyList.length > 0 && (
+                                    <button onClick={() => saveProxies([], false)}
+                                        className="w-full py-1 text-[9px] text-slate-600 hover:text-red-400 transition-colors">
+                                        🗑 Xóa tất cả proxy
+                                    </button>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                    {/* HẾT PROXY PANEL */}
 
                     <div className="flex gap-1 bg-[#0f1524] p-1.5 rounded-lg border border-slate-800 flex-wrap">
                         <button onClick={() => setInputMode('Image')} className={`flex-1 py-1.5 rounded-md text-[10px] font-bold transition-all ${inputMode === 'Image' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-300'}`}>Tạo Ảnh</button>

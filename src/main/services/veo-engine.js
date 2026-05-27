@@ -3,6 +3,7 @@ const path = require('path');
 const { pipeline } = require('stream/promises');
 const crypto = require('crypto');
 const https = require('https');
+const { HttpsProxyAgent, proxyManager } = require('./proxy-manager');
 
 // Mutex để serialize các Extension upload — kênh pendingImageUpload/uploadedMediaId
 let _extensionUploadLock = Promise.resolve();
@@ -64,6 +65,8 @@ class VeoEngine {
         if (bodyStr) headers['content-length'] = Buffer.byteLength(bodyStr).toString();
 
         // Dùng Node.js https thuần — tránh net::ERR_FAILED từ Electron/Chromium net stack
+        // Inject proxy agent nếu proxy xoay đang bật
+        const activeProxy = proxyManager.getNext();
         return new Promise((resolve, reject) => {
             const parsedUrl = new URL(url);
             const reqOptions = {
@@ -72,11 +75,16 @@ class VeoEngine {
                 method,
                 headers,
             };
+            if (activeProxy) {
+                try { reqOptions.agent = new HttpsProxyAgent(activeProxy); }
+                catch {}
+            }
             const req = https.request(reqOptions, (res) => {
                 let data = '';
                 res.on('data', chunk => { data += chunk; });
                 res.on('end', () => {
                     if (res.statusCode >= 200 && res.statusCode < 300) {
+                        if (activeProxy) proxyManager.markSuccess(activeProxy);
                         try { resolve(JSON.parse(data)); } catch { resolve(data); }
                     } else {
                         if (res.statusCode === 403 && data.includes('reCAPTCHA')) {
@@ -88,7 +96,10 @@ class VeoEngine {
                     }
                 });
             });
-            req.on('error', (e) => reject(new Error(`Node.js fetch error: ${e.message}`)));
+            req.on('error', (e) => {
+                if (activeProxy) proxyManager.markFailed(activeProxy);
+                reject(new Error(`Node.js fetch error: ${e.message}`));
+            });
             if (bodyStr) req.write(bodyStr);
             req.end();
         });
@@ -1124,6 +1135,7 @@ class VeoEngine {
         const headers = VeoEngine.buildFullAuthHeaders();
 
         // Dùng Node.js https.request — không follow redirect, đọc Location header trực tiếp
+        const activeProxy = proxyManager.getNext();
         const { location: locationHeader, status, body: bodyText } = await new Promise((resolve, reject) => {
             const parsedUrl = new URL(tRPCUrl);
             const reqOptions = {
@@ -1132,16 +1144,21 @@ class VeoEngine {
                 method: 'GET',
                 headers,
             };
+            if (activeProxy) {
+                try { reqOptions.agent = new HttpsProxyAgent(activeProxy); } catch {}
+            }
             const req = https.request(reqOptions, (res) => {
                 let data = '';
                 res.on('data', chunk => { data += chunk; });
-                res.on('end', () => resolve({
-                    location: res.headers['location'] || null,
-                    status: res.statusCode,
-                    body: data
-                }));
+                res.on('end', () => {
+                    if (activeProxy) proxyManager.markSuccess(activeProxy);
+                    resolve({ location: res.headers['location'] || null, status: res.statusCode, body: data });
+                });
             });
-            req.on('error', (e) => reject(new Error(`https.request failed: ${e.message}`)));
+            req.on('error', (e) => {
+                if (activeProxy) proxyManager.markFailed(activeProxy);
+                reject(new Error(`https.request failed: ${e.message}`));
+            });
             req.end();
         });
 
@@ -1228,6 +1245,7 @@ class VeoEngine {
         }
 
         // Dùng Node.js https.request — tránh net::ERR_FAILED từ Electron net stack
+        const dlProxy = proxyManager.getNext();
         const { statusCode, contentType, resStream } = await new Promise((resolve, reject) => {
             const followRedirect = (reqUrl, depth = 0) => {
                 if (depth > 5) return reject(new Error('Quá nhiều redirect'));
@@ -1239,13 +1257,20 @@ class VeoEngine {
                     method: 'GET',
                     headers: reqHeaders,
                 };
+                if (dlProxy) {
+                    try { reqOptions.agent = new HttpsProxyAgent(dlProxy); } catch {}
+                }
                 const req = https.request(reqOptions, (res) => {
                     if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) && res.headers['location']) {
                         return followRedirect(res.headers['location'], depth + 1);
                     }
+                    if (dlProxy) proxyManager.markSuccess(dlProxy);
                     resolve({ statusCode: res.statusCode, contentType: res.headers['content-type'] || '', resStream: res });
                 });
-                req.on('error', reject);
+                req.on('error', (e) => {
+                    if (dlProxy) proxyManager.markFailed(dlProxy);
+                    reject(e);
+                });
                 req.end();
             };
             followRedirect(url);

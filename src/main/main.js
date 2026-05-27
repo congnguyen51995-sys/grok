@@ -16,7 +16,8 @@ const { DatabaseService }     = require('./services/database');
 const { QueueManager }        = require('./services/queue-manager');
 const { PlaywrightEngine }    = require('./services/playwright-engine');
 const { openLoginWindow, checkLogin, syncToElectronSession, findChromePath } = require('./services/chrome-profile-manager');
-const { VeoEngine }           = require('./services/veo-engine'); 
+const { VeoEngine }           = require('./services/veo-engine');
+const { proxyManager, ProxyManager } = require('./services/proxy-manager');
 
 // ==================== KHỞI TẠO LOCAL SERVER (EXPRESS) ====================
 const express = require('express');
@@ -270,6 +271,10 @@ async function initializeServices() {
     const savedConcurrency = parseInt(await db.getSetting('concurrency', '1'));
     queueManager = new QueueManager({ db, playwrightEngine, concurrency: savedConcurrency });
     await queueManager.init();
+
+    // Load saved proxy list
+    const savedProxies = await db.getSetting('veoProxies_v1', null);
+    if (savedProxies) proxyManager.load(savedProxies);
   } catch (error) { throw error; }
 }
 
@@ -1961,6 +1966,30 @@ ipcMain.handle('veo:extend-chain', async (event, jobData) => {
         const sendLog = (text, type = 'info') => { if (mainWindow) mainWindow.webContents.send('veo-log', { time: new Date().toLocaleTimeString(), text, type }); };
         return await VeoEngine.runExtendChain(jobData, sendLog);
     } catch (error) { return { success: false, error: error.message }; }
+});
+
+// ── Proxy xoay ────────────────────────────────────────────────────────────────
+ipcMain.handle('veo:proxy-get', async () => {
+    return proxyManager.toJSON();
+});
+
+ipcMain.handle('veo:proxy-set', async (event, { proxies, enabled }) => {
+    if (Array.isArray(proxies)) proxyManager.setProxies(proxies);
+    if (enabled !== undefined) proxyManager.setEnabled(enabled);
+    const data = proxyManager.toJSON();
+    if (db) await db.setSetting('veoProxies_v1', JSON.stringify(data));
+    return data;
+});
+
+ipcMain.handle('veo:proxy-toggle', async (event, enabled) => {
+    proxyManager.setEnabled(!!enabled);
+    const data = proxyManager.toJSON();
+    if (db) await db.setSetting('veoProxies_v1', JSON.stringify(data));
+    return data;
+});
+
+ipcMain.handle('veo:proxy-test', async (event, url) => {
+    return await ProxyManager.testProxy(url, 10000);
 });
 
 // ==================== VIDEO EDITOR ====================

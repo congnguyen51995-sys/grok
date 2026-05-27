@@ -667,14 +667,23 @@ export default function VoiceStudio({ dark = true }) {
             const baseUrl = kokoroUrl.replace(/\/$/, '');
 
             if (kokoroMode === 'hf') {
-                // ── HF Space Gradio v4 SSE API ────────────────────────────────
+                // ── HF Space Gradio API ───────────────────────────────────────
                 const hdrs = { 'Content-Type': 'application/json' };
                 if (kokoroHfToken) hdrs['Authorization'] = `Bearer ${kokoroHfToken}`;
 
-                // Try current fn name then fallbacks (handles spaces with different Gradio fn names)
-                const fnCandidates = [kokoroHfFn, 'predict', 'generate', 'generate_first', 'infer']
+                // Helper: extract audio URL from a Gradio output item
+                const extractAudioUrl = (item) => {
+                    if (!item) return null;
+                    if (item.url)  return item.url;
+                    if (item.path) return `${baseUrl}/file=${item.path}`;
+                    if (typeof item === 'string') return item.startsWith('http') ? item : `${baseUrl}${item}`;
+                    return null;
+                };
+
+                // ── APPROACH 1: Gradio v4 SSE /call/{fn} ─────────────────────
+                const fnCandidates = [kokoroHfFn, 'predict', 'generate', 'generate_first', 'infer', 'text_to_speech', 'tts']
                     .filter((f, i, a) => f && a.indexOf(f) === i);
-                let submitRes = null, usedFn = kokoroHfFn;
+                let submitRes = null, usedFn = null;
                 for (const fn of fnCandidates) {
                     const r = await fetch(`${baseUrl}/call/${fn}`, {
                         method: 'POST', headers: hdrs,
@@ -682,49 +691,67 @@ export default function VoiceStudio({ dark = true }) {
                     });
                     if (r.status !== 404) { submitRes = r; usedFn = fn; break; }
                 }
-                if (!submitRes) throw new Error(`Không tìm được endpoint trên HF Space — thử lại sau hoặc kiểm tra URL`);
-                if (!submitRes.ok) throw new Error(`HF submit lỗi: ${submitRes.status} ${submitRes.statusText}`);
-                // Remember working function name for next time
-                if (usedFn !== kokoroHfFn) { setKokoroHfFn(usedFn); kokoroPersist({ hfFn: usedFn }); }
-                const { event_id } = await submitRes.json();
-                if (!event_id) throw new Error('Không nhận được event_id từ HF Space');
 
-                const sseRes = await fetch(`${baseUrl}/call/${usedFn}/${event_id}`,
-                    { headers: kokoroHfToken ? { 'Authorization': `Bearer ${kokoroHfToken}` } : {} }
-                );
-                if (!sseRes.ok) throw new Error(`HF stream lỗi: ${sseRes.status}`);
+                if (submitRes && submitRes.ok) {
+                    // SSE path
+                    if (usedFn !== kokoroHfFn) { setKokoroHfFn(usedFn); kokoroPersist({ hfFn: usedFn }); }
+                    const { event_id } = await submitRes.json();
+                    if (!event_id) throw new Error('Không nhận được event_id từ HF Space');
 
-                const reader = sseRes.body.getReader();
-                const decoder = new TextDecoder();
-                let audioFileUrl = null;
-                let buf = '';
+                    const sseRes = await fetch(`${baseUrl}/call/${usedFn}/${event_id}`,
+                        { headers: kokoroHfToken ? { 'Authorization': `Bearer ${kokoroHfToken}` } : {} }
+                    );
+                    if (!sseRes.ok) throw new Error(`HF stream lỗi: ${sseRes.status}`);
 
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    buf += decoder.decode(value, { stream: true });
-                    const lines = buf.split('\n');
-                    buf = lines.pop() || '';
-                    for (const line of lines) {
-                        if (!line.startsWith('data: ')) continue;
-                        const raw = line.slice(6).trim();
-                        if (!raw || raw === 'null') continue;
-                        try {
-                            const parsed = JSON.parse(raw);
-                            if (Array.isArray(parsed)) {
-                                const item = parsed[0];
-                                if (item?.url)  { audioFileUrl = item.url; }
-                                else if (item?.path) { audioFileUrl = `${baseUrl}/file=${item.path}`; }
-                            }
-                        } catch {}
-                        if (audioFileUrl) break;
+                    const reader = sseRes.body.getReader();
+                    const decoder = new TextDecoder();
+                    let audioFileUrl = null;
+                    let buf = '';
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        buf += decoder.decode(value, { stream: true });
+                        const lines = buf.split('\n');
+                        buf = lines.pop() || '';
+                        for (const line of lines) {
+                            if (!line.startsWith('data: ')) continue;
+                            const raw = line.slice(6).trim();
+                            if (!raw || raw === 'null') continue;
+                            try {
+                                const parsed = JSON.parse(raw);
+                                if (Array.isArray(parsed)) audioFileUrl = extractAudioUrl(parsed[0]);
+                            } catch {}
+                            if (audioFileUrl) break;
+                        }
+                        if (audioFileUrl) { reader.cancel(); break; }
                     }
-                    if (audioFileUrl) { reader.cancel(); break; }
+                    if (!audioFileUrl) throw new Error('Không lấy được URL audio từ HF Space (SSE)');
+                    const af = await fetch(audioFileUrl);
+                    if (!af.ok) throw new Error(`Tải audio lỗi: ${af.status}`);
+                    audioBlob = await af.blob();
+
+                } else {
+                    // ── APPROACH 2: Gradio legacy /run/predict (sync, no SSE) ──
+                    // Many spaces don't expose named SSE endpoints — use fn_index: 0 instead
+                    const legacy = await fetch(`${baseUrl}/run/predict`, {
+                        method: 'POST', headers: hdrs,
+                        body: JSON.stringify({
+                            fn_index: 0,
+                            data: [kokoroText.trim(), kokoroVoice, kokoroSpeed],
+                            session_hash: Math.random().toString(36).slice(2, 10)
+                        })
+                    });
+                    if (!legacy.ok) {
+                        const errTxt = await legacy.text().catch(() => '');
+                        throw new Error(`HF Space không phản hồi (HTTP ${legacy.status})${errTxt ? ': ' + errTxt.slice(0,120) : ''}`);
+                    }
+                    const legacyData = await legacy.json();
+                    const audioFileUrl = extractAudioUrl(legacyData.data?.[0]);
+                    if (!audioFileUrl) throw new Error('Không lấy được URL audio từ HF Space');
+                    const af = await fetch(audioFileUrl);
+                    if (!af.ok) throw new Error(`Tải audio lỗi: ${af.status}`);
+                    audioBlob = await af.blob();
                 }
-                if (!audioFileUrl) throw new Error('Không lấy được URL audio từ HF Space');
-                const audioFetchRes = await fetch(audioFileUrl);
-                if (!audioFetchRes.ok) throw new Error(`Tải audio lỗi: ${audioFetchRes.status}`);
-                audioBlob = await audioFetchRes.blob();
 
             } else {
                 // ── OpenAI-compatible API (kokoro-fastapi) ────────────────────

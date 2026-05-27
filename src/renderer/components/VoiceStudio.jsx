@@ -590,7 +590,47 @@ export default function VoiceStudio({ dark = true }) {
     const [kokoroHistory,     setKokoroHistory]      = useState(() => { try { return JSON.parse(localStorage.getItem(KOKORO_LS_HIST) || '[]'); } catch { return []; } });
     const [kokoroPlayingId,   setKokoroPlayingId]    = useState(null);
     const [kokoroVoiceFilter, setKokoroVoiceFilter]  = useState('');
+    const [kokoroConnStatus,  setKokoroConnStatus]   = useState('idle'); // 'idle'|'checking'|'ok'|'error'
+    const [kokoroConnMsg,     setKokoroConnMsg]       = useState('');
     const kokoroAudioRef = useRef(null);
+
+    // ── Kokoro: kiểm tra kết nối ─────────────────────────────────────────────
+    const kokoroCheckConn = async (url, mode) => {
+        const baseUrl = (url || kokoroUrl).replace(/\/$/, '');
+        const m = mode || kokoroMode;
+        setKokoroConnStatus('checking');
+        setKokoroConnMsg('');
+        try {
+            if (m === 'api') {
+                // Ping /v1/models hoặc /health
+                const r = await fetch(`${baseUrl}/v1/models`, { signal: AbortSignal.timeout(5000) });
+                if (r.ok || r.status === 404) {
+                    setKokoroConnStatus('ok');
+                    setKokoroConnMsg(`✅ Server đang chạy tại ${baseUrl}`);
+                } else {
+                    throw new Error(`HTTP ${r.status}`);
+                }
+            } else {
+                // HF Space: ping /info
+                const r = await fetch(`${baseUrl}/info`, { signal: AbortSignal.timeout(8000) });
+                if (r.ok) {
+                    setKokoroConnStatus('ok');
+                    setKokoroConnMsg(`✅ HF Space sẵn sàng`);
+                } else {
+                    throw new Error(`HTTP ${r.status}`);
+                }
+            }
+        } catch (e) {
+            setKokoroConnStatus('error');
+            const isOffline = /fetch|network|refused|failed/i.test(e.message);
+            setKokoroConnMsg(isOffline
+                ? m === 'api'
+                    ? `❌ Không kết nối được — Docker chưa chạy?\n  docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest`
+                    : `❌ Không kết nối được — kiểm tra URL HF Space`
+                : `❌ Lỗi: ${e.message}`
+            );
+        }
+    };
 
     // ── Kokoro generate ───────────────────────────────────────────────────────
     const kokoroGenerate = async () => {
@@ -698,8 +738,19 @@ export default function VoiceStudio({ dark = true }) {
             addVoiceLog(`✅ [Kokoro] ${kokoroVoice} · ${kokoroText.trim().length} ký tự`, 'success');
 
         } catch (e) {
-            addVoiceLog(`❌ [Kokoro] Lỗi: ${e.message}`, 'error');
-            alert('Lỗi Kokoro TTS: ' + e.message);
+            const isNetErr = /failed to fetch|network|refused|econnrefused|fetch/i.test(e.message);
+            const userMsg = isNetErr
+                ? kokoroMode === 'api'
+                    ? `Không kết nối được tới ${kokoroUrl}\n\nServer chưa chạy — hãy khởi động Docker:\ndocker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest`
+                    : `Không kết nối được tới HF Space.\nKiểm tra URL: ${kokoroUrl}\nHoặc thử lại sau (queue đầy).`
+                : e.message;
+            addVoiceLog(`❌ [Kokoro] ${userMsg.split('\n')[0]}`, 'error');
+            setKokoroConnStatus('error');
+            setKokoroConnMsg(isNetErr
+                ? kokoroMode === 'api' ? '❌ Server chưa chạy — cần khởi động Docker' : '❌ Không kết nối HF Space'
+                : `❌ ${e.message}`
+            );
+            alert('Lỗi Kokoro TTS:\n\n' + userMsg);
         } finally {
             setKokoroGenerating(false);
         }
@@ -2842,7 +2893,7 @@ export default function VoiceStudio({ dark = true }) {
                                         {kokoroMode === 'api' ? 'API URL (kokoro-fastapi)' : 'HF Space URL'}
                                     </label>
                                     <input value={kokoroUrl}
-                                        onChange={e => { setKokoroUrl(e.target.value); kokoroPersist({ url: e.target.value }); }}
+                                        onChange={e => { setKokoroUrl(e.target.value); kokoroPersist({ url: e.target.value }); setKokoroConnStatus('idle'); setKokoroConnMsg(''); }}
                                         placeholder={kokoroMode === 'api' ? 'http://localhost:8880' : 'https://hexgrad-kokoro-tts.hf.space'}
                                         className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-orange-500 transition-colors font-mono"
                                     />
@@ -2870,7 +2921,28 @@ export default function VoiceStudio({ dark = true }) {
                                         />
                                     </div>
                                 )}
+                                {/* Test connection button */}
+                                <button onClick={() => kokoroCheckConn()} disabled={kokoroConnStatus === 'checking'}
+                                    title="Kiểm tra kết nối"
+                                    className={`shrink-0 px-3 py-1.5 rounded-lg text-[10px] font-bold transition-all border flex items-center gap-1.5
+                                        ${kokoroConnStatus === 'ok'       ? 'bg-emerald-600/20 border-emerald-500/40 text-emerald-400' :
+                                          kokoroConnStatus === 'error'    ? 'bg-red-600/20 border-red-500/40 text-red-400' :
+                                          kokoroConnStatus === 'checking' ? 'bg-slate-700/50 border-slate-600 text-slate-400' :
+                                                                            'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600'}`}>
+                                    {kokoroConnStatus === 'checking' ? <><Loader2 size={11} className="animate-spin"/>Test...</> :
+                                     kokoroConnStatus === 'ok'       ? <>✅ OK</> :
+                                     kokoroConnStatus === 'error'    ? <>❌ Lỗi</> :
+                                                                        <>🔌 Test</>}
+                                </button>
                             </div>
+
+                            {/* Connection status message */}
+                            {kokoroConnMsg && (
+                                <div className={`rounded-lg px-3 py-2 text-[9px] leading-relaxed whitespace-pre-line
+                                    ${kokoroConnStatus === 'ok' ? 'bg-emerald-900/20 border border-emerald-500/20 text-emerald-400' : 'bg-red-900/20 border border-red-500/20 text-red-400'}`}>
+                                    {kokoroConnMsg}
+                                </div>
+                            )}
 
                             {kokoroMode === 'hf' && (
                                 <div>
@@ -2886,7 +2958,7 @@ export default function VoiceStudio({ dark = true }) {
                             {/* Setup guide */}
                             <div className="bg-slate-900/60 rounded-lg px-3 py-2 text-[9px] text-slate-600 leading-relaxed">
                                 {kokoroMode === 'api' ? (
-                                    <>💡 Chạy local (CPU): <code className="text-orange-400 font-mono">docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest</code>
+                                    <>💡 Chạy local (CPU): <code className="text-orange-400 font-mono select-all">docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest</code>
                                     <span className="mx-1.5 text-slate-700">·</span>GPU: <code className="text-orange-400 font-mono">kokoro-fastapi-gpu:latest</code></>
                                 ) : (
                                     <>💡 Miễn phí, không cần key. Space mặc định: <code className="text-violet-400 font-mono">hexgrad/Kokoro-TTS</code>

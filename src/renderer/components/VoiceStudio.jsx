@@ -74,6 +74,72 @@ const GEMINI_VOICES = [
     { id: 'Mimosa',       gender: 'neutral', style: 'Tươi sáng'              },
 ];
 
+// ─── KOKORO TTS ───────────────────────────────────────────────────────────────
+const KOKORO_LS      = 'kokoro_tts_v1';
+const KOKORO_LS_HIST = 'kokoro_tts_history';
+
+const KOKORO_VOICES = [
+    // 🇺🇸 American Female
+    { id: 'af_heart',     group: '🇺🇸 Nữ Mỹ',            name: 'Heart'      },
+    { id: 'af_bella',     group: '🇺🇸 Nữ Mỹ',            name: 'Bella'      },
+    { id: 'af_nicole',    group: '🇺🇸 Nữ Mỹ',            name: 'Nicole'     },
+    { id: 'af_sarah',     group: '🇺🇸 Nữ Mỹ',            name: 'Sarah'      },
+    { id: 'af_sky',       group: '🇺🇸 Nữ Mỹ',            name: 'Sky'        },
+    { id: 'af_alloy',     group: '🇺🇸 Nữ Mỹ',            name: 'Alloy'      },
+    { id: 'af_aoede',     group: '🇺🇸 Nữ Mỹ',            name: 'Aoede'      },
+    { id: 'af_jessica',   group: '🇺🇸 Nữ Mỹ',            name: 'Jessica'    },
+    { id: 'af_kore',      group: '🇺🇸 Nữ Mỹ',            name: 'Kore'       },
+    { id: 'af_nova',      group: '🇺🇸 Nữ Mỹ',            name: 'Nova'       },
+    { id: 'af_river',     group: '🇺🇸 Nữ Mỹ',            name: 'River'      },
+    // 🇺🇸 American Male
+    { id: 'am_adam',      group: '🇺🇸 Nam Mỹ',            name: 'Adam'       },
+    { id: 'am_michael',   group: '🇺🇸 Nam Mỹ',            name: 'Michael'    },
+    { id: 'am_echo',      group: '🇺🇸 Nam Mỹ',            name: 'Echo'       },
+    { id: 'am_eric',      group: '🇺🇸 Nam Mỹ',            name: 'Eric'       },
+    { id: 'am_fenrir',    group: '🇺🇸 Nam Mỹ',            name: 'Fenrir'     },
+    { id: 'am_liam',      group: '🇺🇸 Nam Mỹ',            name: 'Liam'       },
+    { id: 'am_onyx',      group: '🇺🇸 Nam Mỹ',            name: 'Onyx'       },
+    { id: 'am_puck',      group: '🇺🇸 Nam Mỹ',            name: 'Puck'       },
+    { id: 'am_santa',     group: '🇺🇸 Nam Mỹ',            name: 'Santa'      },
+    // 🇬🇧 British Female
+    { id: 'bf_alice',     group: '🇬🇧 Nữ Anh',            name: 'Alice'      },
+    { id: 'bf_emma',      group: '🇬🇧 Nữ Anh',            name: 'Emma'       },
+    { id: 'bf_isabella',  group: '🇬🇧 Nữ Anh',            name: 'Isabella'   },
+    { id: 'bf_lily',      group: '🇬🇧 Nữ Anh',            name: 'Lily'       },
+    // 🇬🇧 British Male
+    { id: 'bm_daniel',    group: '🇬🇧 Nam Anh',            name: 'Daniel'     },
+    { id: 'bm_fable',     group: '🇬🇧 Nam Anh',            name: 'Fable'      },
+    { id: 'bm_george',    group: '🇬🇧 Nam Anh',            name: 'George'     },
+    { id: 'bm_lewis',     group: '🇬🇧 Nam Anh',            name: 'Lewis'      },
+    // 🇯🇵 Japanese
+    { id: 'jf_alpha',     group: '🇯🇵 Nữ Nhật',           name: 'Alpha'      },
+    { id: 'jf_gongitsune',group: '🇯🇵 Nữ Nhật',           name: 'Gongitsune' },
+    { id: 'jf_nezuko',    group: '🇯🇵 Nữ Nhật',           name: 'Nezuko'     },
+    { id: 'jm_kumo',      group: '🇯🇵 Nam Nhật',           name: 'Kumo'       },
+    // 🇨🇳 Chinese
+    { id: 'zf_xiaobei',   group: '🇨🇳 Nữ Trung',          name: 'Xiaobei'    },
+    { id: 'zf_xiaoni',    group: '🇨🇳 Nữ Trung',          name: 'Xiaoni'     },
+    { id: 'zf_xiaoxiao',  group: '🇨🇳 Nữ Trung',          name: 'Xiaoxiao'   },
+    { id: 'zm_yunjian',   group: '🇨🇳 Nam Trung',          name: 'Yunjian'    },
+    // 🇰🇷 Korean
+    { id: 'kf_clara',     group: '🇰🇷 Nữ Hàn',            name: 'Clara'      },
+    { id: 'km_sunwoo',    group: '🇰🇷 Nam Hàn',            name: 'Sunwoo'     },
+    // 🇫🇷 French
+    { id: 'ff_siwis',     group: '🇫🇷 Nữ Pháp',           name: 'Siwis'      },
+    // 🇮🇳 Hindi
+    { id: 'hf_alpha',     group: '🇮🇳 Nữ Hindi',          name: 'Alpha'      },
+    { id: 'hm_omega',     group: '🇮🇳 Nam Hindi',          name: 'Omega'      },
+    // 🇮🇹 Italian
+    { id: 'if_sara',      group: '🇮🇹 Nữ Ý',              name: 'Sara'       },
+    // 🇧🇷 Portuguese
+    { id: 'pf_dora',      group: '🇧🇷 Nữ Bồ Đào Nha',    name: 'Dora'       },
+    { id: 'pm_alex',      group: '🇧🇷 Nam Bồ Đào Nha',    name: 'Alex'       },
+    { id: 'pm_santa',     group: '🇧🇷 Nam Bồ Đào Nha',    name: 'Santa'      },
+    // 🇪🇸 Spanish
+    { id: 'ef_dora',      group: '🇪🇸 Nữ Tây Ban Nha',   name: 'Dora'       },
+    { id: 'em_alex',      group: '🇪🇸 Nam Tây Ban Nha',   name: 'Alex'       },
+];
+
 // ArrayBuffer → base64 (browser-safe)
 function bufferToBase64(buffer) {
     const bytes = new Uint8Array(buffer);
@@ -500,6 +566,144 @@ export default function VoiceStudio({ dark = true }) {
             if (ovPollRef.current) { clearInterval(ovPollRef.current); ovPollRef.current = null; }
         };
     }, [subTab]);
+
+    // =========================================================================
+    // ===  KOKORO TTS STATE  ==================================================
+    // =========================================================================
+    const _kokoroLS = () => { try { return JSON.parse(localStorage.getItem(KOKORO_LS) || '{}'); } catch { return {}; } };
+    const kokoroPersist = (patch) => {
+        const cur = _kokoroLS();
+        localStorage.setItem(KOKORO_LS, JSON.stringify({ ...cur, ...patch }));
+    };
+
+    const [kokoroMode,        setKokoroMode]        = useState(() => _kokoroLS().mode    || 'api');
+    const [kokoroUrl,         setKokoroUrl]          = useState(() => _kokoroLS().url     || 'http://localhost:8880');
+    const [kokoroHfToken,     setKokoroHfToken]      = useState(() => _kokoroLS().hfToken || '');
+    const [kokoroHfFn,        setKokoroHfFn]         = useState(() => _kokoroLS().hfFn    || 'generate_first');
+    const [kokoroVoice,       setKokoroVoice]        = useState(() => _kokoroLS().voice   || 'af_heart');
+    const [kokoroSpeed,       setKokoroSpeed]        = useState(() => _kokoroLS().speed   ?? 1.0);
+    const [kokoroFormat,      setKokoroFormat]       = useState(() => _kokoroLS().format  || 'mp3');
+    const [kokoroText,        setKokoroText]         = useState('');
+    const [kokoroGenerating,  setKokoroGenerating]   = useState(false);
+    const [kokoroAudioUrl,    setKokoroAudioUrl]     = useState(null);
+    const [kokoroOutputDir,   setKokoroOutputDir]    = useState(() => _kokoroLS().outputDir || '');
+    const [kokoroHistory,     setKokoroHistory]      = useState(() => { try { return JSON.parse(localStorage.getItem(KOKORO_LS_HIST) || '[]'); } catch { return []; } });
+    const [kokoroPlayingId,   setKokoroPlayingId]    = useState(null);
+    const [kokoroVoiceFilter, setKokoroVoiceFilter]  = useState('');
+    const kokoroAudioRef = useRef(null);
+
+    // ── Kokoro generate ───────────────────────────────────────────────────────
+    const kokoroGenerate = async () => {
+        if (!kokoroText.trim()) return;
+        setKokoroGenerating(true);
+        if (kokoroAudioUrl) { URL.revokeObjectURL(kokoroAudioUrl); setKokoroAudioUrl(null); }
+
+        try {
+            let audioBlob;
+            const baseUrl = kokoroUrl.replace(/\/$/, '');
+
+            if (kokoroMode === 'hf') {
+                // ── HF Space Gradio v4 SSE API ────────────────────────────────
+                const hdrs = { 'Content-Type': 'application/json' };
+                if (kokoroHfToken) hdrs['Authorization'] = `Bearer ${kokoroHfToken}`;
+
+                const submitRes = await fetch(`${baseUrl}/call/${kokoroHfFn}`, {
+                    method: 'POST', headers: hdrs,
+                    body: JSON.stringify({ data: [kokoroText.trim(), kokoroVoice, kokoroSpeed] })
+                });
+                if (!submitRes.ok) throw new Error(`HF submit lỗi: ${submitRes.status} ${submitRes.statusText}`);
+                const { event_id } = await submitRes.json();
+                if (!event_id) throw new Error('Không nhận được event_id từ HF Space');
+
+                const sseRes = await fetch(`${baseUrl}/call/${kokoroHfFn}/${event_id}`,
+                    { headers: kokoroHfToken ? { 'Authorization': `Bearer ${kokoroHfToken}` } : {} }
+                );
+                if (!sseRes.ok) throw new Error(`HF stream lỗi: ${sseRes.status}`);
+
+                const reader = sseRes.body.getReader();
+                const decoder = new TextDecoder();
+                let audioFileUrl = null;
+                let buf = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buf += decoder.decode(value, { stream: true });
+                    const lines = buf.split('\n');
+                    buf = lines.pop() || '';
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const raw = line.slice(6).trim();
+                        if (!raw || raw === 'null') continue;
+                        try {
+                            const parsed = JSON.parse(raw);
+                            if (Array.isArray(parsed)) {
+                                const item = parsed[0];
+                                if (item?.url)  { audioFileUrl = item.url; }
+                                else if (item?.path) { audioFileUrl = `${baseUrl}/file=${item.path}`; }
+                            }
+                        } catch {}
+                        if (audioFileUrl) break;
+                    }
+                    if (audioFileUrl) { reader.cancel(); break; }
+                }
+                if (!audioFileUrl) throw new Error('Không lấy được URL audio từ HF Space');
+                const audioFetchRes = await fetch(audioFileUrl);
+                if (!audioFetchRes.ok) throw new Error(`Tải audio lỗi: ${audioFetchRes.status}`);
+                audioBlob = await audioFetchRes.blob();
+
+            } else {
+                // ── OpenAI-compatible API (kokoro-fastapi) ────────────────────
+                const res = await fetch(`${baseUrl}/v1/audio/speech`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: 'kokoro',
+                        input: kokoroText.trim(),
+                        voice: kokoroVoice,
+                        response_format: kokoroFormat,
+                        speed: kokoroSpeed,
+                    })
+                });
+                if (!res.ok) {
+                    let detail = `HTTP ${res.status}`;
+                    try { const j = await res.clone().json(); detail = j.detail || j.error?.message || j.error || detail; } catch {}
+                    throw new Error(detail);
+                }
+                audioBlob = await res.blob();
+            }
+
+            // ── Phát audio ───────────────────────────────────────────────────
+            const blobUrl = URL.createObjectURL(audioBlob);
+            setKokoroAudioUrl(blobUrl);
+            if (kokoroAudioRef.current) {
+                kokoroAudioRef.current.src = blobUrl;
+                kokoroAudioRef.current.play().catch(() => {});
+            }
+
+            // ── Lưu file nếu có thư mục ──────────────────────────────────────
+            const entry = { id: Date.now(), text: kokoroText.trim().slice(0, 100), voice: kokoroVoice, time: new Date().toLocaleTimeString() };
+            if (kokoroOutputDir) {
+                const ext  = kokoroMode === 'hf' ? 'wav' : kokoroFormat;
+                const fname = `kokoro_${Date.now()}.${ext}`;
+                const outputPath = `${kokoroOutputDir}\\${fname}`;
+                const b64 = bufferToBase64(await audioBlob.arrayBuffer());
+                const saveRes = await window.electronAPI.saveElevenLabsAudio({ base64: b64, outputPath });
+                if (saveRes?.success) { entry.path = outputPath; addVoiceLog(`💾 Đã lưu: ${outputPath}`, 'success'); }
+            }
+
+            const newHist = [entry, ...kokoroHistory].slice(0, 50);
+            setKokoroHistory(newHist);
+            localStorage.setItem(KOKORO_LS_HIST, JSON.stringify(newHist));
+            addVoiceLog(`✅ [Kokoro] ${kokoroVoice} · ${kokoroText.trim().length} ký tự`, 'success');
+
+        } catch (e) {
+            addVoiceLog(`❌ [Kokoro] Lỗi: ${e.message}`, 'error');
+            alert('Lỗi Kokoro TTS: ' + e.message);
+        } finally {
+            setKokoroGenerating(false);
+        }
+    };
 
     // =========================================================================
     // ===  EDGE TTS STATE  ====================================================
@@ -1145,6 +1349,9 @@ export default function VoiceStudio({ dark = true }) {
                 <button onClick={() => setSubTab('omnivoice')} className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm transition-all ${subTab === 'omnivoice' ? 'bg-rose-600 text-white shadow-md' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}>
                     <Volume2 size={16} /> Omni Voice
                     {ovConnected && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"/>}
+                </button>
+                <button onClick={() => setSubTab('kokoro')} className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm transition-all ${subTab === 'kokoro' ? 'bg-orange-600 text-white shadow-md' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}>
+                    🍊 Kokoro TTS
                 </button>
             </div>
 
@@ -2597,6 +2804,238 @@ export default function VoiceStudio({ dark = true }) {
             </div>/* end omnivoice tab */
             )}
             {/* END TAB: OMNI VOICE */}
+
+            {/* ════════════════════════════════════════════════════════════════ */}
+            {/* ══  TAB: KOKORO TTS  ══════════════════════════════════════════ */}
+            {/* ════════════════════════════════════════════════════════════════ */}
+            {subTab === 'kokoro' && (
+                <div className="flex flex-1 p-6 gap-6 overflow-hidden min-h-0">
+                    <audio ref={kokoroAudioRef} onEnded={() => setKokoroPlayingId(null)} />
+
+                    {/* ── CỘT TRÁI: Config + Text + Controls ─────────────────── */}
+                    <div className="flex-1 flex flex-col gap-3 min-h-0 min-w-0">
+
+                        {/* Header + Mode toggle */}
+                        <div className="bg-[#141c2f] border border-orange-500/20 rounded-xl px-4 py-2.5 flex items-center gap-3 shrink-0">
+                            <span className="text-2xl shrink-0">🍊</span>
+                            <div className="flex-1 min-w-0">
+                                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Kokoro TTS v1.0 · Miễn phí</span>
+                                <p className="text-[9px] text-slate-600 mt-0.5">82M params · {KOKORO_VOICES.length} giọng · 10 ngôn ngữ · Không cần API Key</p>
+                            </div>
+                            <div className="flex items-center bg-slate-800 rounded-lg p-0.5 gap-0.5 shrink-0">
+                                <button onClick={() => { setKokoroMode('api'); kokoroPersist({ mode: 'api' }); }}
+                                    className={`px-3 py-1 rounded-md text-[10px] font-bold transition-all ${kokoroMode === 'api' ? 'bg-orange-600 text-white' : 'text-slate-400 hover:text-white'}`}>
+                                    🖥️ Local API
+                                </button>
+                                <button onClick={() => { setKokoroMode('hf'); kokoroPersist({ mode: 'hf' }); }}
+                                    className={`px-3 py-1 rounded-md text-[10px] font-bold transition-all ${kokoroMode === 'hf' ? 'bg-violet-600 text-white' : 'text-slate-400 hover:text-white'}`}>
+                                    🤗 HF Space
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* API Config */}
+                        <div className="bg-[#141c2f] border border-slate-800 rounded-xl p-3 shrink-0 space-y-2">
+                            <div className="flex gap-2 items-end">
+                                <div className="flex-1 min-w-0">
+                                    <label className="text-[9px] font-bold text-slate-600 uppercase tracking-wider mb-1 block">
+                                        {kokoroMode === 'api' ? 'API URL (kokoro-fastapi)' : 'HF Space URL'}
+                                    </label>
+                                    <input value={kokoroUrl}
+                                        onChange={e => { setKokoroUrl(e.target.value); kokoroPersist({ url: e.target.value }); }}
+                                        placeholder={kokoroMode === 'api' ? 'http://localhost:8880' : 'https://hexgrad-kokoro-tts.hf.space'}
+                                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-orange-500 transition-colors font-mono"
+                                    />
+                                </div>
+                                {kokoroMode === 'api' && (
+                                    <div className="w-24 shrink-0">
+                                        <label className="text-[9px] font-bold text-slate-600 uppercase tracking-wider mb-1 block">Format</label>
+                                        <select value={kokoroFormat}
+                                            onChange={e => { setKokoroFormat(e.target.value); kokoroPersist({ format: e.target.value }); }}
+                                            className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-300 focus:outline-none">
+                                            <option value="mp3">mp3</option>
+                                            <option value="wav">wav</option>
+                                            <option value="flac">flac</option>
+                                            <option value="opus">opus</option>
+                                        </select>
+                                    </div>
+                                )}
+                                {kokoroMode === 'hf' && (
+                                    <div className="w-36 shrink-0">
+                                        <label className="text-[9px] font-bold text-slate-600 uppercase tracking-wider mb-1 block">Function name</label>
+                                        <input value={kokoroHfFn}
+                                            onChange={e => { setKokoroHfFn(e.target.value); kokoroPersist({ hfFn: e.target.value }); }}
+                                            placeholder="generate_first"
+                                            className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-400 focus:outline-none font-mono"
+                                        />
+                                    </div>
+                                )}
+                            </div>
+
+                            {kokoroMode === 'hf' && (
+                                <div>
+                                    <label className="text-[9px] font-bold text-slate-600 uppercase tracking-wider mb-1 block">HF Token <span className="normal-case text-slate-700">(không bắt buộc — tăng rate limit)</span></label>
+                                    <input type="password" value={kokoroHfToken}
+                                        onChange={e => { setKokoroHfToken(e.target.value); kokoroPersist({ hfToken: e.target.value }); }}
+                                        placeholder="hf_xxxxxxxxxxxxxxxx"
+                                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-400 focus:outline-none focus:border-violet-500 font-mono"
+                                    />
+                                </div>
+                            )}
+
+                            {/* Setup guide */}
+                            <div className="bg-slate-900/60 rounded-lg px-3 py-2 text-[9px] text-slate-600 leading-relaxed">
+                                {kokoroMode === 'api' ? (
+                                    <>💡 Chạy local (CPU): <code className="text-orange-400 font-mono">docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest</code>
+                                    <span className="mx-1.5 text-slate-700">·</span>GPU: <code className="text-orange-400 font-mono">kokoro-fastapi-gpu:latest</code></>
+                                ) : (
+                                    <>💡 Miễn phí, không cần key. Space mặc định: <code className="text-violet-400 font-mono">hexgrad/Kokoro-TTS</code>
+                                    <span className="mx-1.5 text-slate-700">·</span>Có thể chậm nếu queue đầy — thêm HF Token để ưu tiên hơn.</>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Text input */}
+                        <div className="flex-1 bg-[#141c2f] border border-slate-800 rounded-xl overflow-hidden flex flex-col min-h-0">
+                            <div className="px-4 py-2.5 border-b border-slate-800/50 flex items-center justify-between shrink-0">
+                                <label className="text-[11px] font-bold text-slate-300 uppercase tracking-widest flex items-center gap-2">
+                                    <Volume2 size={13} className="text-orange-400"/> Văn bản cần đọc
+                                </label>
+                                <span className="text-[10px] text-slate-500 font-mono">{kokoroText.length} ký tự</span>
+                            </div>
+                            <textarea value={kokoroText} onChange={e => setKokoroText(e.target.value)}
+                                placeholder="Nhập văn bản cần đọc...&#10;&#10;Hỗ trợ: English · 日本語 · 中文 · 한국어 · Français · हिंदी · Italiano · Português · Español"
+                                className="flex-1 w-full bg-transparent p-4 text-sm text-slate-200 focus:outline-none resize-none leading-relaxed custom-scrollbar"
+                            />
+                        </div>
+
+                        {/* Speed + Output dir */}
+                        <div className="bg-[#141c2f] border border-slate-800 rounded-xl p-3 shrink-0 space-y-2">
+                            <div className="flex gap-4 items-end">
+                                <div className="flex-1">
+                                    <div className="flex justify-between mb-1">
+                                        <label className="text-[9px] font-bold text-slate-600 uppercase tracking-wider">Tốc độ đọc</label>
+                                        <span className="text-[10px] font-bold text-orange-300">{Number(kokoroSpeed).toFixed(1)}×</span>
+                                    </div>
+                                    <input type="range" min="0.5" max="2.0" step="0.1" value={kokoroSpeed}
+                                        onChange={e => { setKokoroSpeed(+e.target.value); kokoroPersist({ speed: +e.target.value }); }}
+                                        className="w-full accent-orange-500"
+                                    />
+                                    <div className="flex justify-between text-[8px] text-slate-700 mt-0.5">
+                                        <span>0.5×</span><span>1.0×</span><span>2.0×</span>
+                                    </div>
+                                </div>
+                                <div className="flex-1">
+                                    <label className="text-[9px] font-bold text-slate-600 uppercase tracking-wider mb-1 block">Thư mục lưu file</label>
+                                    <div className="flex gap-1.5">
+                                        <input readOnly value={kokoroOutputDir} placeholder="Chọn thư mục..."
+                                            className="flex-1 min-w-0 bg-[#0f172a] border border-slate-700 rounded-lg px-2 py-1.5 text-[10px] text-slate-400 truncate focus:outline-none" />
+                                        <button onClick={async () => { const f = await window.electronAPI.selectFolder(); if (f) { setKokoroOutputDir(f); kokoroPersist({ outputDir: f }); } }}
+                                            className="bg-slate-700 hover:bg-slate-600 text-white px-2.5 py-1.5 rounded-lg transition-colors shrink-0" title="Chọn thư mục">
+                                            <FolderOpen size={13}/>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Audio player */}
+                            {kokoroAudioUrl && (
+                                <div className="bg-slate-900/60 border border-orange-500/10 rounded-lg px-3 py-2">
+                                    <audio src={kokoroAudioUrl} controls className="w-full h-8" style={{ filter: 'invert(0.8) sepia(0.4) hue-rotate(15deg)' }} />
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Generate button */}
+                        <button onClick={kokoroGenerate} disabled={kokoroGenerating || !kokoroText.trim()}
+                            className="w-full py-3.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all shadow-lg shrink-0
+                                bg-gradient-to-r from-orange-600 to-amber-500 hover:from-orange-500 hover:to-amber-400
+                                disabled:from-slate-700 disabled:to-slate-700 disabled:shadow-none text-white">
+                            {kokoroGenerating
+                                ? <><Loader2 size={16} className="animate-spin"/> ĐANG TẠO GIỌNG KOKORO...</>
+                                : <><Zap size={16}/> TẠO GIỌNG KOKORO</>
+                            }
+                        </button>
+                    </div>
+
+                    {/* ── CỘT PHẢI: Danh sách giọng + Lịch sử ───────────────── */}
+                    <div className="w-[320px] shrink-0 flex flex-col gap-4 min-h-0">
+
+                        {/* Voice list */}
+                        <div className="flex-1 bg-[#141c2f] border border-slate-800 rounded-xl flex flex-col overflow-hidden min-h-0">
+                            <div className="px-4 py-3 border-b border-slate-800 bg-[#1a233a] shrink-0 space-y-2">
+                                <div className="flex items-center justify-between">
+                                    <h3 className="text-sm font-bold text-white">{KOKORO_VOICES.length} Giọng Kokoro</h3>
+                                    <span className="text-[9px] bg-orange-500/10 text-orange-400 border border-orange-500/20 px-2 py-0.5 rounded-full font-bold font-mono">
+                                        {kokoroVoice}
+                                    </span>
+                                </div>
+                                <input value={kokoroVoiceFilter} onChange={e => setKokoroVoiceFilter(e.target.value)}
+                                    placeholder="Tìm giọng theo tên, ngôn ngữ..."
+                                    className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-orange-500 transition-colors"
+                                />
+                            </div>
+                            <div className="flex-1 overflow-y-auto custom-scrollbar p-2">
+                                {(() => {
+                                    const q = kokoroVoiceFilter.toLowerCase();
+                                    const filtered = KOKORO_VOICES.filter(v =>
+                                        !q || v.id.toLowerCase().includes(q) || v.name.toLowerCase().includes(q) || v.group.toLowerCase().includes(q)
+                                    );
+                                    const groups = {};
+                                    filtered.forEach(v => { if (!groups[v.group]) groups[v.group] = []; groups[v.group].push(v); });
+                                    return Object.entries(groups).map(([grp, voices]) => (
+                                        <div key={grp} className="mb-2">
+                                            <p className="text-[8px] font-bold text-slate-600 uppercase tracking-widest px-1 pt-1 pb-1">{grp}</p>
+                                            <div className="grid grid-cols-3 gap-1">
+                                                {voices.map(v => (
+                                                    <button key={v.id} onClick={() => { setKokoroVoice(v.id); kokoroPersist({ voice: v.id }); }}
+                                                        className={`py-1.5 px-2 rounded-lg text-[10px] font-bold transition-all border truncate text-left
+                                                            ${kokoroVoice === v.id
+                                                                ? 'bg-orange-600 border-orange-500 text-white'
+                                                                : 'border-slate-700/60 text-slate-400 hover:border-orange-500/40 hover:text-white'}`}>
+                                                        {v.name}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    ));
+                                })()}
+                            </div>
+                        </div>
+
+                        {/* History */}
+                        {kokoroHistory.length > 0 && (
+                            <div className="h-48 bg-[#141c2f] border border-slate-800 rounded-xl flex flex-col overflow-hidden shrink-0">
+                                <div className="px-4 py-2.5 border-b border-slate-800 bg-[#1a233a] flex items-center justify-between shrink-0">
+                                    <h3 className="text-xs font-bold text-white">Lịch sử ({kokoroHistory.length})</h3>
+                                    <button onClick={() => { setKokoroHistory([]); localStorage.removeItem(KOKORO_LS_HIST); }}
+                                        className="text-[10px] text-slate-600 hover:text-red-400 transition-colors">Xóa tất cả</button>
+                                </div>
+                                <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1.5">
+                                    {kokoroHistory.map((h, i) => (
+                                        <div key={h.id || i} className="bg-slate-900/40 border border-slate-800/60 rounded-xl p-2.5 flex items-start gap-2">
+                                            <div className="flex-1 min-w-0">
+                                                <p className="text-[10px] text-slate-300 truncate">{h.text}</p>
+                                                <div className="flex items-center gap-2 mt-0.5 text-[9px] text-slate-600">
+                                                    <span className="font-mono text-orange-400/70">{h.voice}</span>
+                                                    <span className="ml-auto shrink-0">{h.time}</span>
+                                                </div>
+                                            </div>
+                                            {h.path && (
+                                                <button onClick={() => window.electronAPI?.openFile?.(h.path)}
+                                                    title="Mở file" className="shrink-0 p-1 hover:bg-slate-700 rounded transition-colors">
+                                                    <Download size={10} className="text-slate-500 hover:text-orange-400"/>
+                                                </button>
+                                            )}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
+            {/* END TAB: KOKORO TTS */}
 
         </div>
     );

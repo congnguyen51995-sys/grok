@@ -18,6 +18,7 @@ const { PlaywrightEngine }    = require('./services/playwright-engine');
 const { openLoginWindow, checkLogin, syncToElectronSession, findChromePath } = require('./services/chrome-profile-manager');
 const { VeoEngine }           = require('./services/veo-engine');
 const { proxyManager, ProxyManager } = require('./services/proxy-manager');
+const { searchStockVideo, downloadStockClip } = require('./services/stock-video');
 
 // ==================== KHỞI TẠO LOCAL SERVER (EXPRESS) ====================
 const express = require('express');
@@ -231,6 +232,90 @@ expressApp.get('/api/system-status', (req, res) => {
     });
 });
 
+// ── /api/solve-recaptcha — Giải reCAPTCHA qua CapSolver + proxy hiện tại ──────
+// Extension gọi endpoint này trước khi dùng window.grecaptcha.enterprise.execute().
+// Nếu CapSolver key đã cấu hình VÀ proxy đang bật → solver dùng đúng proxy IP → token khớp IP API request.
+expressApp.post('/api/solve-recaptcha', async (req, res) => {
+    const { action } = req.body || {};
+    // 1. Đọc CapSolver key
+    let capsolverKey = null;
+    try { capsolverKey = await db.getSetting('capsolver_api_key', null); } catch {}
+    if (!capsolverKey) return res.json({ success: false, error: 'no_capsolver_key' });
+
+    // 2. Đọc config proxy xoay
+    let proxyCfg = null;
+    try { proxyCfg = JSON.parse(await db.getSetting('topProxyRot_v1', null) || 'null'); } catch {}
+
+    const LABS_KEY  = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
+    const LABS_URL  = 'https://labs.google/fx/';
+    const rcAction  = action || 'VIDEO_GENERATION';
+
+    // 3. Xây task CapSolver
+    const taskType = (proxyCfg && proxyCfg.enabled && proxyCfg.apiKey)
+        ? 'ReCaptchaV3EnterpriseTask'          // có proxy → solver dùng proxy IP
+        : 'ReCaptchaV3EnterpriseTaskProxyLess'; // không proxy → solver dùng IP riêng của CapSolver
+
+    const task = {
+        type:       taskType,
+        websiteURL: LABS_URL,
+        websiteKey: LABS_KEY,
+        pageAction: rcAction,
+    };
+
+    if (taskType === 'ReCaptchaV3EnterpriseTask' && proxyCfg) {
+        const gateway = (proxyCfg.gateway || '160.250.166.11:10059').trim();
+        const encoded = encodeURIComponent(proxyCfg.apiKey);
+        task.proxy = `http://${encoded}:${encoded}@${gateway}`;
+    }
+
+    // 4. Hàm POST JSON tới CapSolver (https)
+    const capPost = (path, body) => new Promise((resolve, reject) => {
+        const https = require('https');
+        const raw   = JSON.stringify(body);
+        const reqOpts = {
+            hostname: 'api.capsolver.com',
+            path,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(raw) },
+            timeout: 12000,
+        };
+        const r = https.request(reqOpts, (resp) => {
+            let d = '';
+            resp.on('data', c => d += c);
+            resp.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('parse: ' + d.slice(0,100))); } });
+        });
+        r.on('error', reject);
+        r.on('timeout', () => { r.destroy(); reject(new Error('timeout 12s')); });
+        r.write(raw);
+        r.end();
+    });
+
+    try {
+        // 5. Tạo task
+        const created = await capPost('/createTask', { clientKey: capsolverKey, task });
+        if (created.errorId) return res.json({ success: false, error: created.errorDescription || `errorId:${created.errorId}` });
+        const taskId = created.taskId;
+
+        // 6. Poll kết quả (tối đa 90s, mỗi 3s)
+        for (let i = 0; i < 30; i++) {
+            await new Promise(r => setTimeout(r, 3000));
+            const result = await capPost('/getTaskResult', { clientKey: capsolverKey, taskId });
+            if (result.status === 'ready') {
+                const token = result.solution?.gRecaptchaResponse;
+                if (token) return res.json({ success: true, token });
+                return res.json({ success: false, error: 'no token in solution' });
+            }
+            if (result.status === 'failed' || result.errorId) {
+                return res.json({ success: false, error: result.errorDescription || 'failed' });
+            }
+            // 'processing' → tiếp tục poll
+        }
+        return res.json({ success: false, error: 'timeout 90s' });
+    } catch (e) {
+        return res.json({ success: false, error: e.message });
+    }
+});
+
 expressApp.listen(3000, () => {
     console.log("-> AutoFlow Local Server dang chay o cong 3000..."); // Fix lỗi font
 });
@@ -272,9 +357,15 @@ async function initializeServices() {
     queueManager = new QueueManager({ db, playwrightEngine, concurrency: savedConcurrency });
     await queueManager.init();
 
-    // Load saved proxy list
+    // Load saved proxy list (static)
     const savedProxies = await db.getSetting('veoProxies_v1', null);
     if (savedProxies) proxyManager.load(savedProxies);
+
+    // Load TopProxy rotating config (overrides static list if enabled)
+    const savedTopProxy = await db.getSetting('topProxyRot_v1', null);
+    if (savedTopProxy) {
+        try { _syncTopProxyToManager(JSON.parse(savedTopProxy)); } catch {}
+    }
   } catch (error) { throw error; }
 }
 
@@ -469,6 +560,84 @@ function setupIpcHandlers() {
       return { success: false, error: e.message };
     }
   });
+
+  // ── WHISPER LOCAL TRANSCRIPTION (Node.js worker_thread, không block renderer) ─
+  (() => {
+    const { Worker: NodeWorker } = require('worker_threads');
+    const workerThreadPath = path.join(__dirname, 'workers/whisper-thread.js');
+
+    // Singleton worker — load model 1 lần, tái dùng cho tất cả chunks
+    let _whisperWorker = null;
+    let _pendingCbs    = new Map(); // id → { resolve, reject }
+
+    function getWhisperWorker(senderWebContents) {
+      if (_whisperWorker) return _whisperWorker;
+
+      const wasmDir   = path.join(__dirname, '../../dist/assets');
+      const cacheDir  = path.join(app.getPath('userData'), 'whisper-cache');
+      const ffmpegBin = require('ffmpeg-static');
+
+      _whisperWorker = new NodeWorker(workerThreadPath, {
+        workerData: { ffmpegPath: ffmpegBin, wasmDir, cacheDir },
+      });
+
+      _whisperWorker.on('message', (msg) => {
+        if (msg.type === 'model_progress' || msg.type === 'log') {
+          // Forward progress to renderer
+          if (!senderWebContents.isDestroyed()) {
+            senderWebContents.send('whisper:progress', msg);
+          }
+        } else if (msg.type === 'model_ready') {
+          if (!senderWebContents.isDestroyed()) {
+            senderWebContents.send('whisper:progress', { type: 'model_ready' });
+          }
+        } else if (msg.type === 'result' || msg.type === 'error') {
+          const cb = _pendingCbs.get(msg.id);
+          if (cb) {
+            _pendingCbs.delete(msg.id);
+            if (msg.type === 'result') cb.resolve(msg.result);
+            else cb.reject(new Error(msg.error));
+          }
+        }
+      });
+
+      _whisperWorker.on('error', (err) => {
+        console.error('[WhisperThread] Worker error:', err);
+        // Reject all pending
+        _pendingCbs.forEach(cb => cb.reject(err));
+        _pendingCbs.clear();
+        _whisperWorker = null; // allow recreation
+      });
+
+      _whisperWorker.on('exit', (code) => {
+        if (code !== 0) console.warn('[WhisperThread] Worker exited with code', code);
+        _whisperWorker = null;
+      });
+
+      return _whisperWorker;
+    }
+
+    ipcMain.handle('whisper:transcribe-chunk', async (event, { filePath, startSec, durationSec }) => {
+      const id = `${Date.now()}_${Math.random()}`;
+      return new Promise((resolve, reject) => {
+        _pendingCbs.set(id, { resolve, reject });
+        const worker = getWhisperWorker(event.sender);
+        worker.postMessage({ type: 'transcribe', id, filePath, startSec, durationSec });
+      })
+        .then(result  => ({ success: true,  result }))
+        .catch(err    => ({ success: false, error: err.message }));
+    });
+
+    ipcMain.handle('whisper:preload-model', async (event) => {
+      try {
+        const worker = getWhisperWorker(event.sender);
+        worker.postMessage({ type: 'preload' });
+        return { success: true };
+      } catch (e) {
+        return { success: false, error: e.message };
+      }
+    });
+  })();
 
   // ── LƯU AUDIO ELEVENLABS (base64 → MP3 file) ───────────────────────────
   ipcMain.handle('elevenlabs:save-audio', async (event, { base64, outputPath }) => {
@@ -1968,6 +2137,10 @@ ipcMain.handle('veo:extend-chain', async (event, jobData) => {
     } catch (error) { return { success: false, error: error.message }; }
 });
 
+// ── Stock Video (Pexels / Pixabay) ───────────────────────────────────────────
+ipcMain.handle('stock-video:search',   async (e, params) => searchStockVideo(params));
+ipcMain.handle('stock-video:download', async (e, params) => downloadStockClip(params));
+
 // ── Proxy xoay ────────────────────────────────────────────────────────────────
 ipcMain.handle('veo:proxy-get', async () => {
     return proxyManager.toJSON();
@@ -1990,6 +2163,178 @@ ipcMain.handle('veo:proxy-toggle', async (event, enabled) => {
 
 ipcMain.handle('veo:proxy-test', async (event, url) => {
     return await ProxyManager.testProxy(url, 10000);
+});
+
+// ── Helper: sync TopProxy rotating config → proxyManager ─────────────────────
+function _syncTopProxyToManager(config) {
+    if (config && config.enabled && config.apiKey) {
+        const gateway = (config.gateway || '160.250.166.11:10059').trim();
+        const type    = config.type === 'socks5' ? 'socks5' : 'http';
+        const encoded = encodeURIComponent(config.apiKey);
+        const proxyUrl = `${type}://${encoded}:${encoded}@${gateway}`;
+        proxyManager.setProxies([{ url: proxyUrl, label: config.provider || 'topproxy', enabled: true, failCount: 0 }]);
+        proxyManager.setEnabled(true);
+    } else if (!config || !config.enabled) {
+        // Only disable if no static list is active
+        const statics = proxyManager.proxies.filter(p => p.label && p.label !== 'topproxy' && p.label !== 'kiotproxy');
+        if (statics.length === 0) proxyManager.setEnabled(false);
+    }
+}
+
+// ── TopProxy / KiotProxy rotating proxy API ───────────────────────────────────
+ipcMain.handle('topproxy:get-config', async () => {
+    try { return JSON.parse(await db.getSetting('topProxyRot_v1', null) || '{}'); } catch { return {}; }
+});
+
+ipcMain.handle('topproxy:save-config', async (event, config) => {
+    if (!config || typeof config !== 'object') return { success: false, error: 'Config không hợp lệ' };
+    await db.setSetting('topProxyRot_v1', JSON.stringify(config));
+    _syncTopProxyToManager(config);
+    return { success: true };
+});
+
+ipcMain.handle('topproxy:toggle', async (event, enabled) => {
+    let config = {};
+    try { config = JSON.parse(await db.getSetting('topProxyRot_v1', null) || '{}'); } catch {}
+    config.enabled = !!enabled;
+    await db.setSetting('topProxyRot_v1', JSON.stringify(config));
+    _syncTopProxyToManager(config);
+    return { success: true };
+});
+
+ipcMain.handle('topproxy:check-ip', async () => {
+    let config = {};
+    try { config = JSON.parse(await db.getSetting('topProxyRot_v1', null) || '{}'); } catch {}
+    if (!config.enabled || !config.apiKey) return { success: false, error: 'Proxy chưa được bật' };
+
+    const gateway = (config.gateway || '160.250.166.11:10059').trim();
+    const [proxyHost, proxyPortStr] = gateway.split(':');
+    const proxyPort = parseInt(proxyPortStr) || 10059;
+    const authB64   = Buffer.from(`${config.apiKey}:${config.apiKey}`).toString('base64');
+    const http = require('http');
+    const net  = require('net');
+
+    // ── 1. Lấy IP qua HTTP proxy (luôn hoạt động với mọi HTTP proxy) ─────────
+    const ipResult = await new Promise(resolve => {
+        const req = http.request({
+            host:    proxyHost,
+            port:    proxyPort,
+            method:  'GET',
+            path:    'http://ip-api.com/json',
+            headers: {
+                Host:                  'ip-api.com',
+                'User-Agent':          'Mozilla/5.0',
+                'Proxy-Authorization': 'Basic ' + authB64,
+            },
+        }, (res) => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => {
+                try {
+                    const d = JSON.parse(data);
+                    if (d.status === 'fail') return resolve({ success: false, error: d.message || 'Proxy lỗi' });
+                    resolve({ success: true, ip: d.query, isp: d.isp || d.org, region: d.regionName, city: d.city, country: d.country });
+                } catch { resolve({ success: false, error: 'Parse lỗi: ' + data.slice(0, 80) }); }
+            });
+        });
+        req.on('error', e => resolve({ success: false, error: e.message }));
+        req.setTimeout(12000, () => { req.destroy(); resolve({ success: false, error: 'Timeout (12s)' }); });
+        req.end();
+    });
+
+    if (!ipResult.success) return ipResult;
+
+    // ── 2. Kiểm tra HTTPS CONNECT tunnel — cần thiết cho Veo API (googleapis) ──
+    // Gửi CONNECT tới aisandbox-pa.googleapis.com:443 qua gateway
+    const httpsOk = await new Promise(resolve => {
+        const TARGET = 'aisandbox-pa.googleapis.com';
+        const sock = net.connect(proxyPort, proxyHost);
+        const timer = setTimeout(() => { sock.destroy(); resolve(false); }, 8000);
+        sock.once('connect', () => {
+            sock.write(
+                `CONNECT ${TARGET}:443 HTTP/1.1\r\n` +
+                `Host: ${TARGET}:443\r\n` +
+                `Proxy-Authorization: Basic ${authB64}\r\n\r\n`
+            );
+            sock.once('data', chunk => {
+                clearTimeout(timer);
+                sock.destroy();
+                resolve(/HTTP\/1\.[01] 200/i.test(chunk.toString()));
+            });
+        });
+        sock.once('error', () => { clearTimeout(timer); resolve(false); });
+    });
+
+    return { ...ipResult, httpsConnect: httpsOk };
+});
+
+ipcMain.handle('topproxy:rotate', async () => {
+    let config = {};
+    try { config = JSON.parse(await db.getSetting('topProxyRot_v1', null) || '{}'); } catch {}
+    if (!config.apiKey) return { success: false, error: 'Chưa có API Key' };
+
+    const provider = config.provider || 'topproxy';
+    const apiKey   = config.apiKey;
+
+    // Priority: custom user-set URL → known provider URL → fallback via gateway
+    let urlsToTry = [];
+
+    if (config.rotateUrl && config.rotateUrl.trim()) {
+        // User provided exact URL — use only that
+        urlsToTry = [config.rotateUrl.trim().replace('{apikey}', apiKey).replace('{key}', apiKey)];
+    } else if (provider === 'topproxy') {
+        const gw = (config.gateway || '160.250.166.11:10059').trim();
+        urlsToTry = [
+            `https://topproxy.vn/api/v1/changeip?apikey=${apiKey}`,
+            `https://topproxy.vn/api/v1/xoayip?apikey=${apiKey}`,
+            `http://topproxy.vn/api/v1/changeip?apikey=${apiKey}`,
+            `http://${gw}/changeip?key=${apiKey}`,
+        ];
+    } else if (provider === 'kiotproxy') {
+        const gw = (config.gateway || '').trim();
+        urlsToTry = [
+            `https://kiotproxy.com/api/v1/rotate?apikey=${apiKey}`,
+            `https://kiotproxy.com/api/v1/changeip?apikey=${apiKey}`,
+            ...(gw ? [`http://${gw}/changeip?key=${apiKey}`] : []),
+        ];
+    }
+
+    // Try each URL in order, return first success (or last error)
+    const _tryUrl = (rawUrl) => new Promise(resolve => {
+        try {
+            let pUrl = rawUrl.trim();
+            if (!/^https?:\/\//i.test(pUrl)) pUrl = 'http://' + pUrl;
+            const urlObj = new URL(pUrl);
+            const lib = urlObj.protocol === 'https:' ? require('https') : require('http');
+            const req = lib.get({
+                hostname: urlObj.hostname,
+                port:     urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+                path:     urlObj.pathname + urlObj.search,
+                timeout:  8000,
+                headers:  { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json, text/plain, */*' },
+            }, (res) => {
+                let data = '';
+                res.on('data', c => data += c);
+                res.on('end', () => {
+                    try { resolve({ ok: true, statusCode: res.statusCode, data: JSON.parse(data), raw: data }); }
+                    catch { resolve({ ok: true, statusCode: res.statusCode, raw: data.slice(0, 300) }); }
+                });
+            });
+            req.on('error', e => resolve({ ok: false, error: e.message }));
+            req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'Timeout 8s' }); });
+        } catch (e) { resolve({ ok: false, error: e.message }); }
+    });
+
+    const errors = [];
+    for (const u of urlsToTry) {
+        const r = await _tryUrl(u);
+        if (r.ok && r.statusCode < 400) {
+            return { success: true, url: u, statusCode: r.statusCode, data: r.data || null, raw: r.raw || null };
+        }
+        errors.push(`${u} → ${r.error || 'HTTP ' + r.statusCode}`);
+    }
+
+    return { success: false, error: errors.join(' | '), tried: urlsToTry.length };
 });
 
 // ==================== VIDEO EDITOR ====================
@@ -2069,6 +2414,39 @@ ipcMain.handle('video:cut', async (event, { inputPath, segmentTime, outputFolder
                     sendVideoLog(`✅ Cắt xong: ${files.length} phần`, 'success');
                     resolve({ success: true, files });
                 } else resolve({ success: false, error: `FFmpeg lỗi (code ${code})` });
+            });
+            proc.on('error', err => resolve({ success: false, error: err.message }));
+        });
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+// ── Trim / Loop clip to exact duration ───────────────────────────────────────
+// Dùng cho Stock Video flow: trim nếu clip dài hơn target, loop nếu ngắn hơn
+ipcMain.handle('video:trim-loop', async (event, { inputPath, duration, outputPath }) => {
+    try {
+        const dir = path.dirname(outputPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const dur = Math.max(1, Math.round(Number(duration)));
+        // -stream_loop -1 loops the input indefinitely; -t cuts at target duration
+        // Works for both trim (clip > dur) and loop (clip < dur) scenarios
+        const args = [
+            '-y',
+            '-stream_loop', '-1',
+            '-i', inputPath,
+            '-t', String(dur),
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-c:a', 'aac',
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            outputPath,
+        ];
+        return new Promise((resolve) => {
+            const proc = spawn(ffmpegPath, args);
+            let errOut = '';
+            proc.stderr.on('data', d => { errOut += d.toString(); });
+            proc.on('close', code => {
+                if (code === 0) resolve({ success: true, filePath: outputPath });
+                else resolve({ success: false, error: `FFmpeg code ${code}: ${errOut.slice(-300)}` });
             });
             proc.on('error', err => resolve({ success: false, error: err.message }));
         });

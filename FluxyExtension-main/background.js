@@ -410,6 +410,32 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
 
 // LẤY MÃ RECAPTCHA
 async function fetchRecaptcha(action) {
+    // ── Ưu tiên 1: CapSolver + Proxy (IP token = IP API request) ──────────────
+    // Nếu tool đã cấu hình CapSolver API key → gọi backend giải captcha qua proxy hiện tại.
+    // Điều này đảm bảo token được tạo từ đúng IP proxy → Google không từ chối.
+    try {
+        const capRes = await fetch('http://127.0.0.1:3000/api/solve-recaptcha', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action }),
+            signal: AbortSignal.timeout(95000), // 90s poll + buffer
+        });
+        const capData = await capRes.json();
+        if (capData.success && capData.token) {
+            console.log(`✅ CapSolver reCaptcha OK (Action: ${action}, IP: proxy)`);
+            sendToServer({ recaptchaToken: capData.token, action });
+            return; // done — skip Extension fallback
+        }
+        // error 'no_capsolver_key' → chưa cấu hình CapSolver, xuống fallback
+        if (capData.error && capData.error !== 'no_capsolver_key') {
+            console.warn(`⚠️ CapSolver lỗi (${capData.error}) — dùng Extension fallback`);
+        }
+    } catch (e) {
+        // network error hoặc timeout → fallback
+        console.warn('CapSolver fetch lỗi:', e.message);
+    }
+
+    // ── Fallback: Extension dùng window.grecaptcha.enterprise (IP Chrome) ──────
     let [tab] = await chrome.tabs.query({ url: "*://labs.google/*" });
     if (!tab) return;
     try {
@@ -429,8 +455,8 @@ async function fetchRecaptcha(action) {
             args: [SITE_KEY, action]
         });
         if (result[0] && result[0].result) {
-            console.log(`✅ Lấy thành công reCaptcha (Action: ${action})`);
-            sendToServer({ recaptchaToken: result[0].result, action: action });
+            console.log(`✅ Lấy thành công reCaptcha qua Extension (Action: ${action})`);
+            sendToServer({ recaptchaToken: result[0].result, action });
         }
     } catch (e) {}
 }

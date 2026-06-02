@@ -4,7 +4,7 @@ import {
   ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Terminal, LogIn, Pencil,
   Square, CheckSquare, Loader2, AlertCircle, Clock, Film,
   Image as ImageIcon, Folder, FolderOpen, ExternalLink,
-  UploadCloud, Mic, ShieldCheck, Layers, Sparkles
+  UploadCloud, Mic, ShieldCheck, Layers, Sparkles, Settings as SettingsIcon
 } from 'lucide-react'
 import JobCard from './components/JobCard'
 import VoiceStudio from './components/VoiceStudio'
@@ -12,6 +12,7 @@ import VideoStudio from './components/VideoStudio'
 import VeoStudio from './components/VeoStudio'
 import CreatorStudio from './components/CreatorStudio'
 import AutoAnimation from './components/AutoAnimation'
+import Settings from './components/Settings'
 
 const MODES = [
   { value: 'TEXT_TO_IMAGE',  label: 'Text to Image',      short: 'T2I' },
@@ -732,6 +733,9 @@ export default function App({ onLicenseExpired }) {
             <button onClick={() => setCurrentTab('auto')} className={`px-4 py-1.5 rounded-md text-sm font-bold transition-colors flex items-center gap-2 ${currentTab === 'auto' ? 'bg-purple-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}>
             <Layers size={16} /> Auto Animation
             </button>
+            <button onClick={() => setCurrentTab('settings')} className={`px-4 py-1.5 rounded-md text-sm font-bold transition-colors flex items-center gap-2 ${currentTab === 'settings' ? 'bg-slate-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}>
+            <SettingsIcon size={16} /> Cài đặt
+            </button>
         </div>
 
         {/* --- KHỐI BẢN QUYỀN GLOBAL --- */}
@@ -787,6 +791,11 @@ export default function App({ onLicenseExpired }) {
         {/* ── AUTO ANIMATION (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'auto' ? 'flex' : 'none' }}>
           <AutoAnimation />
+        </div>
+
+        {/* ── SETTINGS (always mounted) ── */}
+        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'settings' ? 'flex' : 'none' }}>
+          <Settings dark={dark} />
         </div>
 
         {/* ── GROK STUDIO (always mounted) ── */}

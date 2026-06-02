@@ -28,17 +28,27 @@ contextBridge.exposeInMainWorld('electronAPI', {
   burnSubtitles:   (data) => ipcRenderer.invoke('video:burnSubtitles', data),
   replaceAudio:    (data) => ipcRenderer.invoke('video:replaceAudio', data),
   mixAudio:        (data) => ipcRenderer.invoke('video:mixAudio', data),
+  trimLoopVideo:   (data) => ipcRenderer.invoke('video:trim-loop', data),
+  // ── Stock Video (Pexels / Pixabay) ────────────────────────────────────────
+  stockVideoSearch:   (p) => ipcRenderer.invoke('stock-video:search', p),
+  stockVideoDownload: (p) => ipcRenderer.invoke('stock-video:download', p),
   // ── VEO STUDIO ─────────────────────────────────────────────────
   runVeo:         (data) => ipcRenderer.invoke('veo:run', data),
   extendVideo:    (data) => ipcRenderer.invoke('veo:extend', data),
   extendChain:    (data) => ipcRenderer.invoke('veo:extend-chain', data),
   onVeoLog:       (cb)   => ipcRenderer.on('veo-log', (_e, data) => cb(data)),
   checkVeoCookie: (cookie) => ipcRenderer.invoke('veo:check-cookie', cookie),
-  // ── Proxy xoay ─────────────────────────────────────────────────────────────
+  // ── Proxy xoay (static list) ──────────────────────────────────────────────
   veoProxyGet:    ()          => ipcRenderer.invoke('veo:proxy-get'),
   veoProxySet:    (data)      => ipcRenderer.invoke('veo:proxy-set', data),
   veoProxyToggle: (enabled)   => ipcRenderer.invoke('veo:proxy-toggle', enabled),
   veoProxyTest:   (url)       => ipcRenderer.invoke('veo:proxy-test', url),
+  // ── TopProxy / KiotProxy rotating ─────────────────────────────────────────
+  topProxyGetConfig:  ()       => ipcRenderer.invoke('topproxy:get-config'),
+  topProxySaveConfig: (cfg)    => ipcRenderer.invoke('topproxy:save-config', cfg),
+  topProxyToggle:     (v)      => ipcRenderer.invoke('topproxy:toggle', v),
+  topProxyCheckIp:    ()       => ipcRenderer.invoke('topproxy:check-ip'),
+  topProxyRotate:     ()       => ipcRenderer.invoke('topproxy:rotate'),
   // ── CÁC HÀM CŨ ────────────────────────────────────────────────────────────
   getJobs:    ()         => ipcRenderer.invoke('db:get-jobs'),
   createJob:  (jobData)  => ipcRenderer.invoke('db:create-job', jobData),
@@ -68,6 +78,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ── VIRAL VIDEO AI ────────────────────────────────────────────────────────
   viralCreateProxy:  (videoPath) => ipcRenderer.invoke('viral:create-proxy', videoPath),
   viralCutSegment:   (data)      => ipcRenderer.invoke('viral:cut-segment', data),
+  // ── WHISPER LOCAL (main process worker_thread) ──────────────────────────────
+  whisperTranscribeChunk: (data) => ipcRenderer.invoke('whisper:transcribe-chunk', data),
+  whisperPreloadModel:    ()     => ipcRenderer.invoke('whisper:preload-model'),
+  onWhisperProgress:      (cb)   => ipcRenderer.on('whisper:progress', (_e, d) => cb(d)),
   // ── AUDIO TO VIDEO ───────────────────────────────────────────────────────
   selectAudioFile: ()       => ipcRenderer.invoke('dialog:select-audio-file'),
   saveTextFile:    (data)   => ipcRenderer.invoke('dialog:save-text-file', data),

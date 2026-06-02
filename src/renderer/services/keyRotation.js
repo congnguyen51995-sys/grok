@@ -139,7 +139,7 @@ function classifyError(error) {
     raw.includes('quota_exceeded')        ||
     raw.includes('dailylimitexceeded');
 
-  // ── 503 / Server overloaded ──────────────────────────────────────────────
+  // ── 503 / Server overloaded / Timeout ───────────────────────────────────────
   const is503 =
     msg.includes('503')                    ||
     raw.includes('"code":503')             ||
@@ -152,6 +152,9 @@ function classifyError(error) {
     msg.includes('service unavailable')    ||
     msg.includes('backend error')          ||
     msg.includes('temporarily unavailable');
+  // NOTE: TRANSCRIBE_TIMEOUT không nằm ở đây — nếu classify là 503,
+  // với 1 key sẽ vòng lặp vô tận (rotate về key cũ, retries503 reset về 0).
+  // Để nó là "lỗi khác" → keyRotation ném ngay → retryOnError (max 2 lần) xử lý.
 
   // Xác định lý do để hiển thị thông báo rõ hơn
   let reason = 'rate_limit';

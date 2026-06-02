@@ -27,25 +27,54 @@ async function retryOnError(fn, maxAttempts = 3, baseDelayMs = 2000) {
 }
 
 // ─── 1. Transcribe 1 chunk audio via Gemini multimodal ───────────────────────
-// Prompt gọn tối đa để tiết kiệm input tokens (~60 tokens thay vì ~130 tokens cũ)
+// Timeout 90s/lần dùng config.httpOptions.timeout của SDK (@google/genai v1.x).
+// SDK dùng AbortController nội bộ → hủy HTTP connection thực sự.
+// Khác Promise.race (chỉ bỏ qua result chứ không cancel fetch) — đã thử và thất bại.
+const TRANSCRIBE_TIMEOUT_MS = 90_000; // 90 giây mỗi attempt
+
 export async function transcribeAudio(apiKeys, base64, mimeType, onSwitch) {
   return retryWithKeyRotation(async (key) => {
     const ai = new GoogleGenAI({ apiKey: key });
-    const response = await ai.models.generateContent({
-      model: TRANSCRIBE_MODEL,
-      contents: [{
-        role: 'user',
-        parts: [
-          { inlineData: { data: base64, mimeType } },
-          {
-            text: `Transcribe in original spoken language (no translation). Return ONLY JSON:
+
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: TRANSCRIBE_MODEL,
+        contents: [{
+          role: 'user',
+          parts: [
+            { inlineData: { data: base64, mimeType } },
+            {
+              text: `Transcribe in original spoken language (no translation). Return ONLY JSON:
 {"text":"full transcript","segments":[{"start":0.0,"end":3.5,"text":"sentence"},...]}`
-          }
-        ]
-      }],
-      // 90s audio → tối đa ~1200 tokens output; 2000 đủ dư, tránh lãng phí quota
-      config: { maxOutputTokens: 2000, thinkingConfig: { thinkingBudget: 0 } }
-    });
+            }
+          ]
+        }],
+        config: {
+          maxOutputTokens: 3000,
+          thinkingConfig: { thinkingBudget: 0 }, // tắt thinking → tiết kiệm token, nhanh hơn
+          // SDK-level timeout: hủy HTTP request sau 90s nếu Gemini không phản hồi
+          httpOptions: { timeout: TRANSCRIBE_TIMEOUT_MS }
+        }
+      });
+    } catch (e) {
+      // Chuẩn hóa mọi dạng timeout / abort → TRANSCRIBE_TIMEOUT
+      // để retryOnError (outer) xử lý retry thay vì keyRotation
+      const emsg = (e?.message || '').toLowerCase();
+      if (
+        e?.name === 'AbortError'                      ||
+        emsg.includes('timeout')                      ||
+        emsg.includes('timed out')                    ||
+        emsg.includes('aborted')                      ||
+        emsg.includes('abort')                        ||
+        e?.code === 'ECONNRESET'                      ||
+        e?.code === 'ETIMEDOUT'                       ||
+        e?.code === 'UND_ERR_CONNECT_TIMEOUT'
+      ) {
+        throw new Error(`TRANSCRIBE_TIMEOUT: Gemini không phản hồi sau ${TRANSCRIBE_TIMEOUT_MS / 1000}s (${e.message})`);
+      }
+      throw e;
+    }
 
     const raw = (response?.text || '').trim()
       .replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
@@ -64,18 +93,25 @@ export async function transcribeAudio(apiKeys, base64, mimeType, onSwitch) {
       segments.push({ start: 0, end: -1, text: fullText });
     }
     return { fullText, segments };
-  }, apiKeys, { onSwitch });
+  // maxCycles: 2 — tối đa 2 vòng key rotation.
+  // TRANSCRIBE_TIMEOUT là "lỗi khác" → keyRotation throw ngay, retryOnError xử lý retry.
+  }, apiKeys, { onSwitch, maxCycles: 2 });
 }
 
-// ─── 1b. Transcribe toàn bộ audio — chunk 90s, xử lý 2 chunk song song ────────
-// Tối ưu quota:
-//   • CHUNK_SECS 90s → giảm 33% số API call (77 → 52 với file 76 phút)
-//   • PARALLEL 2   → 2 chunk chạy đồng thời, dùng 2 key cùng lúc, nhanh 2×
-//   • Prompt gọn   → giảm ~50% input tokens mỗi call
-export async function transcribeAudioChunked(apiKeys, totalDuration, extractChunkFn, onProgress, onChunkDone) {
-  const CHUNK_SECS = 90;
-  const PARALLEL   = Math.min(2, (apiKeys || []).length || 1); // tối đa 2, không vượt số key
+// ─── 1b. Transcribe toàn bộ audio — chunk 90s, xử lý tuần tự (PARALLEL = 1) ──
+// PARALLEL = 1 để tránh double-hit cùng API key khi nhiều key từ cùng 1 project.
+// Nếu PARALLEL = 2, cả 2 chunk đều thử key[0] đồng thời → quota cạn 2× nhanh hơn.
+// onLog(msg) — live log từng bước nhỏ (extract xong, heartbeat, retry, kết quả từng chunk)
+export async function transcribeAudioChunked(apiKeys, totalDuration, extractChunkFn, onProgress, onChunkDone, onLog) {
+  const CHUNK_SECS  = 90;
+  const keys        = (apiKeys || []).map(k => (k || '').trim()).filter(Boolean);
   const totalChunks = Math.ceil(totalDuration / CHUNK_SECS);
+
+  // PARALLEL = số key có sẵn, tối đa 8.
+  // Mỗi chunk được giao 1 key riêng (xoay vòng theo idx) → không đụng nhau.
+  // 1 key → tuần tự; 6 key → 6 chunk song song cùng lúc → nhanh 6×.
+  const PARALLEL = Math.min(keys.length || 1, 8, totalChunks);
+
   const allSegments = [];
   let fullText = '';
 
@@ -88,7 +124,9 @@ export async function transcribeAudioChunked(apiKeys, totalDuration, extractChun
       const idx      = i + p;
       const startSec = idx * CHUNK_SECS;
       const durSec   = Math.min(CHUNK_SECS, totalDuration - startSec);
-      slots.push({ idx, startSec, durSec });
+      // Mỗi chunk bắt đầu từ key khác nhau — tránh nhiều chunk cùng dùng key[0]
+      const keyStart = keys.length > 1 ? idx % keys.length : 0;
+      slots.push({ idx, startSec, durSec, keyStart });
     }
 
     const rangeStr = slots.length > 1
@@ -100,50 +138,82 @@ export async function transcribeAudioChunked(apiKeys, totalDuration, extractChun
     const extracted = await Promise.all(
       slots.map(slot =>
         extractChunkFn(slot.startSec, slot.durSec)
-          .then(r  => ({ ...slot, ...r }))
+          .then(r => {
+            if (r?.success !== false) {
+              onLog?.(`  📤 Đoạn ${slot.idx + 1}/${totalChunks} (${Math.round(slot.durSec)}s) [key${slot.keyStart + 1}] → Gemini...`);
+            }
+            return { ...slot, ...r };
+          })
           .catch(e => ({ ...slot, success: false, error: e.message }))
       )
     );
 
-    // ── Transcribe song song (key rotation bên trong + outer retry cho lỗi tạm thời) ─
-    const transcribed = await Promise.all(
+    // ── Transcribe song song — mỗi chunk dùng key riêng ──────────────────────
+    // Dùng Map để giữ thứ tự khi gộp segment (chunk nhanh hơn có thể về trước)
+    const batchMap = new Map(); // idx → { offsetSegs, textChunk } | { err }
+
+    await Promise.all(
       extracted.map(ex => {
-        if (!ex.success) return Promise.resolve({ ...ex, ok: false });
-        // retryOnError: tối đa 3 lần (2 retry) — phòng Gemini trả rỗng / JSON lỗi
-        return retryOnError(() => transcribeAudio(apiKeys, ex.base64, ex.mimeType, null), 3, 2000)
-          .then(r  => ({ ...ex, ok: true, result: r }))
-          .catch(e => ({ ...ex, ok: false, err: e.message }));
+        if (!ex.success) {
+          const msg = `Lỗi extract: ${ex.error}`;
+          batchMap.set(ex.idx, { err: msg });
+          onChunkDone?.(ex.idx + 1, totalChunks, 0, msg);
+          return Promise.resolve();
+        }
+
+        // Xoay keys để chunk này bắt đầu từ key của nó, fallback sang key tiếp theo
+        const rotatedKeys = keys.length > 1
+          ? [...keys.slice(ex.keyStart), ...keys.slice(0, ex.keyStart)]
+          : keys;
+
+        // Heartbeat mỗi 15s — cho thấy đang chờ Gemini phản hồi
+        let elapsed = 0;
+        const heartbeat = setInterval(() => {
+          elapsed += 15;
+          onLog?.(`  ⏳ Đoạn ${ex.idx + 1}/${totalChunks}: Gemini đang xử lý... (${elapsed}s)`);
+        }, 15_000);
+
+        // retryOnError: 2 lần (1 retry) — tổng tối đa 2×90s rồi bỏ chunk
+        return retryOnError(
+          () => transcribeAudio(rotatedKeys, ex.base64, ex.mimeType, null),
+          2, 3000
+        )
+        .then(r => {
+          clearInterval(heartbeat);
+
+          // Tính offset segment về timeline gốc
+          const chunkEnd = ex.startSec + ex.durSec;
+          const offsetSegs = (r.segments || []).map(s => ({
+            start: parseFloat((Math.min(s.start, ex.durSec) + ex.startSec).toFixed(3)),
+            end:   s.end === -1 ? chunkEnd
+                                : parseFloat((Math.min(s.end, ex.durSec) + ex.startSec).toFixed(3)),
+            text:  s.text
+          })).filter(s => s.text && s.end > s.start);
+
+          batchMap.set(ex.idx, { offsetSegs, textChunk: r.fullText || '' });
+          onChunkDone?.(ex.idx + 1, totalChunks, offsetSegs.length);
+        })
+        .catch(e => {
+          clearInterval(heartbeat);
+          const errMsg = e.message.includes('TRANSCRIBE_TIMEOUT')
+            ? `Timeout — Gemini không phản hồi sau 90s, bỏ qua đoạn này`
+            : e.message;
+          batchMap.set(ex.idx, { err: errMsg });
+          onChunkDone?.(ex.idx + 1, totalChunks, 0, errMsg);
+        });
       })
     );
 
     // ── Gộp kết quả theo đúng thứ tự chunk ───────────────────────────────────
-    for (const t of transcribed) {
-      const { idx, startSec, durSec, success, error, ok, err, result } = t;
-      const chunkEndSec = startSec + durSec;
-
-      if (!success) {
-        onChunkDone?.(idx + 1, totalChunks, 0, `Lỗi extract: ${error}`);
-        continue;
-      }
-      if (!ok) {
-        onChunkDone?.(idx + 1, totalChunks, 0, `Lỗi transcribe: ${err}`);
-        continue;
-      }
-
-      const offsetSegs = (result.segments || []).map(s => ({
-        start: parseFloat((Math.min(s.start, durSec) + startSec).toFixed(3)),
-        end:   s.end === -1 ? chunkEndSec
-                            : parseFloat((Math.min(s.end, durSec) + startSec).toFixed(3)),
-        text:  s.text
-      })).filter(s => s.text && s.end > s.start);
-
-      allSegments.push(...offsetSegs);
-      if (result.fullText) fullText += (fullText ? ' ' : '') + result.fullText;
-      onChunkDone?.(idx + 1, totalChunks, offsetSegs.length);
+    for (const slot of slots) {
+      const res = batchMap.get(slot.idx);
+      if (!res || res.err) continue;
+      allSegments.push(...res.offsetSegs);
+      if (res.textChunk) fullText += (fullText ? ' ' : '') + res.textChunk;
     }
 
-    // Delay nhỏ giữa các batch song song (tránh RPM spike)
-    if (i + PARALLEL < totalChunks) await sleep(400);
+    // Delay nhỏ giữa các batch để tránh RPM spike
+    if (i + PARALLEL < totalChunks) await sleep(500);
   }
 
   return { fullText, segments: allSegments };
@@ -213,8 +283,111 @@ export function createTimeBasedChunks(segments, totalAudioSeconds, chunkDuration
   return chunks;
 }
 
+// ─── 2b. Chia audio thành chunks tự nhiên theo câu nói (5–15s mỗi chunk) ──────
+// Dùng cho Stock Video mode: không ép mỗi cảnh bằng nhau,
+// thay vào đó cắt tại ranh giới câu / khoảng lặng, giữ trong 5–15s.
+export function createNaturalChunks(segments, totalAudioSeconds, minDur = 5, maxDur = 15) {
+  const norm = (t) => t.replace(/[.,!?'"]/g, '').trim().toLowerCase();
+
+  const buildChunk = (sceneNum, start, end, segs) => {
+    const rawTexts = segs.map(s => s.text);
+    const deduped  = rawTexts.filter((t, i) => i === 0 || norm(t) !== norm(rawTexts[i - 1]));
+    const joined   = deduped.length > 0
+      ? cleanDialogueText(deduped.join(' '))
+      : '[Không có lời thoại - Âm thanh môi trường]';
+    return {
+      scene:     sceneNum,
+      time:      `${start.toFixed(1)}s - ${end.toFixed(1)}s`,
+      timeStart: start,
+      timeEnd:   end,
+      exactText: joined,
+    };
+  };
+
+  // Không có segments → chia cố định 8s
+  if (!segments?.length) {
+    const count = Math.ceil(totalAudioSeconds / 8);
+    return Array.from({ length: count }, (_, i) => {
+      const s = i * 8, e = Math.min((i + 1) * 8, totalAudioSeconds);
+      return buildChunk(i + 1, s, e, []);
+    });
+  }
+
+  const chunks = [];
+  let sceneNum  = 1;
+  let gStart    = 0;
+  let gSegs     = [];
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg     = segments[i];
+    const nextSeg = segments[i + 1];
+    gSegs.push(seg);
+
+    const dur        = seg.end - gStart;
+    const pause      = nextSeg ? (nextSeg.start - seg.end) : 999;
+    const isSentEnd  = /[.!?।]$/.test(seg.text.trim());
+    const isLast     = i === segments.length - 1;
+    const goodBreak  = dur >= minDur && (isSentEnd || pause > 0.8 || isLast);
+    const forceBreak = dur >= maxDur;
+
+    if (goodBreak || forceBreak) {
+      const endTime = isLast ? Math.max(seg.end, totalAudioSeconds) : seg.end;
+      chunks.push(buildChunk(sceneNum++, gStart, endTime, [...gSegs]));
+      gStart = nextSeg?.start ?? endTime;
+      gSegs  = [];
+    }
+  }
+
+  // Phần im lặng còn lại sau đoạn nói cuối
+  if (gStart < totalAudioSeconds) {
+    if (gSegs.length > 0) {
+      chunks.push(buildChunk(sceneNum, gStart, totalAudioSeconds, gSegs));
+    } else if (chunks.length > 0) {
+      const last = chunks[chunks.length - 1];
+      last.timeEnd = totalAudioSeconds;
+      last.time    = `${last.timeStart.toFixed(1)}s - ${totalAudioSeconds.toFixed(1)}s`;
+    } else {
+      chunks.push(buildChunk(1, gStart, totalAudioSeconds, []));
+    }
+  }
+
+  return chunks;
+}
+
+// ─── Lấy mẫu transcript thông minh để phân tích context toàn video ───────────
+// Với video dài (1-2h), transcript có thể 100k+ chars. Thay vì chỉ đọc 8000 chars đầu
+// (chỉ phản ánh ~10 phút đầu), lấy mẫu phân bổ đều: intro + middle samples + outro.
+function sampleTranscriptForContext(fullText, maxChars = 10000) {
+  if (!fullText) return '';
+  if (fullText.length <= maxChars) return fullText;
+
+  const INTRO  = 2500; // mở đầu — thường giới thiệu chủ đề
+  const OUTRO  = 1200; // kết thúc — kết luận, call-to-action
+  const MIDDLE = maxChars - INTRO - OUTRO - 200; // ~6100 chars cho phần giữa
+
+  const intro  = fullText.slice(0, INTRO);
+  const outro  = fullText.slice(-OUTRO);
+  const body   = fullText.slice(INTRO, fullText.length - OUTRO);
+
+  // 6 mẫu phân bổ đều từ phần giữa (~1000 chars mỗi mẫu)
+  const N = 6;
+  const sampleLen = Math.floor(MIDDLE / N);
+  const step = Math.floor(body.length / N);
+  let mid = '';
+  for (let i = 0; i < N; i++) {
+    const pos = i * step;
+    mid += body.slice(pos, pos + sampleLen);
+    if (i < N - 1) mid += '\n[...]\n';
+  }
+
+  return `${intro}\n[...]\n${mid}\n[...]\n${outro}`;
+}
+
 // ─── 3. Phân tích tổng quát toàn bộ transcript ───────────────────────────────
 export async function analyzeOverallContent(apiKeys, fullTranscript, onSwitch) {
+  // Lấy mẫu thông minh — bao phủ toàn bộ video thay vì chỉ đọc phần đầu
+  const sampled = sampleTranscriptForContext(fullTranscript, 10000);
+
   return retryWithKeyRotation(async (key) => {
     const ai = new GoogleGenAI({ apiKey: key });
     const response = await ai.models.generateContent({
@@ -223,9 +396,9 @@ export async function analyzeOverallContent(apiKeys, fullTranscript, onSwitch) {
         role: 'user',
         parts: [{
           text: `Analyze this audio/video transcript to build a comprehensive content profile for video prompt generation.
-
+${fullTranscript.length > 10000 ? `(Note: This is a sampled excerpt from a long video — intro, 6 evenly-spaced middle samples, and outro)\n` : ''}
 TRANSCRIPT:
-${fullTranscript.slice(0, 8000)}
+${sampled}
 
 Return ONLY valid JSON (no markdown):
 {
@@ -421,53 +594,66 @@ No markdown, no extra text, no explanation outside the JSON array.`;
   }, apiKeys, { onSwitch });
 }
 
-// ─── 5b. Xử lý toàn bộ chunks — batch 5 scene/call, fallback đơn lẻ ──────────
+// ─── 5b. Xử lý toàn bộ chunks — dynamic batch + parallel 2, fallback đơn lẻ ──
+// Batch size tự động theo độ dài video:
+//   ≤ 100 scenes  → batch 5  (an toàn, JSON nhỏ, ít lỗi)
+//   101–300       → batch 10 (2× nhanh hơn)
+//   > 300         → batch 20 (4× nhanh hơn, dùng cho video 1-2h)
+// Parallel: chạy 2 batch cùng lúc → giảm thêm ~2× thời gian tổng
 export async function analyzeScenes(apiKeys, chunks, targetDuration, overallContext, onSceneProgress, onSceneReady) {
-  const results   = [];
-  const BATCH     = 5;      // 5 scene/call → giảm 5× số request → key lâu hết hơn
-  const DELAY_MS  = 1200;   // delay giữa các batch (nhỏ hơn trước vì ít call hơn)
+  const n = chunks.length;
+  const BATCH     = n > 300 ? 20 : n > 100 ? 10 : 5;
+  const PARALLEL  = 2;    // 2 batch song song — tận dụng nhiều API key
+  const DELAY_MS  = 600;  // delay giữa các cặp batch (ngắn hơn vì batch đã lớn hơn)
 
-  for (let i = 0; i < chunks.length; i += BATCH) {
-    const batchChunks = chunks.slice(i, i + BATCH);
-    onSceneProgress?.(i + 1, chunks.length);
+  // Chia toàn bộ chunks thành các batch group
+  const batchGroups = [];
+  for (let i = 0; i < n; i += BATCH) {
+    batchGroups.push({ startIdx: i, chunks: chunks.slice(i, i + BATCH) });
+  }
+
+  // Mảng results giữ nguyên thứ tự — index theo scene
+  const results = new Array(n);
+
+  // Hàm xử lý 1 batch group, trả về mảng sceneData[] theo thứ tự
+  const processBatchGroup = async (group) => {
+    const { startIdx, chunks: batchChunks } = group;
+    onSceneProgress?.(startIdx + 1, n);
 
     let batchPrompts = null;
     try {
-      // retryOnError: 2 lần (1 retry) — phòng Gemini trả JSON lỗi / mảng sai số
       batchPrompts = await retryOnError(
         () => generateVeoPromptBatch(
           apiKeys, batchChunks, targetDuration, overallContext,
-          ({ fromIdx, toIdx }) => onSceneProgress?.(i + 1, chunks.length, `Key ${fromIdx + 1}→${toIdx + 1}`)
+          ({ fromIdx, toIdx }) => onSceneProgress?.(startIdx + 1, n, `Key ${fromIdx + 1}→${toIdx + 1}`)
         ),
         2, 3000
       );
     } catch (batchErr) {
-      // Batch thất bại sau retry → fallback từng scene đơn lẻ trong batch này
       console.warn('[analyzeScenes] Batch lỗi sau retry, fallback đơn lẻ:', batchErr.message);
     }
 
     for (let j = 0; j < batchChunks.length; j++) {
-      const chunk     = batchChunks[j];
-      const sceneIdx  = i + j;
-      onSceneProgress?.(sceneIdx + 1, chunks.length);
+      const chunk    = batchChunks[j];
+      const absIdx   = startIdx + j;
+      onSceneProgress?.(absIdx + 1, n);
 
       if (batchPrompts && batchPrompts[j]) {
-        // Thành công từ batch
         const sceneData = {
           sceneNumber:    chunk.scene,
           timeEstimation: chunk.time,
           dialogue:       chunk.exactText,
-          veoVideoPrompt: batchPrompts[j]
+          veoVideoPrompt: batchPrompts[j],
         };
-        results.push(sceneData);
+        results[absIdx] = sceneData;
         onSceneReady?.(sceneData, false);
       } else {
-        // Fallback: gọi đơn lẻ — tự động retry tối đa 3 lần trước khi dùng hardcoded fallback
+        // Fallback: gọi đơn lẻ
         try {
           const veoPrompt = await retryOnError(
             () => generateVeoPrompt(
               apiKeys, chunk, targetDuration, overallContext,
-              ({ fromIdx, toIdx }) => onSceneProgress?.(sceneIdx + 1, chunks.length, `Key ${fromIdx + 1}→${toIdx + 1}`)
+              ({ fromIdx, toIdx }) => onSceneProgress?.(absIdx + 1, n, `Key ${fromIdx + 1}→${toIdx + 1}`)
             ),
             3, 2500
           );
@@ -475,9 +661,9 @@ export async function analyzeScenes(apiKeys, chunks, targetDuration, overallCont
             sceneNumber:    chunk.scene,
             timeEstimation: chunk.time,
             dialogue:       chunk.exactText,
-            veoVideoPrompt: veoPrompt
+            veoVideoPrompt: veoPrompt,
           };
-          results.push(sceneData);
+          results[absIdx] = sceneData;
           onSceneReady?.(sceneData, false);
         } catch (e) {
           const fallback = {
@@ -485,19 +671,95 @@ export async function analyzeScenes(apiKeys, chunks, targetDuration, overallCont
             timeEstimation: chunk.time,
             dialogue:       chunk.exactText,
             veoVideoPrompt: 'Cinematic establishing shot, smooth camera movement, aspect ratio 16:9, cinematic shot',
-            error:          e.message
+            error:          e.message,
           };
-          results.push(fallback);
+          results[absIdx] = fallback;
           onSceneReady?.(fallback, true);
         }
       }
     }
+  };
 
-    // Delay giữa các batch (không delay sau batch cuối)
-    if (i + BATCH < chunks.length) await sleep(DELAY_MS);
+  // Chạy PARALLEL batch cùng lúc, từng nhóm PARALLEL batch
+  for (let i = 0; i < batchGroups.length; i += PARALLEL) {
+    const wave = batchGroups.slice(i, i + PARALLEL);
+    await Promise.all(wave.map(g => processBatchGroup(g)));
+    if (i + PARALLEL < batchGroups.length) await sleep(DELAY_MS);
   }
 
-  return results;
+  // Lọc bỏ slot undefined (nếu có lỗi extract nào đó)
+  return results.filter(Boolean);
+}
+
+// ─── 6. Trích xuất keyword tìm kiếm stock video ──────────────────────────────
+// Input: mảng chunks (có .exactText), overallContext
+// Output: mảng keyword string (English, 2-3 từ, searchable trên Pexels/Pixabay)
+// Batch 30 cảnh/call → 300 cảnh chỉ cần 10 API call (~10 giây)
+export async function extractStockKeywords(apiKeys, chunks, overallContext, onProgress) {
+  const BATCH = 30;
+  const results = new Array(chunks.length);
+
+  // Fallback keyword khi extract thất bại
+  const ctxThemes = (overallContext?.visual_themes || []).filter(Boolean);
+  const fallbackKw = (idx) => ctxThemes[idx % ctxThemes.length] || overallContext?.topic?.split(' ').slice(0, 3).join(' ') || 'nature landscape';
+
+  const contextHint = overallContext
+    ? `Topic: ${overallContext.topic || ''}. Visual themes: ${(overallContext.visual_themes || []).join(', ')}.`
+    : '';
+
+  for (let i = 0; i < chunks.length; i += BATCH) {
+    const batch = chunks.slice(i, i + BATCH);
+
+    try {
+      await retryWithKeyRotation(async (key) => {
+        const ai = new GoogleGenAI({ apiKey: key });
+        const items = batch
+          .map((c, j) => `${i + j + 1}. "${(c.exactText || '').slice(0, 150)}"`)
+          .join('\n');
+
+        const response = await ai.models.generateContent({
+          model: LLM_MODEL,
+          contents: [{
+            role: 'user',
+            parts: [{
+              text: `${contextHint ? `Context: ${contextHint}\n` : ''}You are helping find stock footage. For each scene, extract 2-3 English search keywords suitable for Pexels/Pixabay video search. Keywords must be concrete, visual, and searchable (e.g. "busy city street", "mountain sunrise", "scientist laboratory"). Avoid abstract words.
+
+Scenes:
+${items}
+
+Return ONLY a JSON array of exactly ${batch.length} keyword strings:
+["keyword", "keyword", ...]`
+            }]
+          }],
+          config: { maxOutputTokens: batch.length * 20, thinkingConfig: { thinkingBudget: 0 } }
+        });
+
+        const raw = (response?.text || '').trim()
+          .replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+        const arr = JSON.parse(raw.match(/\[[\s\S]*\]/)[0]);
+        if (!Array.isArray(arr)) throw new Error('Không nhận được JSON array');
+
+        for (let j = 0; j < batch.length; j++) {
+          results[i + j] = (arr[j] || '').trim() || fallbackKw(i + j);
+        }
+      }, apiKeys, {});
+    } catch (e) {
+      // Fallback đơn giản từ transcript text
+      for (let j = 0; j < batch.length; j++) {
+        if (!results[i + j]) {
+          const words = (batch[j]?.exactText || '')
+            .replace(/[^a-zA-Z\s]/g, ' ').split(/\s+/)
+            .filter(w => w.length > 4).slice(0, 3).join(' ');
+          results[i + j] = words || fallbackKw(i + j);
+        }
+      }
+    }
+
+    onProgress?.(Math.min(i + BATCH, chunks.length), chunks.length);
+    if (i + BATCH < chunks.length) await sleep(400);
+  }
+
+  return results.map((kw, i) => kw || fallbackKw(i));
 }
 
 // ─── 5. Export helpers ────────────────────────────────────────────────────────

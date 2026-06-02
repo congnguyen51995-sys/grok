@@ -64,27 +64,20 @@ class VeoEngine {
         const bodyStr = body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null;
         if (bodyStr) headers['content-length'] = Buffer.byteLength(bodyStr).toString();
 
-        // Dùng Node.js https thuần — tránh net::ERR_FAILED từ Electron/Chromium net stack
-        // Inject proxy agent nếu proxy xoay đang bật
-        const activeProxy = proxyManager.getNext();
+        // API calls luôn dùng kết nối trực tiếp — proxy chỉ dùng cho CAPTCHA (CapSolver)
+        // Proxy không trả về response HTTPS đúng cách → gây treo vô hạn
         return new Promise((resolve, reject) => {
             const parsedUrl = new URL(url);
-            const reqOptions = {
+            const req = https.request({
                 hostname: parsedUrl.hostname,
-                path: parsedUrl.pathname + parsedUrl.search,
+                path:     parsedUrl.pathname + parsedUrl.search,
                 method,
                 headers,
-            };
-            if (activeProxy) {
-                try { reqOptions.agent = new HttpsProxyAgent(activeProxy); }
-                catch {}
-            }
-            const req = https.request(reqOptions, (res) => {
+            }, (res) => {
                 let data = '';
                 res.on('data', chunk => { data += chunk; });
                 res.on('end', () => {
                     if (res.statusCode >= 200 && res.statusCode < 300) {
-                        if (activeProxy) proxyManager.markSuccess(activeProxy);
                         try { resolve(JSON.parse(data)); } catch { resolve(data); }
                     } else {
                         if (res.statusCode === 403 && data.includes('reCAPTCHA')) {
@@ -92,14 +85,11 @@ class VeoEngine {
                             e.isRecaptchaExpired = true;
                             return reject(e);
                         }
-                        reject(new Error(`API Error ${res.statusCode}: ${data.substring(0, 100)}`));
+                        reject(new Error(`API Error ${res.statusCode}: ${data.substring(0, 200)}`));
                     }
                 });
             });
-            req.on('error', (e) => {
-                if (activeProxy) proxyManager.markFailed(activeProxy);
-                reject(new Error(`Node.js fetch error: ${e.message}`));
-            });
+            req.on('error', reject);
             if (bodyStr) req.write(bodyStr);
             req.end();
         });
@@ -120,14 +110,19 @@ class VeoEngine {
                     global.googleLabsAuth.recaptchaAction = action;
                     global.googleLabsAuth.recaptchaToken = null;
                     global.googleLabsAuth.needRecaptcha = true;
+                    // Timeout 90s: đủ cho CapSolver (thường 10–30s) + Extension fallback
                     let wait = 0;
-                    while (!global.googleLabsAuth.recaptchaToken && wait < 15) {
+                    while (!global.googleLabsAuth.recaptchaToken && wait < 90) {
                         await new Promise(r => setTimeout(r, 1000));
                         wait++;
+                        // Log tiến trình mỗi 10s để user biết đang chờ CapSolver
+                        if (wait === 10 && sendLog) sendLog(`[JOBID:${jobId}] ⏳ Đang chờ mã ReCaptcha (${wait}s)...`, 'info');
+                        if (wait === 30 && sendLog) sendLog(`[JOBID:${jobId}] ⏳ Đang chờ mã ReCaptcha (${wait}s) — CapSolver đang giải...`, 'info');
+                        if (wait === 60 && sendLog) sendLog(`[JOBID:${jobId}] ⏳ Đang chờ mã ReCaptcha (${wait}s) — CapSolver chậm hơn bình thường...`, 'info');
                     }
                     const token = global.googleLabsAuth.recaptchaToken;
                     if (!token) {
-                        const err = new Error("Lấy mã ReCaptcha thất bại. Hãy F5 trang Google Labs.");
+                        const err = new Error("Lấy mã ReCaptcha thất bại sau 90s. Kiểm tra CapSolver key hoặc F5 Google Labs.");
                         reject(err);
                         throw err;
                     }
@@ -255,6 +250,7 @@ class VeoEngine {
 
     static generateIngredientsPayload(prompt, aspectRatio, model, projectId, recaptchaToken, ingredientMediaIds, voiceId = null, duration = '8s') {
         const sessionId = `;${Date.now()}`;
+        const finalPrompt = this.applyOmniPrompt(prompt, model);
         // Veo Ingredients API giới hạn tối đa 6 reference images — cap phòng thủ
         const MAX_REF = 6;
         const safeIds = (ingredientMediaIds || []).slice(0, MAX_REF);
@@ -262,7 +258,7 @@ class VeoEngine {
             "aspectRatio": this.mapAspectRatioForVideo(aspectRatio),
             "textInput": {
                 "structuredPrompt": {
-                    "parts": [{ "text": prompt }]
+                    "parts": [{ "text": finalPrompt }]
                 }
             },
             "videoModelKey": this.mapVideoModelKeyR2V(model, duration),
@@ -337,16 +333,25 @@ class VeoEngine {
         return `veo_3_1_t2v_${tier}_${dur}s_${prio}`;
     }
 
+    static OMNI_ANTI_REPEAT = `\n\n[SPEECH INSTRUCTION: Read every word of the dialogue exactly as written, once and only once. Never repeat, stutter, loop, or duplicate any word, syllable, or phrase under any circumstances.]`;
+
+    static applyOmniPrompt(prompt, model) {
+        if (model !== 'Omni Flash') return prompt;
+        if (prompt.includes('SPEECH:') || prompt.includes('SPEECH INSTRUCTION')) return prompt;
+        return prompt + this.OMNI_ANTI_REPEAT;
+    }
+
     static generateVideoPayload(prompt, aspectRatio, model, duration, projectId, recaptchaToken, startImageId, endImageId, quality = '720p') {
         const sessionId = `;${Date.now()}`;
         const isI2V = !!startImageId;
         const hasEndImage = !!endImageId;
+        const finalPrompt = this.applyOmniPrompt(prompt, model);
         const request = {
             "aspectRatio": this.mapAspectRatioForVideo(aspectRatio),
             "seed": Math.floor(Math.random() * 99999),
             "textInput": {
                 "structuredPrompt": {
-                    "parts": [{ "text": prompt }]
+                    "parts": [{ "text": finalPrompt }]
                 }
             },
             "videoModelKey": this.mapVideoModelKey(model, duration, isI2V, hasEndImage, quality),
@@ -1134,31 +1139,22 @@ class VeoEngine {
         const tRPCUrl = `https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=${mediaName}`;
         const headers = VeoEngine.buildFullAuthHeaders();
 
-        // Dùng Node.js https.request — không follow redirect, đọc Location header trực tiếp
-        const activeProxy = proxyManager.getNext();
+        // Luôn dùng kết nối trực tiếp — tRPC URL resolve không cần qua proxy
         const { location: locationHeader, status, body: bodyText } = await new Promise((resolve, reject) => {
             const parsedUrl = new URL(tRPCUrl);
-            const reqOptions = {
+            const req = https.request({
                 hostname: parsedUrl.hostname,
                 path: parsedUrl.pathname + parsedUrl.search,
                 method: 'GET',
                 headers,
-            };
-            if (activeProxy) {
-                try { reqOptions.agent = new HttpsProxyAgent(activeProxy); } catch {}
-            }
-            const req = https.request(reqOptions, (res) => {
+            }, (res) => {
                 let data = '';
                 res.on('data', chunk => { data += chunk; });
                 res.on('end', () => {
-                    if (activeProxy) proxyManager.markSuccess(activeProxy);
                     resolve({ location: res.headers['location'] || null, status: res.statusCode, body: data });
                 });
             });
-            req.on('error', (e) => {
-                if (activeProxy) proxyManager.markFailed(activeProxy);
-                reject(new Error(`https.request failed: ${e.message}`));
-            });
+            req.on('error', (e) => reject(new Error(`https.request failed: ${e.message}`)));
             req.end();
         });
 
@@ -1244,33 +1240,24 @@ class VeoEngine {
             }
         }
 
-        // Dùng Node.js https.request — tránh net::ERR_FAILED từ Electron net stack
-        const dlProxy = proxyManager.getNext();
+        // Download luôn dùng kết nối trực tiếp — proxy chỉ cần cho API tạo nội dung
+        // File đã tạo xong, tải về bằng Bearer token là đủ, không cần IP khớp proxy
         const { statusCode, contentType, resStream } = await new Promise((resolve, reject) => {
             const followRedirect = (reqUrl, depth = 0) => {
                 if (depth > 5) return reject(new Error('Quá nhiều redirect'));
                 const parsedUrl = new URL(reqUrl);
-                const reqHeaders = options.headers || {};
-                const reqOptions = {
+                const req = https.request({
                     hostname: parsedUrl.hostname,
                     path: parsedUrl.pathname + parsedUrl.search,
                     method: 'GET',
-                    headers: reqHeaders,
-                };
-                if (dlProxy) {
-                    try { reqOptions.agent = new HttpsProxyAgent(dlProxy); } catch {}
-                }
-                const req = https.request(reqOptions, (res) => {
+                    headers: options.headers || {},
+                }, (res) => {
                     if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) && res.headers['location']) {
                         return followRedirect(res.headers['location'], depth + 1);
                     }
-                    if (dlProxy) proxyManager.markSuccess(dlProxy);
                     resolve({ statusCode: res.statusCode, contentType: res.headers['content-type'] || '', resStream: res });
                 });
-                req.on('error', (e) => {
-                    if (dlProxy) proxyManager.markFailed(dlProxy);
-                    reject(e);
-                });
+                req.on('error', reject);
                 req.end();
             };
             followRedirect(url);

@@ -1903,7 +1903,13 @@ function AudioToVideoPanel() {
   // Stock video mode
   const [stockMode,     setStockMode]     = useState(() => _s.stockMode     || false);
   const [stockProvider, setStockProvider] = useState(() => _s.stockProvider || 'pexels');
-  const [stockApiKey,   setStockApiKey]   = useState('');
+  // Keys riêng cho từng provider — luôn load cả 2
+  const [pexelsKey,   setPexelsKey]   = useState('');
+  const [pixabayKey,  setPixabayKey]  = useState('');
+  // stockApiKey là derived: string khi 1 provider, object khi 'both'
+  const stockApiKey = stockProvider === 'both'
+    ? { pexels: pexelsKey, pixabay: pixabayKey }
+    : stockProvider === 'pexels' ? pexelsKey : pixabayKey;
   // 'gemini' | 'whisper' | 'manual'
   const [stockTranscribeMode, setStockTranscribeMode] = useState(() => _s.stockTranscribeMode || 'gemini');
   const [stockManualKw, setStockManualKw] = useState(() => _s.stockManualKw || '');
@@ -1930,10 +1936,11 @@ function AudioToVideoPanel() {
   useEffect(() => { saveAtvSettings({ stockProvider });   }, [stockProvider]);
   useEffect(() => { saveAtvSettings({ stockTranscribeMode }); }, [stockTranscribeMode]);
   useEffect(() => { saveAtvSettings({ stockManualKw });       }, [stockManualKw]);
+  // Load cả 2 keys khi mount (không phụ thuộc vào stockProvider)
   useEffect(() => {
-    const k = stockProvider === 'pexels' ? 'pexels_api_key' : 'pixabay_api_key';
-    window.electronAPI?.getSetting?.(k, '').then(v => setStockApiKey(v || ''));
-  }, [stockProvider]);
+    window.electronAPI?.getSetting?.('pexels_api_key',  '').then(v => setPexelsKey(v  || ''));
+    window.electronAPI?.getSetting?.('pixabay_api_key', '').then(v => setPixabayKey(v || ''));
+  }, []);
 
   // Pipeline
   const [running,    setRunning]   = useState(false);
@@ -2053,7 +2060,12 @@ function AudioToVideoPanel() {
     // Không cần Gemini key khi: manual skip hoặc Whisper cục bộ (stock mode)
     if (!apiKeys.length && !_stockNoGemini && !_useLocalWhisper) { setError('Chưa có API Key Gemini. Vào Creator → nhập key.'); return; }
     if (_makeVideo && !_vidDir) { setError('Vui lòng chọn thư mục lưu video.'); return; }
-    if (_makeVideo && _stockMode && !_stockApiKey) { setError(`Chưa có API key ${_stockProvider}. Vào Settings → Stock Video.`); return; }
+    if (_makeVideo && _stockMode) {
+      const hasKey = _stockProvider === 'both'
+        ? (pexelsKey || pixabayKey)
+        : !!_stockApiKey;
+      if (!hasKey) { setError(`Chưa có API key ${_stockProvider === 'both' ? 'Pexels hoặc Pixabay' : _stockProvider}. Vào Settings → Stock Video.`); return; }
+    }
 
     setRunning(true); setError('');
     setDone([]); setActive(null); setErrStep(null);
@@ -2339,8 +2351,18 @@ function AudioToVideoPanel() {
                 addLog(`  → fallback keyword: "${usedKw}"`, 'info');
               }
 
+              // Lọc chỉ lấy video LANDSCAPE (width > height) — loại bỏ 9:16 portrait
+              const landscapeOnly = results.filter(v =>
+                v.width && v.height ? v.width > v.height : true // nếu thiếu dimensions thì giữ lại
+              );
+              // Nếu không có clip landscape nào thì fallback toàn bộ (tránh kết quả rỗng)
+              const filtered = landscapeOnly.length > 0 ? landscapeOnly : results;
+              if (landscapeOnly.length < results.length) {
+                addLog(`  → Đã lọc ${results.length - landscapeOnly.length} clip portrait, còn ${landscapeOnly.length} landscape`, 'info');
+              }
+
               // Sort: ưu tiên clip >= targetDur, rồi dài nhất
-              const sorted = [...results].sort((a, b) => {
+              const sorted = [...filtered].sort((a, b) => {
                 const aOk = a.duration >= targetDur ? 0 : 1;
                 const bOk = b.duration >= targetDur ? 0 : 1;
                 if (aOk !== bOk) return aOk - bOk;
@@ -3030,21 +3052,41 @@ function AudioToVideoPanel() {
                   <div className="space-y-2">
                     <div>
                       <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1.5 block">Nguồn stock</label>
-                      <div className="flex gap-1.5">
-                        {['pexels', 'pixabay'].map(p => (
-                          <button key={p} disabled={running} onClick={() => setStockProvider(p)}
-                            className={cn('flex-1 py-1.5 rounded-lg text-[10px] font-bold border capitalize transition-all',
-                              stockProvider === p ? 'bg-emerald-700/80 border-emerald-600 text-white' : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
-                            {p}
+                      <div className="flex gap-1">
+                        {[
+                          { v: 'pexels',  l: 'Pexels'  },
+                          { v: 'pixabay', l: 'Pixabay' },
+                          { v: 'both',    l: '⚡ Cả 2'  },
+                        ].map(({ v, l }) => (
+                          <button key={v} disabled={running} onClick={() => setStockProvider(v)}
+                            className={cn('flex-1 py-1.5 rounded-lg text-[10px] font-bold border transition-all',
+                              stockProvider === v
+                                ? v === 'both' ? 'bg-purple-700/80 border-purple-600 text-white' : 'bg-emerald-700/80 border-emerald-600 text-white'
+                                : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
+                            {l}
                           </button>
                         ))}
                       </div>
+                      {stockProvider === 'both' && (
+                        <p className="text-[8px] text-purple-400/70 mt-1">Tìm song song cả 2, xen kẽ kết quả tốt nhất</p>
+                      )}
                     </div>
-                    <div className={cn('rounded-lg px-2.5 py-2 text-[10px] leading-snug',
-                      stockApiKey ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-300' : 'bg-amber-500/10 border border-amber-500/20 text-amber-400')}>
-                      {stockApiKey
-                        ? `✓ ${stockProvider} key: ${stockApiKey.slice(0, 8)}...`
-                        : `⚠ Chưa cấu hình — vào Settings → Stock Video`}
+                    {/* Trạng thái API keys */}
+                    <div className="space-y-1">
+                      {[
+                        { id: 'pexels',  label: 'Pexels',  key: pexelsKey  },
+                        { id: 'pixabay', label: 'Pixabay', key: pixabayKey },
+                      ].map(({ id, label, key }) => {
+                        const active = stockProvider === 'both' || stockProvider === id;
+                        if (!active) return null;
+                        return (
+                          <div key={id} className={cn('rounded-lg px-2.5 py-1.5 text-[10px] leading-snug flex items-center gap-1.5',
+                            key ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-300' : 'bg-amber-500/10 border border-amber-500/20 text-amber-400')}>
+                            <span className="font-bold shrink-0">{label}:</span>
+                            <span className="truncate">{key ? `✓ ${key.slice(0, 10)}...` : '⚠ Chưa cấu hình (Settings → Stock Video)'}</span>
+                          </div>
+                        );
+                      })}
                     </div>
                     <p className="text-[8px] text-slate-600">
                       {sceneDur === -1 ? 'Smart: tách theo câu, clip 5–15s tự nhiên' : `Mỗi cảnh ${sceneDur}s → tự tìm + cắt/lặp clip`}

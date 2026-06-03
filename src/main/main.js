@@ -2427,7 +2427,9 @@ ipcMain.handle('video:trim-loop', async (event, { inputPath, duration, outputPat
     try {
         const dir = path.dirname(outputPath);
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        const dur = Math.max(1, Math.round(Number(duration)));
+        // Dùng float chính xác (toFixed 3) — KHÔNG Math.round để tránh drift tích lũy 400+ chunk
+        const dur = Math.max(0.5, Number(duration));
+        const durStr = dur.toFixed(3); // VD: "10.337" thay vì "10"
 
         // Nếu có target resolution → scale+pad để chuẩn hóa (tất cả clip cùng kích thước → concat copy nhanh)
         // Dùng letterbox pad để giữ tỷ lệ gốc, điền đen nếu cần
@@ -2441,7 +2443,7 @@ ipcMain.handle('video:trim-loop', async (event, { inputPath, duration, outputPat
             '-y',
             '-stream_loop', '-1',
             '-i', inputPath,
-            '-t', String(dur),
+            '-t', durStr,
             '-vf', vf,
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
             '-c:a', 'aac', '-ar', '44100', '-b:a', '128k', '-ac', '2',
@@ -2531,77 +2533,127 @@ ipcMain.handle('video:burnSubtitles', async (event, { videoPath, srtContent, out
     }
 });
 
-// ── THAY THẾ AUDIO VIDEO (tắt tiếng video + ghép audio gốc vào) ─────────────
-// ── GHÉP TẤT CẢ CLIP STOCK + CHÈN AUDIO GỐC (1 bước duy nhất, cực nhanh) ────
-// Yêu cầu: tất cả clips đã được chuẩn hóa cùng resolution/fps bởi video:trim-loop
-// Flow: concat demuxer (-c copy, không re-encode) → mux audio gốc
+// ── GHÉP TẤT CẢ CLIP STOCK + CHÈN AUDIO GỐC, ĐẢM BẢO DURATION KHỚP ──────────
+// Flow: probe audio duration → concat clips (-c copy) → sync duration → mux audio
+// Đảm bảo video output = audio duration chính xác (không thừa, không thiếu)
 ipcMain.handle('video:concat-audio', async (event, { clips, audioPath, outputFolder, outputName }) => {
     const outDir   = outputFolder || path.dirname(clips[0] || '.');
     const tmpDir   = path.join(outDir, '_concat_tmp');
     const listFile = path.join(tmpDir, 'concat.txt');
     const vidOnly  = path.join(tmpDir, 'video_only.mp4');
+    const vidSynced = path.join(tmpDir, 'video_synced.mp4');
     const finalOut = path.join(outDir, (outputName || `final_${Date.now()}`) + '.mp4');
+
+    // Helper: probe duration bằng ffprobe
+    const probeDuration = (filePath) => new Promise((resolve) => {
+        const proc = spawn(ffprobePath, [
+            '-v', 'quiet', '-show_entries', 'format=duration',
+            '-of', 'csv=p=0', filePath
+        ]);
+        let out = '';
+        proc.stdout.on('data', d => out += d);
+        proc.on('close', () => resolve(parseFloat(out.trim()) || 0));
+        proc.on('error', () => resolve(0));
+    });
 
     try {
         if (!clips || clips.length === 0) return { success: false, error: 'Không có clip nào' };
         if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
-        sendVideoLog(`[FFmpeg] Bắt đầu ghép ${clips.length} clip stock...`);
+        // ── Bước 0: Probe audio duration (chuẩn đích) ─────────────────────
+        const audioDur = await probeDuration(audioPath);
+        sendVideoLog(`[FFmpeg] Audio gốc: ${audioDur.toFixed(3)}s — ghép ${clips.length} clip...`);
 
-        // ── Bước 1: Ghi concat list ───────────────────────────────────────
+        // ── Bước 1: Ghi concat list ────────────────────────────────────────
         const lines = clips.map(f => `file '${f.replace(/\\/g, '/').replace(/'/g, "\\'")}'`).join('\n');
         fs.writeFileSync(listFile, lines, 'utf8');
 
-        // ── Bước 2: Concat demuxer (-c copy, không re-encode) ─────────────
-        // Vì tất cả clip đã được chuẩn hóa cùng codec/res/fps bởi trim-loop,
-        // -c copy hoạt động hoàn hảo và cực nhanh (không mất chất lượng, không tốn CPU)
-        sendVideoLog(`[FFmpeg] Concat ${clips.length} clip → video_only.mp4 (copy mode)...`);
+        // ── Bước 2: Concat demuxer (-c copy, không re-encode) ──────────────
+        sendVideoLog(`[FFmpeg] Concat ${clips.length} clip (copy mode)...`);
         const concatResult = await runFFmpeg([
-            '-y',
-            '-f', 'concat', '-safe', '0',
+            '-y', '-f', 'concat', '-safe', '0',
             '-i', listFile,
             '-c', 'copy',
             vidOnly,
         ]);
-
         if (!concatResult.ok) {
             sendVideoLog(`❌ Concat lỗi: ${concatResult.stderr.slice(-300)}`, 'error');
             return { success: false, error: `Concat thất bại: ${concatResult.stderr.slice(-400)}` };
         }
-        sendVideoLog(`✅ Concat xong!`);
 
-        // ── Bước 3: Mux audio gốc vào video ──────────────────────────────
-        // -c:v copy → giữ nguyên video (không re-encode lần nữa)
-        // -c:a aac  → encode audio gốc (mp3/wav/aac...) → aac
-        // -shortest → cắt theo track ngắn hơn (video vs audio)
-        sendVideoLog(`[FFmpeg] Chèn audio gốc → ${path.basename(finalOut)}...`);
-        const muxResult = await runFFmpeg([
+        const videoDur = await probeDuration(vidOnly);
+        const diff = videoDur - audioDur;
+        sendVideoLog(`[FFmpeg] Video concat: ${videoDur.toFixed(3)}s | Audio: ${audioDur.toFixed(3)}s | Diff: ${diff > 0 ? '+' : ''}${diff.toFixed(3)}s`);
+
+        // ── Bước 3: Đồng bộ duration video → audio ────────────────────────
+        let syncedVidPath = vidOnly;
+
+        if (audioDur > 0 && Math.abs(diff) > 0.1) { // chỉ xử lý nếu lệch > 0.1s
+            if (diff > 0.1) {
+                // Video DÀI hơn audio → trim video về đúng audio duration
+                sendVideoLog(`[FFmpeg] Video dài hơn ${diff.toFixed(2)}s → trim về ${audioDur.toFixed(3)}s...`);
+                const trimRes = await runFFmpeg([
+                    '-y', '-i', vidOnly,
+                    '-t', audioDur.toFixed(3),
+                    '-c', 'copy',
+                    vidSynced,
+                ]);
+                if (trimRes.ok) syncedVidPath = vidSynced;
+                else sendVideoLog(`⚠️ Trim duration lỗi — dùng video gốc`);
+
+            } else if (diff < -0.1) {
+                // Video NGẮN hơn audio → loop clip cuối để kéo dài
+                const shortage = (-diff).toFixed(3);
+                sendVideoLog(`[FFmpeg] Video ngắn hơn ${(-diff).toFixed(2)}s → loop clip cuối để bù...`);
+                // Thêm duration tổng vào concat list cuối cùng bằng cách loop vidOnly
+                const extendRes = await runFFmpeg([
+                    '-y',
+                    '-stream_loop', '-1',   // loop file vô hạn
+                    '-i', vidOnly,
+                    '-t', audioDur.toFixed(3), // cắt đúng audio duration
+                    '-c', 'copy',
+                    vidSynced,
+                ]);
+                if (extendRes.ok) syncedVidPath = vidSynced;
+                else sendVideoLog(`⚠️ Extend duration lỗi — dùng video gốc`);
+            }
+        } else {
+            sendVideoLog(`✅ Duration khớp (lệch < 0.1s), không cần sync`);
+        }
+
+        // ── Bước 4: Mux audio gốc vào video đã sync ──────────────────────
+        // -c:v copy    → không re-encode video
+        // -c:a aac     → encode audio gốc → aac
+        // -t audioDur  → đảm bảo output = đúng audio duration (phòng trường hợp còn lệch nhỏ)
+        sendVideoLog(`[FFmpeg] Mux audio gốc → ${path.basename(finalOut)}...`);
+        const muxArgs = [
             '-y',
-            '-i', vidOnly,
+            '-i', syncedVidPath,
             '-i', audioPath,
             '-c:v', 'copy',
             '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
             '-map', '0:v:0',
             '-map', '1:a:0',
-            '-shortest',
-            '-movflags', '+faststart',
-            finalOut,
-        ]);
+        ];
+        if (audioDur > 0) muxArgs.push('-t', audioDur.toFixed(3)); // hard cap theo audio
+        muxArgs.push('-movflags', '+faststart', finalOut);
 
+        const muxResult = await runFFmpeg(muxArgs);
         if (!muxResult.ok) {
             sendVideoLog(`❌ Mux audio lỗi: ${muxResult.stderr.slice(-300)}`, 'error');
             return { success: false, error: `Mux audio thất bại: ${muxResult.stderr.slice(-400)}` };
         }
 
+        // Verify output duration
+        const outDur = await probeDuration(finalOut);
         const sizeMB = (fs.statSync(finalOut).size / 1024 / 1024).toFixed(1);
-        sendVideoLog(`✅ Hoàn tất! ${path.basename(finalOut)} (${sizeMB} MB)`, 'success');
-        return { success: true, path: finalOut };
+        sendVideoLog(`✅ Hoàn tất! ${path.basename(finalOut)} — ${outDur.toFixed(2)}s / ${audioDur.toFixed(2)}s (${sizeMB} MB)`, 'success');
+        return { success: true, path: finalOut, videoDur: outDur, audioDur };
     } catch (e) {
         sendVideoLog(`❌ concat-audio lỗi: ${e.message}`, 'error');
         return { success: false, error: e.message };
     } finally {
-        // Dọn dẹp thư mục tạm
         try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
     }
 });

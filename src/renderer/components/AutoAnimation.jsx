@@ -2327,10 +2327,11 @@ function AudioToVideoPanel() {
           if (stopRef.current) throw new Error('Đã dừng.');
 
           const keyword   = stockKeywords[i];
+          // Dùng float chính xác — KHÔNG Math.round → tránh drift tích lũy trên 400+ chunk
           const targetDur = _autoChunk
-            ? Math.max(1, Math.round(timeChunks[i].timeEnd - timeChunks[i].timeStart))
+            ? Math.max(0.5, timeChunks[i].timeEnd - timeChunks[i].timeStart)
             : _sceneDur;
-          addLog(`[Stock] ${i + 1}/${timeChunks.length}: "${keyword}" (${targetDur}s)...`, 'info');
+          addLog(`[Stock] ${i + 1}/${timeChunks.length}: "${keyword}" (${targetDur.toFixed(2)}s)...`, 'info');
 
           try {
             // Search với fallback tự động

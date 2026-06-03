@@ -447,6 +447,16 @@ ${contextBlock}
 ━━━ 🚫 VEO CONTENT POLICY — MANDATORY, ZERO EXCEPTIONS ━━━
 Google Veo will REJECT prompts containing: graphic violence, blood, gore, weapons used violently, murder, torture, execution; adult/sexual content, nudity; hate speech, racism; drug use/manufacture; terrorism, bombs; disturbing or traumatic imagery.
 
+⛔ PROMINENT PEOPLE RULE — ABSOLUTE BAN (causes PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED):
+NEVER use the real name of ANY real person in a prompt — no celebrities, politicians, athletes, musicians, actors, business leaders, historical figures, or any named real human being.
+ALWAYS replace with a generic role description:
+• Speaker/narrator name (e.g. "John Smith says...") → "a speaker", "the presenter", "a narrator"
+• Celebrity name (e.g. "Elon Musk", "Taylor Swift", "Cristiano Ronaldo") → "a tech entrepreneur", "a famous singer", "a world-class athlete"
+• Politician (e.g. "Obama", "Trump", "Biden") → "a world leader", "a government official"
+• Historical figure (e.g. "Einstein", "Gandhi", "Newton") → "a scientist", "a visionary leader"
+• Any "Firstname Lastname" pattern of a real person → replace with their occupation/role
+RULE: If the audio mentions a real person by name, describe ONLY their ROLE and ACTION, never their name.
+
 CRITICAL RULE — REFRAME SENSITIVE AUDIO INTO SAFE VISUALS:
 When the dialogue/narration contains sensitive, violent, or figurative language, you MUST reinterpret it as a safe, cinematic visual metaphor. Do NOT literally visualize the words — translate the EMOTION and NARRATIVE INTENT instead.
 
@@ -555,6 +565,14 @@ For each scene provided, write ONE complete Veo_Video_Prompt for a ${targetDurat
 
 ━━━ 🚫 VEO CONTENT POLICY — MANDATORY, ZERO EXCEPTIONS ━━━
 Google Veo will REJECT prompts containing: graphic violence, blood, gore, weapons used violently, murder, torture, execution; adult/sexual content, nudity; hate speech, racism; drug use; terrorism, bombs; disturbing imagery.
+
+⛔ PROMINENT PEOPLE RULE — ABSOLUTE BAN (causes PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED):
+NEVER write the real name of ANY real person. Replace with their role/occupation:
+• Any celebrity, politician, athlete, musician, actor, business leader, historical figure → use role only
+• Examples: "Elon Musk" → "a tech entrepreneur" | "Obama" → "a world leader" | "Taylor Swift" → "a famous singer" | "Ronaldo" → "a world-class athlete" | "Einstein" → "a scientist" | "Sơn Tùng" → "a popular singer"
+• Speaker/narrator names in audio → "a presenter", "a speaker", "the narrator"
+• ANY "Firstname Lastname" of a real person → replace with occupation/role description
+This rule applies even if the audio explicitly names the person — describe their ROLE, never their NAME.
 
 CRITICAL RULE — REFRAME SENSITIVE AUDIO INTO SAFE VISUALS:
 When dialogue/narration contains sensitive or figurative language, translate the EMOTION and NARRATIVE INTENT into a safe visual — do NOT literally visualize violent/sensitive words.

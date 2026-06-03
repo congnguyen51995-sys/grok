@@ -168,7 +168,7 @@ const VOICE_POOL_FEMALE  = VOICE_POOL.filter(v => v.gender === 'female');
 const VOICE_POOL_NEUTRAL = VOICE_POOL.filter(v => v.gender === 'neutral');
 
 // ── Policy violation helpers ─────────────────────────────────────────────────
-const POLICY_REGEX = /safety|policy|violat|content.?filter|inappropriat|harmful|prohibited|blocked|community.?guideline|terms.of.service|unable.to.generate|cannot.generate|not.able.to|restricted|flagged|adult.content|nsfw|explicit/i;
+const POLICY_REGEX = /safety|policy|violat|content.?filter|inappropriat|harmful|prohibited|blocked|community.?guideline|terms.of.service|unable.to.generate|cannot.generate|not.able.to|restricted|flagged|adult.content|nsfw|explicit|PROMINENT_PEOPLE|prominent.people|public.figure|real.person|celebrity.filter/i;
 
 // Suffix an toàn — thêm vào TẤT CẢ prompt gửi Veo để tránh vi phạm chính sách
 const VEO_SAFE_SUFFIX = ', safe for all audiences, family-friendly, no graphic violence, no blood or gore, no adult or sexual content, no nudity, no weapons displayed aggressively, no disturbing imagery, tasteful and cinematic, appropriate for general viewing';
@@ -177,9 +177,11 @@ function isPolicyViolation(errorMsg) {
   return POLICY_REGEX.test(errorMsg || '');
 }
 
-// Làm sạch prompt vi phạm: thay từ nhạy cảm + đảm bảo có safe suffix
+// Làm sạch prompt vi phạm: strip tên người + thay từ nhạy cảm + safe suffix
 function sanitizePrompt(prompt) {
   if (!prompt) return '';
+  // Bước 0: luôn strip tên người trước (tránh PROMINENT_PEOPLE error)
+  prompt = stripProminentPeople(prompt);
   // Thay từ nhạy cảm bằng mô tả trung tính (không xóa hẳn để tránh câu vô nghĩa)
   const BANNED_MAP = [
     [/\bblood(?:y|ied)?\b/gi,           'dramatic scene'],
@@ -221,6 +223,43 @@ function applyVeoPolicy(prompt) {
   const p = prompt.trim();
   if (p.toLowerCase().includes('safe for all') || p.toLowerCase().includes('family-friendly')) return p;
   return p + VEO_SAFE_SUFFIX;
+}
+
+// ── Strip prominent people / real names khỏi prompt ─────────────────────────
+// Veo lỗi PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED khi prompt chứa tên thật người nổi tiếng
+// Hàm này thay thế tên riêng bằng mô tả vai trò chung chung
+const PERSON_REPLACE_MAP = [
+  // Chính trị / lãnh đạo
+  [/\b(Joe Biden|Donald Trump|Barack Obama|Vladimir Putin|Xi Jinping|Elon Musk|Bill Gates|Steve Jobs|Jeff Bezos|Mark Zuckerberg|Tim Cook|Sundar Pichai|Sam Altman)\b/gi, 'a prominent leader'],
+  // Nghệ sĩ / giải trí
+  [/\b(Taylor Swift|Beyoncé|Beyonce|Justin Bieber|Adele|Ed Sheeran|Rihanna|Lady Gaga|Eminem|Drake|BTS|Blackpink|Sơn Tùng|Son Tung)\b/gi, 'a famous musician'],
+  [/\b(Tom Hanks|Leonardo DiCaprio|Brad Pitt|Angelina Jolie|Scarlett Johansson|Robert Downey|Chris Evans|Dwayne Johnson|Will Smith|Keanu Reeves)\b/gi, 'a famous actor'],
+  // Thể thao
+  [/\b(Cristiano Ronaldo|Lionel Messi|LeBron James|Michael Jordan|Kobe Bryant|Neymar|Zlatan|Roger Federer|Serena Williams|Usain Bolt)\b/gi, 'a world-class athlete'],
+  // Nhân vật lịch sử / học thuật
+  [/\b(Albert Einstein|Isaac Newton|Stephen Hawking|Nikola Tesla|Charles Darwin|Sigmund Freud|Karl Marx|Nelson Mandela|Mahatma Gandhi|Martin Luther King)\b/gi, 'a historical figure'],
+  // Người Việt nổi tiếng
+  [/\b(Hồ Chí Minh|Ho Chi Minh|Nguyễn Phú Trọng|Tô Lâm|Jack Ma|Warren Buffett|George Soros|Oprah Winfrey|Ellen DeGeneres)\b/gi, 'a prominent public figure'],
+];
+
+// Regex nhận dạng tên riêng dạng "Firstname Lastname" (2 chữ hoa đầu liên tiếp)
+// Ví dụ: "John Smith", "Nguyen Van A" — để fallback sau map cố định
+const PROPER_NAME_REGEX = /\b([A-ZÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴĐ][a-záàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ]+)\s+([A-ZÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴĐ][a-z]+(?:\s+[A-ZÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴĐ][a-z]+)*)\b/g;
+
+function stripProminentPeople(prompt) {
+  if (!prompt) return '';
+  let p = prompt;
+  // 1. Thay các tên nổi tiếng đã biết
+  PERSON_REPLACE_MAP.forEach(([regex, replacement]) => { p = p.replace(regex, replacement); });
+  // 2. Thay pattern "Firstname Lastname" còn sót bằng "a person"
+  //    (chỉ thay nếu chứa 2 từ viết hoa liền — tránh thay tên địa điểm như "New York")
+  p = p.replace(PROPER_NAME_REGEX, (match, first, rest) => {
+    // Giữ lại nếu là địa danh hoặc tổ chức phổ biến
+    const keepList = /\b(New York|Los Angeles|San Francisco|United States|United Kingdom|South Korea|North Korea|Hong Kong|New Zealand|South Africa|Saudi Arabia|World Cup|Super Bowl|Olympic Games)\b/i;
+    if (keepList.test(match)) return match;
+    return 'a person';
+  });
+  return p.replace(/\s{2,}/g, ' ').trim();
 }
 
 // ── Escalating prompt repair — 4 cấp độ ngày càng mạnh hơn ──────────────────
@@ -746,7 +785,7 @@ function IdeaToVideoPanel() {
             sceneEnvId ? envImgMap[sceneEnvId] : null,
             ...sceneObjIds.map(id => objImgMap[id]),
           ].filter(Boolean);
-          const task = { id: tid, prompt: applyVeoPolicy(buildVideoPrompt(s)) };
+          const task = { id: tid, prompt: applyVeoPolicy(stripProminentPeople(buildVideoPrompt(s))) };
           const speakChar = sceneCharIds.find(id => charVoiceMap[id] && (charMediaMap[id] || charImgMap[id]));
           if (speakChar) {
             task.voiceId = charVoiceMap[speakChar];
@@ -1608,7 +1647,7 @@ function ScriptToVideoPanel() {
             sceneEnvId?envImgMap[sceneEnvId]:null,
             ...sceneObjIds.map(id=>objImgMap[id]),
           ].filter(Boolean);
-          const task={ id:tid, prompt:applyVeoPolicy(buildVideoPrompt(s)) };
+          const task={ id:tid, prompt:applyVeoPolicy(stripProminentPeople(buildVideoPrompt(s))) };
           const speakChar=sceneCharIds.find(id=>charVoiceMap[id]&&(charMediaMap[id]||charImgMap[id]));
           if (speakChar) {
             task.voiceId=charVoiceMap[speakChar];
@@ -2644,10 +2683,10 @@ function AudioToVideoPanel() {
         const MAX_A2V_GLOBAL = 20;  // global retry: 20 lần
 
         {
-          // Áp dụng VEO policy vào tất cả prompt ngay khi tạo task
+          // Áp dụng VEO policy + strip tên người nổi tiếng vào tất cả prompt
           const allTasks_a2v = generatedScenes.map((s, i) => ({
             id: `vid_${i}`,
-            prompt: applyVeoPolicy(s.veoVideoPrompt || 'Cinematic establishing shot, smooth camera movement'),
+            prompt: applyVeoPolicy(stripProminentPeople(s.veoVideoPrompt || 'Cinematic establishing shot, smooth camera movement')),
           }));
           let pendingTasks = dedupTasksByPrompt(allTasks_a2v, addLog);
           const a2vTaskMap = new Map();
@@ -5445,7 +5484,7 @@ function UrlToVideoPanel() {
         const charLockArr  = Array.isArray(scene.character_lock) ? scene.character_lock : [];
         const sceneCharIds = charLockArr.map(c => c?.id).filter(Boolean);
 
-        const prompt = applyVeoPolicy(buildU2VPrompt(scene));
+        const prompt = applyVeoPolicy(stripProminentPeople(buildU2VPrompt(scene)));
         const task = { id: tid, prompt };
 
         // ── Smart DNA selection — prompt-aware, max 6 ────────────────────────────
@@ -7073,8 +7112,8 @@ Script:
           sceneNum:    sc.sceneNum || i + 1,
           title:       sc.title || `Cảnh ${i + 1}`,
           numShots:    (sc.shots || []).length,
-          prompt:      applyVeoPolicy(buildImagePrompt(sc, parsed)),
-          videoPrompt: applyVeoPolicy(buildVideoPrompt(sc, parsed)),
+          prompt:      applyVeoPolicy(stripProminentPeople(buildImagePrompt(sc, parsed))),
+          videoPrompt: applyVeoPolicy(stripProminentPeople(buildVideoPrompt(sc, parsed))),
           hasDialogue: !!sc.hasDialogue,
           speakerName: sc.speakerName || '',
           dialogue:    sc.dialogue || '',

@@ -225,40 +225,64 @@ function applyVeoPolicy(prompt) {
   return p + VEO_SAFE_SUFFIX;
 }
 
-// ── Strip prominent people / real names khỏi prompt ─────────────────────────
-// Veo lỗi PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED khi prompt chứa tên thật người nổi tiếng
-// Hàm này thay thế tên riêng bằng mô tả vai trò chung chung
+// ── Strip prominent people — toàn diện, nhiều lớp ───────────────────────────
+// Veo lỗi PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED khi prompt chứa:
+//   - Tên thật người nổi tiếng (bất kỳ ngôn ngữ)
+//   - Mô tả nhận dạng được ("founder of SpaceX", "world's richest person")
+//   - Tước hiệu + tên ("President Biden", "CEO Musk")
+
+// ── Tên nổi tiếng cụ thể → vai trò chung ────────────────────────────────────
 const PERSON_REPLACE_MAP = [
-  // Chính trị / lãnh đạo
-  [/\b(Joe Biden|Donald Trump|Barack Obama|Vladimir Putin|Xi Jinping|Elon Musk|Bill Gates|Steve Jobs|Jeff Bezos|Mark Zuckerberg|Tim Cook|Sundar Pichai|Sam Altman)\b/gi, 'a prominent leader'],
-  // Nghệ sĩ / giải trí
-  [/\b(Taylor Swift|Beyoncé|Beyonce|Justin Bieber|Adele|Ed Sheeran|Rihanna|Lady Gaga|Eminem|Drake|BTS|Blackpink|Sơn Tùng|Son Tung)\b/gi, 'a famous musician'],
-  [/\b(Tom Hanks|Leonardo DiCaprio|Brad Pitt|Angelina Jolie|Scarlett Johansson|Robert Downey|Chris Evans|Dwayne Johnson|Will Smith|Keanu Reeves)\b/gi, 'a famous actor'],
+  // Công nghệ / Kinh doanh
+  [/\b(Elon Musk|Musk|Jeff Bezos|Bezos|Bill Gates|Gates|Steve Jobs|Jobs|Mark Zuckerberg|Zuckerberg|Tim Cook|Sundar Pichai|Sam Altman|Larry Page|Sergey Brin|Jack Ma|Warren Buffett|Buffett|George Soros|Michael Bloomberg|Jensen Huang|Reed Hastings|Brian Chesky|Travis Kalanick)\b/gi, 'a tech entrepreneur'],
+  // Chính trị
+  [/\b(Joe Biden|Biden|Donald Trump|Trump|Barack Obama|Obama|Hillary Clinton|Clinton|Vladimir Putin|Putin|Xi Jinping|Jinping|Boris Johnson|Emmanuel Macron|Macron|Angela Merkel|Merkel|Justin Trudeau|Trudeau|Volodymyr Zelensky|Zelensky|Narendra Modi|Modi|Jair Bolsonaro|Nguyễn Phú Trọng|Tô Lâm|Phạm Minh Chính)\b/gi, 'a world leader'],
+  // Nhạc / Giải trí
+  [/\b(Taylor Swift|Swift|Beyoncé|Beyonce|Justin Bieber|Bieber|Adele|Ed Sheeran|Sheeran|Rihanna|Lady Gaga|Gaga|Eminem|Drake|BTS|Blackpink|Ariana Grande|Grande|Post Malone|Billie Eilish|Eilish|The Weeknd|Bruno Mars|Sơn Tùng|Son Tung|Mỹ Tâm|My Tam|Đen Vâu|Jack|Soobin)\b/gi, 'a famous musician'],
+  [/\b(Tom Hanks|Hanks|Leonardo DiCaprio|DiCaprio|Brad Pitt|Pitt|Angelina Jolie|Jolie|Scarlett Johansson|Johansson|Robert Downey|Chris Evans|Dwayne Johnson|Will Smith|Keanu Reeves|Ryan Reynolds|Reynolds|Tom Cruise|Cruise|Meryl Streep|Julia Roberts)\b/gi, 'a famous actor'],
+  [/\b(Oprah Winfrey|Oprah|Ellen DeGeneres|Ellen|Jimmy Fallon|Jimmy Kimmel|Stephen Colbert|Joe Rogan|Rogan|MrBeast|PewDiePie)\b/gi, 'a media personality'],
   // Thể thao
-  [/\b(Cristiano Ronaldo|Lionel Messi|LeBron James|Michael Jordan|Kobe Bryant|Neymar|Zlatan|Roger Federer|Serena Williams|Usain Bolt)\b/gi, 'a world-class athlete'],
-  // Nhân vật lịch sử / học thuật
-  [/\b(Albert Einstein|Isaac Newton|Stephen Hawking|Nikola Tesla|Charles Darwin|Sigmund Freud|Karl Marx|Nelson Mandela|Mahatma Gandhi|Martin Luther King)\b/gi, 'a historical figure'],
-  // Người Việt nổi tiếng
-  [/\b(Hồ Chí Minh|Ho Chi Minh|Nguyễn Phú Trọng|Tô Lâm|Jack Ma|Warren Buffett|George Soros|Oprah Winfrey|Ellen DeGeneres)\b/gi, 'a prominent public figure'],
+  [/\b(Cristiano Ronaldo|Ronaldo|Lionel Messi|Messi|LeBron James|LeBron|Michael Jordan|Jordan|Kobe Bryant|Kobe|Neymar|Zlatan Ibrahimović|Ibrahimovic|Zlatan|Roger Federer|Federer|Serena Williams|Williams|Usain Bolt|Bolt|Tiger Woods|Woods|Muhammad Ali|Ali|Pelé|Pele|Maradona)\b/gi, 'a world-class athlete'],
+  // Lịch sử / Học thuật
+  [/\b(Albert Einstein|Einstein|Isaac Newton|Newton|Stephen Hawking|Hawking|Nikola Tesla|Tesla|Charles Darwin|Darwin|Sigmund Freud|Freud|Karl Marx|Marx|Nelson Mandela|Mandela|Mahatma Gandhi|Gandhi|Martin Luther King|Abraham Lincoln|Lincoln|Winston Churchill|Churchill|Napoleon Bonaparte|Napoleon|Julius Caesar|Caesar|Cleopatra|Shakespeare)\b/gi, 'a historical figure'],
+  // Lãnh đạo tôn giáo
+  [/\b(Pope Francis|Pope|Dalai Lama|Mother Teresa|Muhammad|Jesus Christ|Buddha)\b/gi, 'a spiritual leader'],
 ];
 
-// Regex nhận dạng tên riêng dạng "Firstname Lastname" (2 chữ hoa đầu liên tiếp)
-// Ví dụ: "John Smith", "Nguyen Van A" — để fallback sau map cố định
-const PROPER_NAME_REGEX = /\b([A-ZÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴĐ][a-záàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ]+)\s+([A-ZÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴĐ][a-z]+(?:\s+[A-ZÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴĐ][a-z]+)*)\b/g;
+// ── Mô tả nhận dạng được → mô tả chung ──────────────────────────────────────
+const IDENTIFIABLE_DESC_MAP = [
+  // "founder/CEO/creator of [company]"
+  [/\b(founder|co-founder|CEO|owner|creator|inventor)\s+of\s+\w[\w\s]*/gi, 'a business leader'],
+  // "[superlative] person/man/woman in the world"
+  [/\b(world'?s?\s+)?(richest|most famous|most powerful|wealthiest|most influential|greatest|best known)\s+(person|man|woman|human|individual|entrepreneur|athlete|leader|billionaire)/gi, 'a prominent person'],
+  // "President/CEO/Chairman [name or title]"
+  [/\b(President|Vice President|Prime Minister|Chancellor|Emperor|King|Queen|Prince|Princess|Secretary|Senator|Governor)\s+of\s+\w[\w\s]*/gi, 'a government official'],
+  // "[title] [Name]" — "President Biden", "CEO Musk"
+  [/\b(President|VP|CEO|CFO|CTO|Chairman|Senator|Governor|Mayor|Minister|Director|General|Admiral|Colonel)\s+[A-Z][a-z]+\b/g, 'a leader'],
+];
+
+// ── Địa danh & tổ chức ĐƯỢC GIỮ LẠI (không thay) ────────────────────────────
+const SAFE_PLACES = /\b(New York|Los Angeles|San Francisco|Silicon Valley|Wall Street|United States|United Kingdom|South Korea|North Korea|Hong Kong|New Zealand|South Africa|Saudi Arabia|Vatican|Hollywood|Broadway|Olympics|World Cup|Super Bowl|Grammy|Oscar|Nobel)\b/i;
 
 function stripProminentPeople(prompt) {
   if (!prompt) return '';
   let p = prompt;
-  // 1. Thay các tên nổi tiếng đã biết
-  PERSON_REPLACE_MAP.forEach(([regex, replacement]) => { p = p.replace(regex, replacement); });
-  // 2. Thay pattern "Firstname Lastname" còn sót bằng "a person"
-  //    (chỉ thay nếu chứa 2 từ viết hoa liền — tránh thay tên địa điểm như "New York")
-  p = p.replace(PROPER_NAME_REGEX, (match, first, rest) => {
-    // Giữ lại nếu là địa danh hoặc tổ chức phổ biến
-    const keepList = /\b(New York|Los Angeles|San Francisco|United States|United Kingdom|South Korea|North Korea|Hong Kong|New Zealand|South Africa|Saudi Arabia|World Cup|Super Bowl|Olympic Games)\b/i;
-    if (keepList.test(match)) return match;
-    return 'a person';
-  });
+
+  // Bước 1: Thay mô tả nhận dạng trước (trước khi thay tên để tránh partial match)
+  IDENTIFIABLE_DESC_MAP.forEach(([rx, rep]) => { p = p.replace(rx, rep); });
+
+  // Bước 2: Thay tên nổi tiếng cụ thể
+  PERSON_REPLACE_MAP.forEach(([rx, rep]) => { p = p.replace(rx, rep); });
+
+  // Bước 3: Thay "Firstname Lastname" còn sót (brace-counting approach)
+  // Pattern: 2+ từ viết hoa liên tiếp, không phải địa danh/tổ chức đã biết
+  p = p.replace(/\b([A-ZÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴĐ][a-záàảãạăắằẳẵặâấầẩẫậêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ]{1,})\s+([A-ZÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴĐ][a-záàảãạăắằẳẵặâấầẩẫậêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ]{1,}(?:\s+[A-ZÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴĐ][a-z]{1,})*)\b/g,
+    (match) => SAFE_PLACES.test(match) ? match : 'a person'
+  );
+
+  // Bước 4: Thay tước hiệu + từ viết hoa tiếp theo (còn sót)
+  p = p.replace(/\b(Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.|Sir|Dame|Lord)\s+[A-Z][a-z]+\b/g, 'a person');
+
   return p.replace(/\s{2,}/g, ' ').trim();
 }
 

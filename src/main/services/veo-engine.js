@@ -5,6 +5,45 @@ const crypto = require('crypto');
 const https = require('https');
 const { HttpsProxyAgent, proxyManager } = require('./proxy-manager');
 
+// ── Veo Prompt Sanitizer — chặn PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED ──
+// Chạy trong main process TRƯỚC khi gửi prompt lên Veo API (lớp phòng thủ cuối)
+const _VEO_SAFE_SUFFIX = ', no real people, no celebrities, no public figures, safe for all audiences, family-friendly';
+
+const _PERSON_NAMES_RE = [
+  // Công nghệ / Kinh doanh
+  /\b(Elon Musk|Musk|Jeff Bezos|Bezos|Bill Gates|Gates|Steve Jobs|Jobs|Mark Zuckerberg|Zuckerberg|Tim Cook|Sundar Pichai|Sam Altman|Jack Ma|Warren Buffett|Buffett|Jensen Huang)\b/gi,
+  // Chính trị
+  /\b(Joe Biden|Biden|Donald Trump|Trump|Barack Obama|Obama|Hillary Clinton|Clinton|Vladimir Putin|Putin|Xi Jinping|Jinping|Boris Johnson|Emmanuel Macron|Macron|Angela Merkel|Merkel|Justin Trudeau|Trudeau|Volodymyr Zelensky|Zelensky|Narendra Modi|Modi)\b/gi,
+  // Giải trí / Nhạc
+  /\b(Taylor Swift|Swift|Beyoncé|Beyonce|Justin Bieber|Bieber|Adele|Ed Sheeran|Rihanna|Lady Gaga|Gaga|Eminem|Drake|Ariana Grande|Grande|Billie Eilish|Eilish|The Weeknd|Bruno Mars|Sơn Tùng|Son Tung|Mỹ Tâm)\b/gi,
+  /\b(Tom Hanks|Hanks|Leonardo DiCaprio|DiCaprio|Brad Pitt|Pitt|Angelina Jolie|Jolie|Scarlett Johansson|Johansson|Robert Downey|Will Smith|Keanu Reeves|Tom Cruise|Cruise)\b/gi,
+  // Thể thao
+  /\b(Cristiano Ronaldo|Ronaldo|Lionel Messi|Messi|LeBron James|LeBron|Michael Jordan|Jordan|Kobe Bryant|Kobe|Neymar|Roger Federer|Federer|Serena Williams|Usain Bolt|Tiger Woods|Muhammad Ali|Ali|Pelé|Pele)\b/gi,
+  // Lịch sử / Học thuật
+  /\b(Albert Einstein|Einstein|Isaac Newton|Newton|Stephen Hawking|Hawking|Nikola Tesla|Tesla|Charles Darwin|Darwin|Nelson Mandela|Mandela|Mahatma Gandhi|Gandhi|Martin Luther King|Abraham Lincoln|Lincoln|Winston Churchill|Churchill|Napoleon|Julius Caesar|Caesar|Cleopatra|Shakespeare)\b/gi,
+  // Mô tả nhận dạng được
+  /\b(founder|co-founder|CEO|owner|creator|inventor)\s+of\s+(Tesla|SpaceX|Apple|Google|Facebook|Meta|Amazon|Microsoft|Twitter|YouTube|Netflix|Uber|Airbnb|OpenAI|PayPal|eBay)\b/gi,
+  /\b(world'?s?\s+)?(richest|most famous|most powerful|wealthiest|most influential)\s+(person|man|woman|billionaire|entrepreneur|athlete|leader)\b/gi,
+  // Tước hiệu + tên
+  /\b(President|CEO|CFO|CTO|Chairman|Senator|Governor|Prime Minister)\s+[A-Z][a-z]+\b/g,
+  /\b(Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.|Sir|Dame)\s+[A-Z][a-z]+\s+[A-Z][a-z]+\b/g,
+];
+
+function sanitizeVeoPrompt(prompt) {
+  if (!prompt) return prompt;
+  let p = String(prompt);
+  _PERSON_NAMES_RE.forEach(re => { p = p.replace(re, 'a person'); });
+  // Thay "Firstname Lastname" 2 chữ hoa liền (fallback)
+  p = p.replace(/\b([A-Z][a-z]{1,})\s+([A-Z][a-z]{1,}(?:\s+[A-Z][a-z]{1,})?)\b/g, (m) => {
+    // Giữ lại địa danh
+    if (/\b(New York|Los Angeles|San Francisco|United States|United Kingdom|South Korea|North Korea|Hong Kong|World Cup|Super Bowl)\b/i.test(m)) return m;
+    return 'a person';
+  });
+  // Thêm suffix nếu chưa có
+  if (!p.includes('no real people') && !p.includes('no celebrities')) p += _VEO_SAFE_SUFFIX;
+  return p.replace(/\s{2,}/g, ' ').trim();
+}
+
 // Mutex để serialize các Extension upload — kênh pendingImageUpload/uploadedMediaId
 let _extensionUploadLock = Promise.resolve();
 // Mutex để serialize Extension API calls (video gen) — kênh pendingVideoGen/videoGenResult
@@ -1357,7 +1396,7 @@ class VeoEngine {
                         for (let tokenTry = 1; tokenTry <= 3; tokenTry++) {
                             const imgRecaptchaToken = await VeoEngine.acquireRecaptcha('IMAGE_GENERATION', task.id, sendLog);
                             sendLog(`[JOBID:${task.id}] Bắn lệnh tạo ảnh lên AI Sandbox${tokenTry > 1 ? ` (lần ${tokenTry})` : ''}...`, 'info');
-                            const payload = this.generateImagePayload(task.prompt, aspectRatio, genCount, auth.projectId, imgRecaptchaToken, model, referenceImageIds);
+                            const payload = this.generateImagePayload(sanitizeVeoPrompt(task.prompt), aspectRatio, genCount, auth.projectId, imgRecaptchaToken, model, referenceImageIds);
                             try {
                                 genRes = await this.fetchAPI(imageApiUrl, 'POST', payload);
                                 break; // thành công → thoát loop
@@ -1477,7 +1516,7 @@ class VeoEngine {
                                 let ingr1AutoReloaded = false;
                                 for (let tokenTry = 1; tokenTry <= 3; tokenTry++) {
                                     const ingredRecaptcha = await VeoEngine.acquireRecaptcha('VIDEO_GENERATION', task.id, sendLog);
-                                    const ingredPayload = this.generateIngredientsPayload(task.prompt, aspectRatio, model, auth.projectId, ingredRecaptcha, ingredientMediaIds, task.voiceId || null, duration);
+                                    const ingredPayload = this.generateIngredientsPayload(sanitizeVeoPrompt(task.prompt), aspectRatio, model, auth.projectId, ingredRecaptcha, ingredientMediaIds, task.voiceId || null, duration);
                                     sendLog(`[JOBID:${task.id}] Gửi lệnh Ingredients Video qua API${tokenTry > 1 ? ` (lần ${tokenTry})` : ''}...`, 'info');
                                     try {
                                         genRes = await this.fetchAPI(INGRED_URL, 'POST', ingredPayload);
@@ -1512,7 +1551,7 @@ class VeoEngine {
                                 let ingr2AutoReloaded = false;
                                 for (let tokenTry = 1; tokenTry <= 3; tokenTry++) {
                                     const ingredRecaptcha = await VeoEngine.acquireRecaptcha('VIDEO_GENERATION', task.id, sendLog);
-                                    const ingredPayload = this.generateIngredientsPayload(task.prompt, aspectRatio, model, auth.projectId, ingredRecaptcha, ingredientMediaIds, task.voiceId || null, duration);
+                                    const ingredPayload = this.generateIngredientsPayload(sanitizeVeoPrompt(task.prompt), aspectRatio, model, auth.projectId, ingredRecaptcha, ingredientMediaIds, task.voiceId || null, duration);
                                     try {
                                         // Gọi qua Extension MAIN world (cùng session với upload) — tránh Media not found
                                         genRes = await this.generateVideoViaExtension(INGRED_URL, ingredPayload, sendLog, task.id);
@@ -1564,7 +1603,7 @@ class VeoEngine {
                                 while (i2vRetry < 3) {
                                     try {
                                         const videoRecaptchaToken = await VeoEngine.acquireRecaptcha('VIDEO_GENERATION', task.id, sendLog);
-                                        const videoPayload = this.generateVideoPayload(task.prompt, aspectRatio, model, duration, auth.projectId, videoRecaptchaToken, startImageId, endImageId, quality);
+                                        const videoPayload = this.generateVideoPayload(sanitizeVeoPrompt(task.prompt), aspectRatio, model, duration, auth.projectId, videoRecaptchaToken, startImageId, endImageId, quality);
                                         genRes = await this.fetchAPI(VIDEO_GEN_URL, 'POST', videoPayload);
                                         if (!genRes) throw new Error('I2V gen thất bại');
                                         break;
@@ -1592,7 +1631,7 @@ class VeoEngine {
                                 while (t2vRetry < 3) {
                                     try {
                                         const freshToken = await VeoEngine.acquireRecaptcha('VIDEO_GENERATION', task.id, sendLog);
-                                        const freshPayload = this.generateVideoPayload(task.prompt, aspectRatio, model, duration, auth.projectId, freshToken, startImageId, endImageId, quality);
+                                        const freshPayload = this.generateVideoPayload(sanitizeVeoPrompt(task.prompt), aspectRatio, model, duration, auth.projectId, freshToken, startImageId, endImageId, quality);
                                         genRes = await this.generateVideoViaExtension(VIDEO_GEN_URL, freshPayload, sendLog, task.id);
                                         if (!genRes) throw new Error('Extension T2V gen thất bại hoặc timeout');
                                         break;

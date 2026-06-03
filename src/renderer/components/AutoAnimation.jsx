@@ -2386,10 +2386,11 @@ function AudioToVideoPanel() {
                 const prevPath = orderedStockPaths.slice(0, i).filter(Boolean).pop();
                 if (prevPath) orderedStockPaths[i] = prevPath;
               } else {
-                // Trim / loop to exact scene duration
+                // Trim / loop to exact scene duration — chuẩn hóa 1280×720 để concat copy nhanh
                 const trimPath = `${_vidDir}\\stock_${String(i).padStart(4, '0')}.mp4`;
                 const tr = await window.electronAPI.trimLoopVideo({
                   inputPath: rawPath, duration: targetDur, outputPath: trimPath,
+                  targetW: 1280, targetH: 720,   // ← chuẩn hóa resolution 16:9 HD
                 });
                 if (tr?.success) {
                   orderedStockPaths[i] = trimPath;
@@ -2473,59 +2474,70 @@ function AudioToVideoPanel() {
       markDone('video');
       if (stopRef.current) throw new Error('Đã dừng.');
 
-      // ── 6. Ghép video ──────────────────────────────────────────────────────
+      // ── 6 + 7. Ghép clip stock + chèn audio gốc (FFmpeg local, 1 bước) ──────
       setActive('merge'); setActiveTab('merge');
-      addLog('Đang ghép video...', 'info');
 
-      let mergeFiles = [...vPaths];
-      if (!_stockMode && _videoEngine === 'veo') {
-        const allFolderVideos = await window.electronAPI.readVideoFolder(_vidDir);
-        mergeFiles = (allFolderVideos || []).filter(v => !v.name.startsWith('final_') && !v.name.startsWith('stock_')).map(v => v.path);
-      }
+      // Lấy danh sách clip đã trim theo thứ tự
+      const stockClips = orderedStockPaths.filter(Boolean);
+      addLog(`🎬 Ghép ${stockClips.length} clip stock bằng FFmpeg...`, 'info');
 
-      let mergedVideoPath = '';
-      if (mergeFiles.length >= 2) {
-        const outName = `merged_${Date.now()}`;
-        const mr = await window.electronAPI.mergeVideo({
-          files: mergeFiles, trimStart: 0, trimEnd: 0,
-          transition: useTransition ? 'Ngẫu nhiên' : 'Không có', outputFolder: _vidDir, outputName: outName,
-        });
-        if (mr?.success && mr?.path) {
-          mergedVideoPath = mr.path;
-          setMergedPath(mr.path);
-          addLog(`✅ Ghép xong: ${outName}.mp4`, 'success');
-        } else {
-          addLog(`⚠️ Ghép lỗi: ${mr?.error || 'unknown'}`, 'error');
-        }
-      } else if (mergeFiles.length === 1) {
-        mergedVideoPath = mergeFiles[0];
-        setMergedPath(mergeFiles[0]);
-        addLog('⚠️ Chỉ có 1 video — bỏ qua ghép', 'info');
-      }
-      markDone('merge');
-      if (stopRef.current) throw new Error('Đã dừng.');
-
-      // ── 7. Tắt tiếng video + ghép audio gốc ──────────────────────────────
-      setActive('remaster'); setActiveTab('remaster');
-      if (mergedVideoPath && filePath) {
-        addLog('🎵 Đang tắt tiếng video ghép và ghép audio gốc vào...', 'info');
+      if (stockClips.length === 0) {
+        addLog('⚠️ Không có clip nào để ghép', 'error');
+        markDone('merge');
+        markDone('remaster');
+      } else if (stockClips.length === 1) {
+        // Chỉ 1 clip: mux audio trực tiếp
+        addLog('⚠️ Chỉ 1 clip — mux audio trực tiếp...', 'info');
+        const outName = `final_${Date.now()}`;
         const rmr = await window.electronAPI.replaceAudio({
-          videoPath: mergedVideoPath,
-          audioPath: filePath,
+          videoPath: stockClips[0], audioPath: filePath,
           outputFolder: _vidDir,
         });
         if (rmr?.success && rmr?.path) {
-          setFinalPath(rmr.path);
-          addLog(`✅ Hoàn tất! Video với audio gốc: ${rmr.path.split(/[\\/]/).pop()}`, 'success');
+          setMergedPath(rmr.path); setFinalPath(rmr.path);
+          addLog(`✅ Hoàn tất! ${rmr.path.split(/[\\/]/).pop()}`, 'success');
         } else {
-          addLog(`⚠️ Ghép audio thất bại: ${rmr?.error || 'unknown'}`, 'error');
-          // Fallback: dùng video đã ghép
-          setFinalPath(mergedVideoPath);
+          addLog(`⚠️ Mux audio lỗi: ${rmr?.error}`, 'error');
+          setFinalPath(stockClips[0]);
         }
+        markDone('merge');
+        markDone('remaster');
       } else {
-        addLog('⏭️ Bỏ qua bước ghép audio (thiếu video hoặc audio gốc)', 'info');
+        // Nhiều clip: dùng concat-audio (concat demuxer + mux audio, không re-encode)
+        const outName = `final_stock_${Date.now()}`;
+        addLog(`📋 Concat list: ${stockClips.length} clip → ghép + chèn audio gốc...`, 'info');
+        const car = await window.electronAPI.concatAudio({
+          clips:        stockClips,
+          audioPath:    filePath,
+          outputFolder: _vidDir,
+          outputName:   outName,
+        });
+        if (car?.success && car?.path) {
+          setMergedPath(car.path); setFinalPath(car.path);
+          addLog(`✅ Hoàn tất! ${car.path.split(/[\\/]/).pop()}`, 'success');
+        } else {
+          addLog(`⚠️ concat-audio lỗi: ${car?.error || 'unknown'}`, 'error');
+          // Fallback: ghép video trước rồi mux audio riêng
+          addLog('🔄 Fallback: mergeVideo + replaceAudio...', 'info');
+          const mr = await window.electronAPI.mergeVideo({
+            files: stockClips, trimStart: 0, trimEnd: 0,
+            transition: 'Không có', outputFolder: _vidDir, outputName: `merged_${Date.now()}`,
+          });
+          if (mr?.success && mr?.path) {
+            const rmr = await window.electronAPI.replaceAudio({
+              videoPath: mr.path, audioPath: filePath, outputFolder: _vidDir,
+            });
+            const fp = rmr?.success ? rmr.path : mr.path;
+            setMergedPath(mr.path); setFinalPath(fp);
+            addLog(`✅ Fallback xong: ${fp.split(/[\\/]/).pop()}`, 'success');
+          } else {
+            addLog(`❌ Fallback ghép lỗi: ${mr?.error}`, 'error');
+          }
+        }
+        markDone('merge');
+        if (stopRef.current) throw new Error('Đã dừng.');
+        markDone('remaster');
       }
-      markDone('remaster');
 
     } catch (err) {
       const msg = err.message || 'Lỗi không xác định';

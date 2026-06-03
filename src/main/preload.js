@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   replaceAudio:    (data) => ipcRenderer.invoke('video:replaceAudio', data),
   mixAudio:        (data) => ipcRenderer.invoke('video:mixAudio', data),
   trimLoopVideo:   (data) => ipcRenderer.invoke('video:trim-loop', data),
+  concatAudio:     (data) => ipcRenderer.invoke('video:concat-audio', data),
   // ── Stock Video (Pexels / Pixabay) ────────────────────────────────────────
   stockVideoSearch:   (p) => ipcRenderer.invoke('stock-video:search', p),
   stockVideoDownload: (p) => ipcRenderer.invoke('stock-video:download', p),

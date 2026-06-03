@@ -1895,13 +1895,15 @@ class VeoEngine {
                 } else {
                     // Video: batch 5 task song song → chờ cả batch xong (download) → retry task lỗi → batch tiếp
                     const BATCH_SIZE = 5;
-                    const MAX_RETRIES = 20;
+                    // Internal retry = 3 (chỉ để phục hồi lỗi mạng thoáng qua)
+                    // Retry strategy thực sự do AutoAnimation.jsx điều khiển (5 lần → global 20 lần)
+                    const MAX_RETRIES = 3;
                     for (let batchStart = 0; batchStart < tasks.length; batchStart += BATCH_SIZE) {
                         const batch = tasks.slice(batchStart, batchStart + BATCH_SIZE);
                         let pendingTasks = [...batch];
 
                         for (let attempt = 1; attempt <= MAX_RETRIES && pendingTasks.length > 0; attempt++) {
-                            sendLog(`📦 Batch ${Math.floor(batchStart / BATCH_SIZE) + 1} — chạy ${pendingTasks.length} task${attempt > 1 ? ` (retry lần ${attempt})` : ''}...`, 'info');
+                            sendLog(`📦 Batch ${Math.floor(batchStart / BATCH_SIZE) + 1} — chạy ${pendingTasks.length} task${attempt > 1 ? ` (retry ${attempt}/${MAX_RETRIES})` : ''}...`, 'info');
                             const prevLen = results.length;
 
                             // Chạy tất cả pending task song song, chờ hết batch
@@ -1921,10 +1923,10 @@ class VeoEngine {
                                     }
                                 }
                                 if (attempt < MAX_RETRIES) {
-                                    sendLog(`🔁 ${failedTasks.length} task lỗi — thử lại lần ${attempt + 1}/${MAX_RETRIES} sau 5s...`, 'warn');
+                                    sendLog(`🔁 ${failedTasks.length} task lỗi — thử lại ${attempt + 1}/${MAX_RETRIES} sau 5s...`, 'warn');
                                     await new Promise(r => setTimeout(r, 5000));
                                 } else {
-                                    sendLog(`❌ ${failedTasks.length} task thử ${MAX_RETRIES} lần vẫn lỗi — bỏ qua`, 'error');
+                                    sendLog(`⏭️ ${failedTasks.length} task lỗi sau ${MAX_RETRIES} lần — trả về AutoAnimation để xử lý tiếp`, 'warn');
                                     for (const t of failedTasks) {
                                         results.push({ id: t.id, prompt: t.prompt, isError: true });
                                     }

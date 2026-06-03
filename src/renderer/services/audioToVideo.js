@@ -444,6 +444,26 @@ CONTENT CONTEXT (use this to keep prompts consistent and accurate):
 
 Write ONE complete, detailed Veo_Video_Prompt for a ${targetDuration}-second scene.
 ${contextBlock}
+━━━ 🚫 VEO CONTENT POLICY — MANDATORY, ZERO EXCEPTIONS ━━━
+Google Veo will REJECT prompts containing: graphic violence, blood, gore, weapons used violently, murder, torture, execution; adult/sexual content, nudity; hate speech, racism; drug use/manufacture; terrorism, bombs; disturbing or traumatic imagery.
+
+CRITICAL RULE — REFRAME SENSITIVE AUDIO INTO SAFE VISUALS:
+When the dialogue/narration contains sensitive, violent, or figurative language, you MUST reinterpret it as a safe, cinematic visual metaphor. Do NOT literally visualize the words — translate the EMOTION and NARRATIVE INTENT instead.
+
+Examples of required reframing:
+• "killed it / crushed it / destroyed the competition" → triumphant performer on stage, team celebrating victory, athlete crossing finish line in first place
+• "going to war / battle / fight for it" → determined professionals in focused teamwork, athletes training intensely, people working with fierce dedication
+• "blood, sweat and tears" → close-up of sweating hands gripping a tool, exhausted but determined face, tears of joy at achievement
+• "exploding sales / bomb of a deal" → bar charts soaring upward, fireworks celebration, confetti falling on happy business team
+• "cut throat competition / knifing the rival" → chess pieces being strategically moved, competitor analysis on screens, intense boardroom negotiation
+• "overdose of success / high on results" → person exhilarated on mountain summit, team cheering with raised fists, euphoric celebration
+• "massacre / slaughter in the market" → bold downward stock chart with dramatic lighting, newspaper headlines spinning, financial crisis montage
+• "drugs / medication changed my life" → doctor in white coat with patient, pharmacy with clean clinical setting, medical breakthrough visualization
+• "death / dying industry / kill the old way" → old rusty machinery being replaced by modern technology, transformation montage, phoenix rising metaphor
+
+If content is clearly fictional/narrative (film plot, story), visualize it tastefully with implied action, not graphic detail.
+Always prioritize EMOTIONAL TRUTH over literal translation of words.
+
 ━━━ REQUIRED PROMPT STRUCTURE (ALL elements must be present) ━━━
 A complete Veo prompt MUST include ALL of the following in one flowing paragraph:
 
@@ -455,7 +475,7 @@ A complete Veo prompt MUST include ALL of the following in one flowing paragraph
 6. VISUAL STYLE — Film look: cinematic, documentary, hyper-real, stylized, photorealistic, etc.
 7. MOOD/ATMOSPHERE — Emotional quality: tense, uplifting, melancholic, epic, serene, mysterious
 8. AUDIO CUES (Veo 3 native audio) — Ambient sounds, music tone, voice-over style, sound effects relevant to the scene
-9. END TAG — Always close with: "aspect ratio 16:9, cinematic shot"
+9. END TAG — Always close with: "safe for all audiences, family-friendly, aspect ratio 16:9, cinematic shot"
 
 ━━━ CONTENT ALIGNMENT RULES ━━━
 - STRICT ALIGNMENT: Every key object, action, or number mentioned in the dialogue MUST appear visually in the prompt.
@@ -533,6 +553,25 @@ CONTENT CONTEXT (keep all prompts consistent with this):
 ${contextBlock}
 For each scene provided, write ONE complete Veo_Video_Prompt for a ${targetDuration}-second clip.
 
+━━━ 🚫 VEO CONTENT POLICY — MANDATORY, ZERO EXCEPTIONS ━━━
+Google Veo will REJECT prompts containing: graphic violence, blood, gore, weapons used violently, murder, torture, execution; adult/sexual content, nudity; hate speech, racism; drug use; terrorism, bombs; disturbing imagery.
+
+CRITICAL RULE — REFRAME SENSITIVE AUDIO INTO SAFE VISUALS:
+When dialogue/narration contains sensitive or figurative language, translate the EMOTION and NARRATIVE INTENT into a safe visual — do NOT literally visualize violent/sensitive words.
+
+Reframing examples (APPLY TO ALL SCENES):
+• "killed it / crushed it" → triumphant performer, team celebrating, athlete winning
+• "going to war / battle / fight" → determined teamwork, intense training, fierce dedication
+• "blood sweat and tears" → sweating hands on work, exhausted-but-determined face, tears of joy
+• "explosion of sales / bomb deal" → soaring bar charts, confetti celebration, fireworks over city
+• "cut throat / knife the competition" → chess strategy, intense negotiation, competitor analysis
+• "overdose of success / high on results" → mountain summit elation, team cheering, euphoric celebration
+• "massacre / slaughter (market/results)" → dramatic stock charts, newspaper montage, financial transformation
+• "drugs / medication" → doctor with patient, pharmacy, medical breakthrough, healthcare setting
+• "death / dying / kill (old ways)" → old technology replaced by new, transformation montage, rebirth imagery
+• "war / military / soldiers (business context)" → strategic boardroom, mission briefing, business team deployment
+If content is narrative fiction, visualize tastefully with implied action and emotional close-ups — never graphic detail.
+
 ━━━ EACH PROMPT MUST INCLUDE ALL 9 ELEMENTS ━━━
 1. SUBJECT & ACTION — specific subject and what they are doing
 2. ENVIRONMENT/SETTING — location, indoor/outdoor, background details
@@ -542,10 +581,10 @@ For each scene provided, write ONE complete Veo_Video_Prompt for a ${targetDurat
 6. VISUAL STYLE — cinematic, documentary, photorealistic, hyper-real, etc.
 7. MOOD/ATMOSPHERE — emotional quality of the scene
 8. AUDIO CUES — ambient sounds, music tone, voice-over style (Veo 3 native audio)
-9. END TAG — always close with: "aspect ratio 16:9, cinematic shot"
+9. END TAG — always close with: "safe for all audiences, family-friendly, aspect ratio 16:9, cinematic shot"
 
 ━━━ RULES ━━━
-- STRICT ALIGNMENT: every object/action/number in dialogue MUST appear in the prompt.
+- STRICT ALIGNMENT: every object/action/number in dialogue MUST appear in the prompt (safely reframed if sensitive).
 - DYNAMIC MOVEMENT: chain camera movements for 2+ ideas: "Starts with X, then pans to Y, reveals Z"
 - PACING: ${pacingMap[targetDuration] || pacingMap[8]}
 - NUMBERS/DATA: visualize as glowing holographic overlays or floating infographics.

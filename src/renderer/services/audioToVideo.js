@@ -26,6 +26,43 @@ async function retryOnError(fn, maxAttempts = 3, baseDelayMs = 2000) {
   throw lastErr;
 }
 
+// ─── JSON extractor an toàn ────────────────────────────────────────────────────
+// Dùng brace-counting để tìm JSON object đầu tiên hợp lệ trong chuỗi bất kỳ.
+// Khắc phục 2 vấn đề của greedy regex /\{[\s\S]*\}/:
+//   1. Gemini thêm text/commentary SAU JSON → greedy lấy quá dài → JSON.parse lỗi
+//      "Unexpected non-whitespace character after JSON at position N"
+//   2. maxOutputTokens bị đụng → JSON bị cắt giữa chừng → greedy lấy nửa chừng
+function extractFirstJSON(raw) {
+  if (!raw) return null;
+  // Thử parse toàn bộ trước (trường hợp sạch nhất)
+  try { return JSON.parse(raw); } catch {}
+  // Brace-counting: dừng đúng tại } kết thúc object đầu tiên
+  const start = raw.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0;
+  let inStr  = false;
+  let escape = false;
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i];
+    if (escape)           { escape = false; continue; }
+    if (ch === '\\')      { escape = true;  continue; }
+    if (ch === '"')       { inStr = !inStr; continue; }
+    if (inStr)            { continue; }
+    if (ch === '{')         depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(raw.slice(start, i + 1)); } catch {}
+        // Nếu vẫn lỗi (nội dung bên trong bị hỏng) → thử tìm object tiếp theo
+        const next = raw.indexOf('{', i + 1);
+        if (next === -1) return null;
+        return extractFirstJSON(raw.slice(next));
+      }
+    }
+  }
+  return null; // JSON bị cắt giữa chừng (maxTokens đụng)
+}
+
 // ─── 1. Transcribe 1 chunk audio via Gemini multimodal ───────────────────────
 // Timeout 90s/lần dùng config.httpOptions.timeout của SDK (@google/genai v1.x).
 // SDK dùng AbortController nội bộ → hủy HTTP connection thực sự.
@@ -51,7 +88,7 @@ export async function transcribeAudio(apiKeys, base64, mimeType, onSwitch) {
           ]
         }],
         config: {
-          maxOutputTokens: 3000,
+          maxOutputTokens: 8192, // tăng từ 3000 → tránh JSON bị cắt giữa chừng với audio dài
           thinkingConfig: { thinkingBudget: 0 }, // tắt thinking → tiết kiệm token, nhanh hơn
           // SDK-level timeout: hủy HTTP request sau 90s nếu Gemini không phản hồi
           httpOptions: { timeout: TRANSCRIBE_TIMEOUT_MS }
@@ -80,10 +117,11 @@ export async function transcribeAudio(apiKeys, base64, mimeType, onSwitch) {
       .replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
     if (!raw) throw new Error('Gemini trả về rỗng khi transcribe audio');
 
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('Không tìm thấy JSON trong kết quả transcription');
-
-    const parsed = JSON.parse(jsonMatch[0]);
+    // Dùng brace-counting thay vì greedy regex:
+    // Greedy /\{[\s\S]*\}/ lấy tới dấu } CUỐI CÙNG → fail khi Gemini thêm text sau JSON
+    // Brace-counting dừng đúng tại } kết thúc object đầu tiên hợp lệ
+    const parsed = extractFirstJSON(raw);
+    if (!parsed) throw new Error(`Không parse được JSON từ Gemini: ${raw.slice(0, 200)}`);
     const segments = (parsed.segments || [])
       .map(s => ({ start: parseFloat(s.start) || 0, end: parseFloat(s.end) || 0, text: (s.text || '').trim() }))
       .filter(s => s.text);
@@ -416,9 +454,9 @@ Return ONLY valid JSON (no markdown):
     });
 
     const raw = (response?.text || '').trim();
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('Không tìm thấy JSON trong phân tích tổng quát');
-    return JSON.parse(jsonMatch[0]);
+    const parsed = extractFirstJSON(raw.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim());
+    if (!parsed) throw new Error(`Không parse được JSON phân tích tổng quát: ${raw.slice(0, 200)}`);
+    return parsed;
   }, apiKeys, { onSwitch });
 }
 

@@ -104,14 +104,26 @@
 
                         <div>
                             <label class="block text-sm font-semibold mb-1.5 text-slate-700">Thời hạn sử dụng</label>
-                            <select id="durationSelect" class="w-full border border-slate-300 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-[#5b5fff]/50 focus:border-[#5b5fff] transition-all bg-white font-medium">
+                            <select id="durationSelect" onchange="onDurationChange()" class="w-full border border-slate-300 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-[#5b5fff]/50 focus:border-[#5b5fff] transition-all bg-white font-medium">
                                 <option value="5">5 Ngày (Bản Test)</option>
                                 <option value="30" selected>30 Ngày (1 Tháng)</option>
-                                <option value="90">3 Tháng</option>
-                                <option value="180">6 Tháng</option>
-                                <option value="365">1 Năm</option>
+                                <option value="90">90 Ngày (3 Tháng)</option>
+                                <option value="180">180 Ngày (6 Tháng)</option>
+                                <option value="365">365 Ngày (1 Năm)</option>
                                 <option value="3650">Vĩnh viễn (10 năm)</option>
+                                <option value="custom">✏️ Tùy chỉnh (nhập số ngày)</option>
                             </select>
+                            <!-- Ô nhập số ngày tùy chỉnh — hiện khi chọn "Tùy chỉnh" -->
+                            <div id="customDaysWrapper" class="hidden mt-2">
+                                <div class="flex items-center gap-2 bg-amber-50 border border-amber-300 rounded-lg px-4 py-3">
+                                    <span class="text-amber-600 text-sm font-semibold shrink-0">Số ngày:</span>
+                                    <input type="number" id="customDaysInput" min="1" max="9999" value="60"
+                                        placeholder="Nhập số ngày..."
+                                        class="flex-1 bg-transparent border-none outline-none text-slate-800 font-bold text-lg text-center w-24"
+                                        oninput="updateCustomLabel()">
+                                    <span id="customDaysLabel" class="text-amber-600 text-xs font-medium shrink-0">≈ 2 tháng</span>
+                                </div>
+                            </div>
                         </div>
 
                         <button onclick="generateKey()" class="w-full bg-[#1677ff] hover:bg-[#0f5fcb] text-white font-bold py-3.5 rounded-lg transition-colors mt-4 shadow-[0_4px_14px_0_rgba(22,119,255,0.39)] text-sm tracking-wide">
@@ -167,6 +179,68 @@
         </main>
     </div>
 
+    <!-- MODAL GIA HẠN NHANH -->
+    <div id="renewModal" class="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm hidden items-center justify-center">
+        <div class="bg-white rounded-2xl shadow-2xl w-[440px] border border-slate-200 p-7 mx-4">
+            <div class="flex items-center justify-between mb-5">
+                <h3 class="text-lg font-bold text-slate-800">Gia hạn / Tạo Key Mới</h3>
+                <button onclick="closeRenewModal()" class="text-slate-400 hover:text-slate-600 p-1 rounded-lg hover:bg-slate-100 transition-colors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+
+            <!-- Info khách -->
+            <div class="bg-slate-50 rounded-xl border border-slate-200 p-4 mb-5 space-y-2">
+                <div class="flex items-center gap-2">
+                    <span class="text-[10px] font-bold text-slate-400 uppercase w-14 shrink-0">Khách</span>
+                    <span id="renewModalName" class="text-sm font-bold text-slate-700 truncate"></span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <span class="text-[10px] font-bold text-slate-400 uppercase w-14 shrink-0">HWID</span>
+                    <span id="renewModalHwid" class="font-mono text-xs text-blue-600 bg-blue-50 border border-blue-200 rounded px-2 py-0.5 truncate select-all"></span>
+                </div>
+            </div>
+
+            <!-- Preset ngày nhanh -->
+            <div class="mb-4">
+                <label class="block text-sm font-semibold text-slate-700 mb-2">Chọn số ngày gia hạn</label>
+                <div class="grid grid-cols-4 gap-2 mb-3">
+                    <button onclick="setRenewDays(7)"   class="preset-btn py-2 text-xs font-bold rounded-lg border border-slate-200 hover:border-[#5b5fff] hover:bg-[#f5f3ff] hover:text-[#5b5fff] transition-all text-slate-600">7 ngày</button>
+                    <button onclick="setRenewDays(30)"  class="preset-btn py-2 text-xs font-bold rounded-lg border border-slate-200 hover:border-[#5b5fff] hover:bg-[#f5f3ff] hover:text-[#5b5fff] transition-all text-slate-600">30 ngày</button>
+                    <button onclick="setRenewDays(90)"  class="preset-btn py-2 text-xs font-bold rounded-lg border border-slate-200 hover:border-[#5b5fff] hover:bg-[#f5f3ff] hover:text-[#5b5fff] transition-all text-slate-600">90 ngày</button>
+                    <button onclick="setRenewDays(180)" class="preset-btn py-2 text-xs font-bold rounded-lg border border-slate-200 hover:border-[#5b5fff] hover:bg-[#f5f3ff] hover:text-[#5b5fff] transition-all text-slate-600">180 ngày</button>
+                    <button onclick="setRenewDays(365)" class="preset-btn py-2 text-xs font-bold rounded-lg border border-slate-200 hover:border-[#5b5fff] hover:bg-[#f5f3ff] hover:text-[#5b5fff] transition-all text-slate-600">1 năm</button>
+                    <button onclick="setRenewDays(3650)" class="preset-btn col-span-3 py-2 text-xs font-bold rounded-lg border border-slate-200 hover:border-[#5b5fff] hover:bg-[#f5f3ff] hover:text-[#5b5fff] transition-all text-slate-600">Vĩnh viễn (10 năm)</button>
+                </div>
+                <!-- Nhập tùy chỉnh -->
+                <div class="flex items-center gap-3 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+                    <span class="text-amber-700 text-sm font-bold shrink-0">Tùy chỉnh:</span>
+                    <input type="number" id="renewDaysInput" min="1" max="9999" value="30"
+                        class="flex-1 bg-transparent border-none outline-none text-slate-800 font-bold text-xl text-center"
+                        oninput="updateRenewLabel()">
+                    <span class="text-amber-600 text-xs font-medium shrink-0">ngày</span>
+                </div>
+                <p id="renewDaysLabel" class="text-center text-xs text-slate-400 mt-1.5">≈ 1 tháng · Hết hạn: <span id="renewExpiryPreview"></span></p>
+            </div>
+
+            <!-- Key output -->
+            <div id="renewKeySection" class="hidden mb-4 p-4 bg-emerald-50 border border-emerald-200 rounded-xl">
+                <p class="text-[10px] font-bold text-emerald-600 uppercase tracking-wider mb-2">Key mới tạo</p>
+                <div class="flex items-center gap-2">
+                    <input type="text" id="renewKeyOutput" readonly
+                        class="flex-1 bg-white border border-emerald-300 rounded-lg px-3 py-2 font-mono font-bold text-emerald-700 text-sm text-center focus:outline-none select-all">
+                    <button onclick="copyRenewKey()" class="p-2 bg-emerald-100 hover:bg-emerald-200 rounded-lg transition-colors">
+                        <svg id="renewCopyIcon" class="w-5 h-5 text-emerald-700" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                    </button>
+                </div>
+            </div>
+
+            <button onclick="generateRenewKey()" class="w-full bg-[#1677ff] hover:bg-[#0f5fcb] text-white font-bold py-3 rounded-xl transition-colors shadow-lg text-sm tracking-wide">
+                TẠO KEY GIA HẠN
+            </button>
+        </div>
+    </div>
+
     <script>
         // MÃ BÍ MẬT BẢO VỆ KEY - PHẢI TRÙNG VỚI ELECTRON!
         const SECRET_SALT = "GROK_STUDIO_PRO_VIP_2026_SECRET";
@@ -177,10 +251,19 @@
         // KHỞI TẠO ỨNG DỤNG
         window.onload = () => {
             loadHistory();
-            
-            // Xử lý đăng nhập bằng phím Enter
-            document.getElementById('password').addEventListener('keypress', function (e) {
+
+            document.getElementById('password').addEventListener('keypress', e => {
                 if (e.key === 'Enter') login();
+            });
+
+            // Đóng modal gia hạn khi click ra ngoài
+            document.getElementById('renewModal').addEventListener('click', function(e) {
+                if (e.target === this) closeRenewModal();
+            });
+
+            // Phím ESC đóng modal
+            document.addEventListener('keydown', e => {
+                if (e.key === 'Escape') closeRenewModal();
             });
         };
 
@@ -236,10 +319,45 @@
         // ==========================================
         // 3. THUẬT TOÁN TẠO KEY & LƯU LỊCH SỬ
         // ==========================================
+        // ==========================================
+        // HELPERS: Custom days trong form tạo key
+        // ==========================================
+        function onDurationChange() {
+            const val = document.getElementById('durationSelect').value;
+            const wrapper = document.getElementById('customDaysWrapper');
+            if (val === 'custom') {
+                wrapper.classList.remove('hidden');
+                updateCustomLabel();
+            } else {
+                wrapper.classList.add('hidden');
+            }
+        }
+
+        function updateCustomLabel() {
+            const days = parseInt(document.getElementById('customDaysInput').value) || 0;
+            let label = '';
+            if (days < 7)        label = `${days} ngày`;
+            else if (days < 30)  label = `${Math.round(days/7)} tuần`;
+            else if (days < 365) label = `≈ ${(days/30).toFixed(1)} tháng`;
+            else                 label = `≈ ${(days/365).toFixed(1)} năm`;
+            document.getElementById('customDaysLabel').textContent = label;
+        }
+
+        function getSelectedDays() {
+            const sel = document.getElementById('durationSelect').value;
+            if (sel === 'custom') {
+                const v = parseInt(document.getElementById('customDaysInput').value);
+                if (!v || v < 1) { alert('Vui lòng nhập số ngày hợp lệ (≥ 1)!'); return null; }
+                return v;
+            }
+            return parseInt(sel);
+        }
+
         function generateKey() {
             const customerName = document.getElementById('noteInput').value.trim();
             const hwid = document.getElementById('hwidInput').value.trim().toUpperCase();
-            const days = parseInt(document.getElementById('durationSelect').value);
+            const days = getSelectedDays();
+            if (days === null) return;
             
             if(!hwid) return alert("Vui lòng nhập Mã máy (HWID) của khách!");
             if(!customerName) return alert("Vui lòng nhập Tên/Ghi chú để dễ quản lý sau này!");
@@ -306,12 +424,97 @@
             }
         }
 
-        // Chức năng: Gia hạn (Chuyển thông tin sang Tab Tạo Mới)
+        // Chức năng: Mở modal gia hạn nhanh
+        function openRenewModal(hwid, name) {
+            document.getElementById('renewModalName').textContent = name;
+            document.getElementById('renewModalHwid').textContent = hwid;
+            document.getElementById('renewModalHwid').dataset.hwid = hwid;
+            document.getElementById('renewModalName').dataset.name = name;
+            document.getElementById('renewDaysInput').value = 30;
+            document.getElementById('renewKeySection').classList.add('hidden');
+            document.getElementById('renewKeyOutput').value = '';
+            updateRenewLabel();
+            const modal = document.getElementById('renewModal');
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        function closeRenewModal() {
+            const modal = document.getElementById('renewModal');
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
+        function setRenewDays(days) {
+            document.getElementById('renewDaysInput').value = days;
+            updateRenewLabel();
+            // Highlight preset btn
+            document.querySelectorAll('.preset-btn').forEach(b => {
+                b.classList.remove('border-[#5b5fff]','bg-[#f5f3ff]','text-[#5b5fff]');
+            });
+        }
+
+        function updateRenewLabel() {
+            const days = parseInt(document.getElementById('renewDaysInput').value) || 0;
+            let label = '';
+            if (days < 7)        label = `${days} ngày`;
+            else if (days < 30)  label = `${Math.round(days/7)} tuần`;
+            else if (days < 365) label = `≈ ${(days/30).toFixed(1)} tháng`;
+            else                 label = `≈ ${(days/365).toFixed(1)} năm`;
+
+            const expiry = new Date();
+            expiry.setDate(expiry.getDate() + days);
+            document.getElementById('renewDaysLabel').innerHTML =
+                `${label} &nbsp;·&nbsp; Hết hạn: <span id="renewExpiryPreview" class="font-bold text-slate-600">${formatDate(expiry.getTime())}</span>`;
+        }
+
+        function generateRenewKey() {
+            const hwid  = document.getElementById('renewModalHwid').dataset.hwid;
+            const name  = document.getElementById('renewModalName').dataset.name;
+            const days  = parseInt(document.getElementById('renewDaysInput').value);
+            if (!days || days < 1) return alert('Nhập số ngày hợp lệ (≥ 1)!');
+
+            const createdDate = new Date();
+            const expiryDate  = new Date();
+            expiryDate.setDate(expiryDate.getDate() + days);
+            const expiryTimestamp = expiryDate.getTime();
+
+            const expiryHex = expiryTimestamp.toString(16).toUpperCase();
+            const payload   = hwid + expiryHex;
+            const signature = CryptoJS.HmacSHA256(payload, SECRET_SALT).toString(CryptoJS.enc.Hex).toUpperCase().substring(0, 16);
+            const finalKey  = `${expiryHex}-${signature}`;
+
+            document.getElementById('renewKeyOutput').value = finalKey;
+            document.getElementById('renewKeySection').classList.remove('hidden');
+
+            // Lưu lịch sử
+            const record = {
+                id: Date.now().toString(),
+                customerName: `${name} (Gia hạn ${days}n)`,
+                hwid, key: finalKey, days,
+                createdTimestamp: createdDate.getTime(),
+                expiryTimestamp
+            };
+            historyDB.unshift(record);
+            saveHistory();
+        }
+
+        function copyRenewKey() {
+            const key = document.getElementById('renewKeyOutput').value;
+            if (!key) return;
+            navigator.clipboard.writeText(key).then(() => {
+                const icon = document.getElementById('renewCopyIcon');
+                icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>';
+                icon.classList.add('text-emerald-500');
+                setTimeout(() => {
+                    icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>';
+                }, 1500);
+            });
+        }
+
+        // Chức năng cũ: Gia hạn (Chuyển sang Tab Tạo Mới) — giữ lại fallback
         function renewKey(hwid, name) {
-            document.getElementById('hwidInput').value = hwid;
-            document.getElementById('noteInput').value = `${name} (Gia hạn)`;
-            document.getElementById('keyOutput').value = '';
-            switchTab('create');
+            openRenewModal(hwid, name);
         }
 
         // Chức năng: Xóa bản ghi
@@ -389,6 +592,7 @@
                     </td>
                     <td class="px-6 py-4 border-b border-slate-100 whitespace-nowrap">
                         <p class="text-sm font-bold ${isExpired ? 'text-amber-600' : 'text-slate-700'}">${formatDate(item.expiryTimestamp)}</p>
+                        <p class="text-[10px] mt-0.5 ${isExpired ? 'text-red-400' : 'text-slate-400'}">${isExpired ? 'Đã hết hạn' : `Còn ${Math.ceil((item.expiryTimestamp - now) / 86400000)} ngày`}</p>
                     </td>
                     <td class="px-6 py-4 border-b border-slate-100 text-center whitespace-nowrap">
                         ${statusHtml}
@@ -399,8 +603,9 @@
                                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
                                 Cấp lại
                             </button>
-                            <button onclick="renewKey('${safeHwid}', '${safeName}')" title="Gia hạn (Tạo Key mới)" class="p-1.5 text-blue-500 hover:bg-blue-50 border border-slate-200 rounded transition-colors">
+                            <button onclick="openRenewModal('${safeHwid}', '${safeName}')" title="Gia hạn — chọn số ngày" class="flex items-center gap-1 px-2 py-1.5 text-[11px] font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded transition-colors">
                                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                Gia hạn
                             </button>
                             <button onclick="deleteRecord('${item.id}')" title="Xóa lịch sử này" class="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 border border-slate-200 rounded transition-colors">
                                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>

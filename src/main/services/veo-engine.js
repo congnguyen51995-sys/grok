@@ -1874,7 +1874,8 @@ class VeoEngine {
                 } catch (error) {
                     sendLog(`[JOBID:${task.id}] Lỗi: ${error.message}`, 'error');
                     sendLog(`[JOBID:${task.id}]`, 'job_fail');
-                    results.push({ id: task.id, prompt: task.prompt, isError: true });
+                    // Truyền error.message về renderer để detect policy violation
+                    results.push({ id: task.id, prompt: task.prompt, isError: true, error: error.message || '' });
                 }
             };
 

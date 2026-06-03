@@ -167,6 +167,22 @@ const VOICE_POOL_MALE    = VOICE_POOL.filter(v => v.gender === 'male');
 const VOICE_POOL_FEMALE  = VOICE_POOL.filter(v => v.gender === 'female');
 const VOICE_POOL_NEUTRAL = VOICE_POOL.filter(v => v.gender === 'neutral');
 
+// ── Policy violation helpers ─────────────────────────────────────────────────
+const POLICY_REGEX = /safety|policy|violat|content.?filter|inappropriat|harmful|prohibited|blocked|community.?guideline|terms.of.service|unable.to.generate|cannot.generate|not.able.to|restricted|flagged|adult.content|nsfw|explicit/i;
+
+function isPolicyViolation(errorMsg) {
+  return POLICY_REGEX.test(errorMsg || '');
+}
+
+// Xử lý prompt vi phạm chính sách: xóa từ nhạy cảm + thêm hậu tố an toàn
+function sanitizePrompt(prompt) {
+  const BANNED = /\b(blood|gore|violent(ly)?|weapon|gun|knife|sword|murder|kill(ing)?|death|corpse|nude|naked|explicit|sexual|erotic|adult|nsfw|hate|racist|discrimination|drug|bomb|terrorist)\b/gi;
+  const SAFE_SUFFIX = ', safe for all audiences, family-friendly, cinematic, tasteful, no graphic content, no explicit material, appropriate for general viewing';
+  let cleaned = (prompt || '').replace(BANNED, '').replace(/\s{2,}/g, ' ').trim();
+  if (!cleaned.toLowerCase().includes('safe for all')) cleaned += SAFE_SUFFIX;
+  return cleaned;
+}
+
 // Phát hiện giới tính nhân vật từ ID + mô tả
 function detectCharGender(charId = '', description = '') {
   const text = `${charId} ${description}`.toLowerCase();
@@ -528,7 +544,8 @@ function IdeaToVideoPanel() {
       setActive('video'); setActiveTab('video');
       const engineLabel  = 'Veo';
       const maxVidWorkers = 8;
-      const MAX_VIDEO_RETRY = 20;
+      const MAX_FIRST_RETRY_I2V = 5;  // lần đầu: 5 lần rồi bỏ qua
+      const MAX_GLOBAL_RETRY_I2V = 20; // global: 20 lần
       const vPaths = [];
 
       const buildVideoPrompt = (sceneObj) => {
@@ -618,15 +635,13 @@ function IdeaToVideoPanel() {
         // Dedup prompt trùng trước khi gửi
         let pendingTasks = dedupTasksByPrompt(allTasks, addLog);
 
-        // ── Helper: chạy 1 vòng retry 20 lần ──────────────────────────────────
-        const runIdeaVeoPass = async (passLabel) => {
+        // ── Helper: 1 vòng retry, tham số maxRetry ────────────────────────────
+        const i2vPolicySet = new Set();
+        const runIdeaVeoPass = async (passLabel, maxRetry) => {
           const filterPass = makeSubmitGuard();
-          for (let attempt = 1; attempt <= MAX_VIDEO_RETRY && pendingTasks.length > 0; attempt++) {
+          for (let attempt = 1; attempt <= maxRetry && pendingTasks.length > 0; attempt++) {
             if (stopRef.current) throw new Error('Đã dừng.');
-            if (attempt > 1) {
-              addLog(`${passLabel}[Veo] Thử lại lần ${attempt}: ${pendingTasks.length} video...`, 'info');
-              await sleep(10000);
-            }
+            if (attempt > 1) { addLog(`${passLabel}[Veo] Thử lại lần ${attempt}/${maxRetry}: ${pendingTasks.length} video...`, 'info'); await sleep(10000); }
             const safeTasks = filterPass(pendingTasks, addLog);
             if (!safeTasks.length) break;
             const vr = await window.electronAPI.runVeo({
@@ -635,38 +650,58 @@ function IdeaToVideoPanel() {
               quality: vidQuality, outputFolder: vidDir, duration: `${sceneDur}s`,
             });
             const files = vr?.files || [];
-            const succeeded = files.filter(f => !f.isError && f.filePath);
-            const failedIds = new Set(files.filter(f => f.isError).map(f => f.id));
+            const succeeded    = files.filter(f => !f.isError && f.filePath);
+            const failedFiles  = files.filter(f => f.isError);
+            const failedIds    = new Set(failedFiles.map(f => f.id));
             succeeded.forEach(f => { orderedVPaths[veoTaskMap.get(f.id) ?? 0] = f.filePath; });
-            if (succeeded.length > 0)
-              addLog(`✅ ${passLabel}[Veo] Lần ${attempt}: ${succeeded.length}/${safeTasks.length} thành công`, 'success');
+            if (succeeded.length > 0) addLog(`✅ ${passLabel}[Veo] Lần ${attempt}: ${succeeded.length}/${safeTasks.length} thành công`, 'success');
+            // Policy violation detection
+            for (const ff of failedFiles) {
+              if (isPolicyViolation(ff.error)) {
+                i2vPolicySet.add(ff.id);
+                addLog(`🚫 [Chính sách Veo] Cảnh vi phạm: "${(ff.error || '').slice(0, 80)}" → đổi prompt an toàn`, 'error');
+              }
+            }
             pendingTasks = safeTasks.filter(t => failedIds.has(t.id)).map(t => {
               const ni = `${t.id}_r${attempt}`;
               veoTaskMap.set(ni, veoTaskMap.get(t.id)); veoTaskMap.delete(t.id);
+              if (i2vPolicySet.has(t.id)) {
+                i2vPolicySet.delete(t.id); i2vPolicySet.add(ni);
+                const cp = sanitizePrompt(t.prompt);
+                addLog(`🔧 Prompt làm sạch: "${cp.slice(0,70)}..."`, 'info');
+                return { ...t, id: ni, prompt: cp };
+              }
               return { ...t, id: ni };
             });
-            if (pendingTasks.length > 0 && attempt < MAX_VIDEO_RETRY)
+            if (pendingTasks.length > 0 && attempt < maxRetry)
               addLog(`⚠️ ${passLabel}[Veo] ${pendingTasks.length} video lỗi → chờ 10s...`, 'error');
           }
         };
 
-        // Vòng chính (20 lần)
-        await runIdeaVeoPass('');
+        // Vòng chính — 5 lần, bỏ qua nếu vẫn lỗi, tiếp tục video khác
+        addLog(`📋 Tạo ${pendingTasks.length} video — thử ${MAX_FIRST_RETRY_I2V} lần/task, bỏ qua nếu thất bại`, 'info');
+        await runIdeaVeoPass('', MAX_FIRST_RETRY_I2V);
+        if (pendingTasks.length > 0)
+          addLog(`⏭️ ${pendingTasks.length} video vẫn lỗi sau ${MAX_FIRST_RETRY_I2V} lần → bỏ qua, tiếp tục`, 'warn');
 
-        // Global retry: sau khi tất cả xong, chạy lại toàn bộ lỗi 20 vòng × 20 lần
-        const MAX_GLOBAL = 20;
-        for (let gPass = 1; gPass <= MAX_GLOBAL && pendingTasks.length > 0; gPass++) {
-          if (stopRef.current) throw new Error('Đã dừng.');
-          addLog(`🔄 [Global Retry ${gPass}/${MAX_GLOBAL}] ${pendingTasks.length} video vẫn lỗi → thử lại...`, 'info');
-          await sleep(5000);
-          pendingTasks = pendingTasks.map(t => {
-            const ni = `${t.id}_g${gPass}`;
-            veoTaskMap.set(ni, veoTaskMap.get(t.id)); veoTaskMap.delete(t.id);
-            return { ...t, id: ni };
-          });
-          await runIdeaVeoPass(`[Global ${gPass}/${MAX_GLOBAL}]`);
-          if (pendingTasks.length === 0) addLog(`✅ [Global Retry] Tất cả hoàn thành ở vòng ${gPass}!`, 'success');
-          else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`, 'error');
+        // Global retry: sau khi hoàn thành TẤT CẢ → quay lại retry lỗi 20 lần
+        if (pendingTasks.length > 0) {
+          addLog(`\n🔄 ════ GLOBAL RETRY ════ ${pendingTasks.length} video lỗi → retry ${MAX_GLOBAL_RETRY_I2V} lần...`, 'info');
+          await sleep(3000);
+          const MAX_GLOBAL = 20;
+          for (let gPass = 1; gPass <= MAX_GLOBAL && pendingTasks.length > 0; gPass++) {
+            if (stopRef.current) throw new Error('Đã dừng.');
+            addLog(`🔄 [Global Retry ${gPass}/${MAX_GLOBAL}] ${pendingTasks.length} video vẫn lỗi → thử lại ${MAX_GLOBAL_RETRY_I2V} lần...`, 'info');
+            await sleep(5000);
+            pendingTasks = pendingTasks.map(t => {
+              const ni = `${t.id}_g${gPass}`;
+              veoTaskMap.set(ni, veoTaskMap.get(t.id)); veoTaskMap.delete(t.id);
+              return { ...t, id: ni };
+            });
+            await runIdeaVeoPass(`[Global ${gPass}/${MAX_GLOBAL}]`, MAX_GLOBAL_RETRY_I2V);
+            if (pendingTasks.length === 0) addLog(`✅ [Global Retry] Tất cả hoàn thành ở vòng ${gPass}!`, 'success');
+            else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`, 'error');
+          }
         }
         if (pendingTasks.length > 0)
           addLog(`❌ [Veo] ${pendingTasks.length} video thất bại sau tất cả vòng retry — bỏ qua`, 'error');
@@ -1386,7 +1421,8 @@ function ScriptToVideoPanel() {
       // ── 4. Videos ───────────────────────────────────────────────────────────
       setActive('video'); setActiveTab('video');
       const engineLabel  = 'Veo';
-      const MAX_VIDEO_RETRY = 20;
+      const MAX_FIRST_RETRY_S2V  = 5;
+      const MAX_GLOBAL_RETRY_S2V = 20;
       const vPaths = [];
 
       const buildVideoPrompt = (sceneObj) => {
@@ -1452,37 +1488,51 @@ function ScriptToVideoPanel() {
         // Dedup prompt trùng trước khi gửi
         let pendingTasks = dedupTasksByPrompt(allTasks_s2v, addLog);
 
-        // ── Helper: 1 vòng retry 20 lần ──────────────────────────────────────
-        const runS2VVeoPass = async (passLabel) => {
+        // ── Helper: 1 vòng retry, tham số maxRetry ───────────────────────────
+        const s2vPolicySet = new Set();
+        const runS2VVeoPass = async (passLabel, maxRetry) => {
           const filterPass = makeSubmitGuard();
-          for (let attempt=1; attempt<=MAX_VIDEO_RETRY&&pendingTasks.length>0; attempt++) {
+          for (let attempt=1; attempt<=maxRetry&&pendingTasks.length>0; attempt++) {
             if (stopRef.current) throw new Error('Đã dừng.');
-            if (attempt>1) { addLog(`${passLabel}[Veo] Thử lại lần ${attempt}: ${pendingTasks.length} video...`,'info'); await sleep(10000); }
+            if (attempt>1) { addLog(`${passLabel}[Veo] Thử lại lần ${attempt}/${maxRetry}: ${pendingTasks.length} video...`,'info'); await sleep(10000); }
             const safeTasks=filterPass(pendingTasks,addLog);
             if (!safeTasks.length) break;
             const vr=await window.electronAPI.runVeo({ mediaType:'Video', tasks:safeTasks, aspectRatio:ratio, model:vidMdl, genCount:'1x', quality:vidQuality, outputFolder:vidDir, duration:`${sceneDur}s` });
             const files=vr?.files||[];
             const succeeded=files.filter(f=>!f.isError&&f.filePath);
-            const failedIds=new Set(files.filter(f=>f.isError).map(f=>f.id));
+            const failedFiles=files.filter(f=>f.isError);
+            const failedIds=new Set(failedFiles.map(f=>f.id));
             succeeded.forEach(f=>{ const si=veoTaskMap.get(f.id)??0; orderedVPaths[si]=f.filePath; });
             if (succeeded.length>0) addLog(`✅ ${passLabel}[Veo] Lần ${attempt}: ${succeeded.length}/${safeTasks.length} thành công`,'success');
-            pendingTasks=safeTasks.filter(t=>failedIds.has(t.id)).map(t=>{ const ni=`${t.id}_r${attempt}`; veoTaskMap.set(ni,veoTaskMap.get(t.id)); veoTaskMap.delete(t.id); return {...t,id:ni}; });
-            if (pendingTasks.length>0&&attempt<MAX_VIDEO_RETRY) addLog(`⚠️ ${passLabel}[Veo] ${pendingTasks.length} video lỗi → chờ 10s...`,'error');
+            for (const ff of failedFiles) { if (isPolicyViolation(ff.error)) { s2vPolicySet.add(ff.id); addLog(`🚫 [Chính sách Veo] Vi phạm: "${(ff.error||'').slice(0,80)}" → đổi prompt`, 'error'); } }
+            pendingTasks=safeTasks.filter(t=>failedIds.has(t.id)).map(t=>{
+              const ni=`${t.id}_r${attempt}`; veoTaskMap.set(ni,veoTaskMap.get(t.id)); veoTaskMap.delete(t.id);
+              if (s2vPolicySet.has(t.id)) { s2vPolicySet.delete(t.id); s2vPolicySet.add(ni); const cp=sanitizePrompt(t.prompt); addLog(`🔧 Prompt làm sạch: "${cp.slice(0,70)}..."`, 'info'); return {...t,id:ni,prompt:cp}; }
+              return {...t,id:ni};
+            });
+            if (pendingTasks.length>0&&attempt<maxRetry) addLog(`⚠️ ${passLabel}[Veo] ${pendingTasks.length} video lỗi → chờ 10s...`,'error');
           }
         };
 
-        await runS2VVeoPass('');
+        // Vòng chính — 5 lần, bỏ qua nếu vẫn lỗi
+        addLog(`📋 Tạo ${pendingTasks.length} video — thử ${MAX_FIRST_RETRY_S2V} lần/task`, 'info');
+        await runS2VVeoPass('', MAX_FIRST_RETRY_S2V);
+        if (pendingTasks.length>0) addLog(`⏭️ ${pendingTasks.length} video vẫn lỗi → bỏ qua, tiếp tục`,'warn');
 
-        // Global retry: chạy lại toàn bộ lỗi sau khi hoàn thành tất cả prompt
-        const MAX_GLOBAL_S2V = 20;
-        for (let gPass=1; gPass<=MAX_GLOBAL_S2V&&pendingTasks.length>0; gPass++) {
-          if (stopRef.current) throw new Error('Đã dừng.');
-          addLog(`🔄 [Global Retry ${gPass}/${MAX_GLOBAL_S2V}] ${pendingTasks.length} video vẫn lỗi → thử lại...`,'info');
-          await sleep(5000);
-          pendingTasks=pendingTasks.map(t=>{ const ni=`${t.id}_g${gPass}`; veoTaskMap.set(ni,veoTaskMap.get(t.id)); veoTaskMap.delete(t.id); return {...t,id:ni}; });
-          await runS2VVeoPass(`[Global ${gPass}/${MAX_GLOBAL_S2V}]`);
-          if (pendingTasks.length===0) addLog(`✅ [Global Retry] Tất cả hoàn thành ở vòng ${gPass}!`,'success');
-          else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`,'error');
+        // Global retry sau khi hoàn thành TẤT CẢ
+        if (pendingTasks.length>0) {
+          addLog(`\n🔄 ════ GLOBAL RETRY ════ ${pendingTasks.length} video lỗi → retry ${MAX_GLOBAL_RETRY_S2V} lần...`, 'info');
+          await sleep(3000);
+          const MAX_GLOBAL_S2V = 20;
+          for (let gPass=1; gPass<=MAX_GLOBAL_S2V&&pendingTasks.length>0; gPass++) {
+            if (stopRef.current) throw new Error('Đã dừng.');
+            addLog(`🔄 [Global Retry ${gPass}/${MAX_GLOBAL_S2V}] ${pendingTasks.length} video vẫn lỗi → thử lại ${MAX_GLOBAL_RETRY_S2V} lần...`,'info');
+            await sleep(5000);
+            pendingTasks=pendingTasks.map(t=>{ const ni=`${t.id}_g${gPass}`; veoTaskMap.set(ni,veoTaskMap.get(t.id)); veoTaskMap.delete(t.id); return {...t,id:ni}; });
+            await runS2VVeoPass(`[Global ${gPass}/${MAX_GLOBAL_S2V}]`, MAX_GLOBAL_RETRY_S2V);
+            if (pendingTasks.length===0) addLog(`✅ [Global Retry] Tất cả hoàn thành ở vòng ${gPass}!`,'success');
+            else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`,'error');
+          }
         }
         if (pendingTasks.length>0) addLog(`❌ [Veo] ${pendingTasks.length} video thất bại sau tất cả vòng retry — bỏ qua`,'error');
 
@@ -5108,7 +5158,8 @@ function UrlToVideoPanel() {
 
       addLog(`[Veo] Tạo ${dedupedScenes.length} video · Ingredients · ${langInfo} · DNA pool: ${globalImgPaths.length} ảnh / ${globalMediaIds.length} UUID...`, 'info');
 
-      const MAX_VIDEO_RETRY = 20;
+      const MAX_FIRST_RETRY_U2V  = 5;
+      const MAX_GLOBAL_RETRY_U2V = 20;
       const veoTaskMap = new Map();
       const orderedVPaths = new Array(dedupedScenes.length).fill(null);
 
@@ -5232,12 +5283,13 @@ function UrlToVideoPanel() {
       // Dedup prompt trùng trước khi gửi lần đầu
       pendingTasks = dedupTasksByPrompt(pendingTasks, addLog);
 
-      // ── Helper: 1 vòng retry 20 lần ────────────────────────────────────────
-      const runU2VVeoPass = async (passLabel) => {
+      // ── Helper: 1 vòng retry, tham số maxRetry ───────────────────────────
+      const u2vPolicySet = new Set();
+      const runU2VVeoPass = async (passLabel, maxRetry) => {
         const filterPass = makeSubmitGuard();
-        for (let attempt = 1; attempt <= MAX_VIDEO_RETRY && pendingTasks.length > 0; attempt++) {
+        for (let attempt = 1; attempt <= maxRetry && pendingTasks.length > 0; attempt++) {
           if (stopRef.current) throw new Error('Đã dừng.');
-          if (attempt > 1) { addLog(`${passLabel}[Veo] Thử lại lần ${attempt}: ${pendingTasks.length} video...`, 'info'); await sleep(10000); }
+          if (attempt > 1) { addLog(`${passLabel}[Veo] Thử lại lần ${attempt}/${maxRetry}: ${pendingTasks.length} video...`, 'info'); await sleep(10000); }
           const safeTasks = filterPass(pendingTasks, addLog);
           if (!safeTasks.length) break;
           const vr = await window.electronAPI.runVeo({
@@ -5246,35 +5298,45 @@ function UrlToVideoPanel() {
             outputFolder: vidDir, duration: '8s',
           });
           const files = vr?.files || [];
-          const succeeded = files.filter(f => !f.isError && f.filePath);
-          const failedIds = new Set(files.filter(f => f.isError).map(f => f.id));
+          const succeeded   = files.filter(f => !f.isError && f.filePath);
+          const failedFiles = files.filter(f => f.isError);
+          const failedIds   = new Set(failedFiles.map(f => f.id));
           succeeded.forEach(f => { const idx = veoTaskMap.get(f.id) ?? 0; orderedVPaths[idx] = f.filePath; });
           if (succeeded.length > 0) addLog(`✅ ${passLabel}[Veo] Lần ${attempt}: ${succeeded.length}/${safeTasks.length} thành công`, 'success');
+          for (const ff of failedFiles) { if (isPolicyViolation(ff.error)) { u2vPolicySet.add(ff.id); addLog(`🚫 [Chính sách Veo] Vi phạm: "${(ff.error||'').slice(0,80)}" → đổi prompt`, 'error'); } }
           pendingTasks = safeTasks.filter(t => failedIds.has(t.id)).map(t => {
             const ni = `${t.id}_r${attempt}`;
             veoTaskMap.set(ni, veoTaskMap.get(t.id)); veoTaskMap.delete(t.id);
+            if (u2vPolicySet.has(t.id)) { u2vPolicySet.delete(t.id); u2vPolicySet.add(ni); const cp = sanitizePrompt(t.prompt); addLog(`🔧 Prompt làm sạch: "${cp.slice(0,70)}..."`, 'info'); return { ...t, id: ni, prompt: cp }; }
             return { ...t, id: ni };
           });
-          if (pendingTasks.length > 0 && attempt < MAX_VIDEO_RETRY) addLog(`⚠️ ${passLabel}[Veo] ${pendingTasks.length} video lỗi → chờ 10s...`, 'error');
+          if (pendingTasks.length > 0 && attempt < maxRetry) addLog(`⚠️ ${passLabel}[Veo] ${pendingTasks.length} video lỗi → chờ 10s...`, 'error');
         }
       };
 
-      await runU2VVeoPass('');
+      // Vòng chính — 5 lần
+      addLog(`📋 Tạo ${pendingTasks.length} video — thử ${MAX_FIRST_RETRY_U2V} lần/task`, 'info');
+      await runU2VVeoPass('', MAX_FIRST_RETRY_U2V);
+      if (pendingTasks.length > 0) addLog(`⏭️ ${pendingTasks.length} video vẫn lỗi → bỏ qua, tiếp tục`, 'warn');
 
-      // Global retry: sau khi tất cả hoàn thành, chạy lại toàn bộ lỗi
-      const MAX_GLOBAL_U2V = 20;
-      for (let gPass = 1; gPass <= MAX_GLOBAL_U2V && pendingTasks.length > 0; gPass++) {
-        if (stopRef.current) throw new Error('Đã dừng.');
-        addLog(`🔄 [Global Retry ${gPass}/${MAX_GLOBAL_U2V}] ${pendingTasks.length} video vẫn lỗi → thử lại...`, 'info');
-        await sleep(5000);
-        pendingTasks = pendingTasks.map(t => {
-          const ni = `${t.id}_g${gPass}`;
-          veoTaskMap.set(ni, veoTaskMap.get(t.id)); veoTaskMap.delete(t.id);
-          return { ...t, id: ni };
-        });
-        await runU2VVeoPass(`[Global ${gPass}/${MAX_GLOBAL_U2V}]`);
-        if (pendingTasks.length === 0) addLog(`✅ [Global Retry] Tất cả hoàn thành ở vòng ${gPass}!`, 'success');
-        else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`, 'error');
+      // Global retry sau khi TẤT CẢ xong
+      if (pendingTasks.length > 0) {
+        addLog(`\n🔄 ════ GLOBAL RETRY ════ ${pendingTasks.length} video lỗi → retry ${MAX_GLOBAL_RETRY_U2V} lần...`, 'info');
+        await sleep(3000);
+        const MAX_GLOBAL_U2V = 20;
+        for (let gPass = 1; gPass <= MAX_GLOBAL_U2V && pendingTasks.length > 0; gPass++) {
+          if (stopRef.current) throw new Error('Đã dừng.');
+          addLog(`🔄 [Global Retry ${gPass}/${MAX_GLOBAL_U2V}] ${pendingTasks.length} video vẫn lỗi → thử lại ${MAX_GLOBAL_RETRY_U2V} lần...`, 'info');
+          await sleep(5000);
+          pendingTasks = pendingTasks.map(t => {
+            const ni = `${t.id}_g${gPass}`;
+            veoTaskMap.set(ni, veoTaskMap.get(t.id)); veoTaskMap.delete(t.id);
+            return { ...t, id: ni };
+          });
+          await runU2VVeoPass(`[Global ${gPass}/${MAX_GLOBAL_U2V}]`, MAX_GLOBAL_RETRY_U2V);
+          if (pendingTasks.length === 0) addLog(`✅ [Global Retry] Tất cả hoàn thành ở vòng ${gPass}!`, 'success');
+          else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`, 'error');
+        }
       }
       if (pendingTasks.length > 0) addLog(`❌ [Veo] ${pendingTasks.length} video thất bại sau tất cả vòng retry — bỏ qua`, 'error');
 
@@ -6631,36 +6693,39 @@ Script:
       // ── Batch helper — CÙNG pattern với Veo Studio: gửi tất cả 1 lần, guard chống gửi trùng ──
       // Không dùng BATCH_SIZE — veo-engine tự giới hạn MAX_WORKERS=5 song song
       // Khi retry: đổi task ID mới (_r1, _r2...) → server không nhận nhầm là request cũ
-      const MAX_RETRY = 20;        // số lần thử lại mỗi vòng
-      const MAX_GLOBAL_PASSES = 20; // số vòng global retry sau khi tất cả đã thử 20 lần
+      const MAX_FIRST_RETRY  = 5;  // lần đầu: thử 5 lần rồi bỏ qua, làm video tiếp
+      const MAX_GLOBAL_RETRY = 20; // global: sau khi xong tất cả, retry lỗi 20 lần
+      const MAX_GLOBAL_PASSES = 20; // vòng global tối đa
+
       const runVeoBatch = async (baseParams, tasks, enableGlobalRetry = false) => {
-        // Map taskId → index trong tasks[] gốc (để ghép kết quả về đúng vị trí)
         const taskIdxMap = new Map();
         tasks.forEach((t, i) => taskIdxMap.set(t.id, i));
         const orderedResults = new Array(tasks.length).fill(null);
 
-        // Dedup: loại task trùng prompt+voice+ingredient trước khi gửi
         let pendingTasks = dedupTasksByPrompt([...tasks], addLog);
+        // Theo dõi các task vi phạm chính sách → cần đổi prompt
+        const policyViolatedIds = new Set();
 
-        // ── Helper: chạy 1 vòng retry (tối đa MAX_RETRY lần) ─────────────────
-        const runOnePass = async (passLabel) => {
-          const filterPass = makeSubmitGuard(); // guard mới mỗi pass → ID mới được chấp nhận
-          for (let attempt = 1; attempt <= MAX_RETRY && pendingTasks.length > 0; attempt++) {
+        // ── Helper: chạy 1 vòng retry maxRetry lần ───────────────────────────
+        const runOnePass = async (passLabel, maxRetry) => {
+          const filterPass = makeSubmitGuard();
+          for (let attempt = 1; attempt <= maxRetry && pendingTasks.length > 0; attempt++) {
             if (stopRef.current) throw new Error('Đã dừng.');
             if (attempt > 1) {
-              addLog(`🔄 ${passLabel} Thử lại ${pendingTasks.length} task (lần ${attempt}/${MAX_RETRY}) — chờ 10s...`, 'info');
+              addLog(`🔄 ${passLabel} Thử lại ${pendingTasks.length} task (lần ${attempt}/${maxRetry}) — chờ 10s...`, 'info');
               await sleep(10000);
             }
 
             const safeTasks = filterPass(pendingTasks, addLog);
             if (!safeTasks.length) { addLog('⚠️ Tất cả task đã gửi — bỏ qua retry', 'info'); break; }
 
-            addLog(`📤 ${passLabel} Gửi ${safeTasks.length} task lên Veo (lần ${attempt})...`, 'info');
+            addLog(`📤 ${passLabel} Gửi ${safeTasks.length} task lên Veo (lần ${attempt}/${maxRetry})...`, 'info');
             const r = await window.electronAPI.runVeo({ ...baseParams, tasks: safeTasks });
             const files = r?.files || [];
 
             const succeeded = files.filter(f => !f.isError && f.filePath);
-            const failedIds = new Set(files.filter(f => f.isError).map(f => f.id));
+            const failedFiles = files.filter(f => f.isError);
+            const failedIds   = new Set(failedFiles.map(f => f.id));
 
             succeeded.forEach(f => {
               const idx = taskIdxMap.get(f.id);
@@ -6670,37 +6735,60 @@ Script:
             if (succeeded.length > 0)
               addLog(`✅ ${passLabel} Lần ${attempt}: ${succeeded.length}/${safeTasks.length} thành công`, 'success');
 
+            // ── Detect & xử lý vi phạm chính sách ─────────────────────────
+            for (const ff of failedFiles) {
+              if (isPolicyViolation(ff.error)) {
+                policyViolatedIds.add(ff.id);
+                addLog(`🚫 [Chính sách Veo] Task ${ff.id} vi phạm: "${(ff.error || '').slice(0, 100)}" → sẽ đổi prompt an toàn`, 'error');
+              }
+            }
+
             pendingTasks = safeTasks
               .filter(t => failedIds.has(t.id))
               .map(t => {
                 const newId = `${t.id}_r${attempt}`;
-                taskIdxMap.set(newId, taskIdxMap.get(t.id));
+                const origIdx = taskIdxMap.get(t.id);
+                taskIdxMap.set(newId, origIdx);
                 taskIdxMap.delete(t.id);
+                // Nếu vi phạm chính sách → sanitize prompt cho lần retry
+                const wasViolation = policyViolatedIds.has(t.id);
+                if (wasViolation) {
+                  policyViolatedIds.delete(t.id);
+                  policyViolatedIds.add(newId);
+                  const cleanedPrompt = sanitizePrompt(t.prompt);
+                  addLog(`🔧 Prompt đã làm sạch: "${cleanedPrompt.slice(0, 80)}..."`, 'info');
+                  return { ...t, id: newId, prompt: cleanedPrompt };
+                }
                 return { ...t, id: newId };
               });
 
-            if (pendingTasks.length > 0 && attempt < MAX_RETRY)
+            if (pendingTasks.length > 0 && attempt < maxRetry)
               addLog(`⚠️ ${passLabel} ${pendingTasks.length} task lỗi → thử lại lần ${attempt + 1}...`, 'info');
           }
         };
 
-        // ── Vòng chính ────────────────────────────────────────────────────────
-        await runOnePass('');
+        // ── Vòng chính: thử 5 lần rồi bỏ qua, làm video tiếp ────────────────
+        addLog(`📋 Bắt đầu tạo ${pendingTasks.length} video (thử tối đa ${MAX_FIRST_RETRY} lần/task, bỏ qua nếu vẫn lỗi)...`, 'info');
+        await runOnePass('', MAX_FIRST_RETRY);
 
-        // ── Global retry: chạy lại toàn bộ lỗi sau khi hoàn thành tất cả ───
-        if (enableGlobalRetry) {
+        if (pendingTasks.length > 0)
+          addLog(`⏭️ ${pendingTasks.length} task vẫn lỗi sau ${MAX_FIRST_RETRY} lần → bỏ qua, tiếp tục video khác`, 'warn');
+
+        // ── Global retry: sau khi hoàn thành TẤT CẢ → retry lỗi 20 lần ────
+        if (enableGlobalRetry && pendingTasks.length > 0) {
+          addLog(`\n🔄 ════ GLOBAL RETRY ════ Bắt đầu chạy lại ${pendingTasks.length} task lỗi (${MAX_GLOBAL_PASSES} vòng × ${MAX_GLOBAL_RETRY} lần)...`, 'info');
+          await sleep(3000);
           for (let gPass = 1; gPass <= MAX_GLOBAL_PASSES && pendingTasks.length > 0; gPass++) {
             if (stopRef.current) throw new Error('Đã dừng.');
-            addLog(`🔄 [Global Retry ${gPass}/${MAX_GLOBAL_PASSES}] ${pendingTasks.length} task vẫn lỗi → thử lại ${MAX_RETRY} lần...`, 'info');
+            addLog(`🔄 [Global Retry ${gPass}/${MAX_GLOBAL_PASSES}] ${pendingTasks.length} task vẫn lỗi → thử lại ${MAX_GLOBAL_RETRY} lần...`, 'info');
             await sleep(5000);
-            // Đổi ID mới để guard của pass mới chấp nhận
             pendingTasks = pendingTasks.map(t => {
               const ni = `${t.id}_g${gPass}`;
               taskIdxMap.set(ni, taskIdxMap.get(t.id));
               taskIdxMap.delete(t.id);
               return { ...t, id: ni };
             });
-            await runOnePass(`[Global ${gPass}/${MAX_GLOBAL_PASSES}]`);
+            await runOnePass(`[Global ${gPass}/${MAX_GLOBAL_PASSES}]`, MAX_GLOBAL_RETRY);
             if (pendingTasks.length === 0)
               addLog(`✅ [Global Retry] Tất cả hoàn thành ở vòng ${gPass}!`, 'success');
             else
@@ -6709,9 +6797,8 @@ Script:
         }
 
         if (pendingTasks.length > 0)
-          addLog(`❌ ${pendingTasks.length} task thất bại sau tất cả các vòng retry — bỏ qua`, 'error');
+          addLog(`❌ ${pendingTasks.length} task thất bại sau tất cả vòng retry — bỏ qua`, 'error');
 
-        // Map kết quả về theo task ID gốc (trước khi đổi ID retry)
         const resultMap = {};
         tasks.forEach((t, i) => { if (orderedResults[i]) resultMap[t.id] = orderedResults[i]; });
         return resultMap;

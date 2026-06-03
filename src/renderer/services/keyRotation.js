@@ -52,13 +52,17 @@ export async function retryWithKeyRotation(fn, apiKeys, { onSwitch, maxCycles = 
         keysTriedThisCycle++;
         retries503 = 0;
 
+        // Delay nhỏ giữa các key switch để tránh hammer Gemini
+        // (không delay nếu chỉ có 1 key)
+        if (keys.length > 1) await sleep(150);
+
         // Đã thử hết tất cả keys trong vòng này
         if (keysTriedThisCycle >= keys.length) {
           cycles++;
           keysTriedThisCycle = 0;
 
           if (cycles < maxCycles) {
-            // Chờ ngắn rồi thử lại từ đầu — cho phép rate-limit per-minute reset
+            // Chờ rồi thử lại từ đầu — cho phép rate-limit per-minute reset
             const waitMs = 15000 + 10000 * (cycles - 1); // 15s, 25s, 35s, 45s
             console.warn(
               `[KeyRotation] Đã thử ${keys.length} keys, tất cả bị giới hạn. ` +

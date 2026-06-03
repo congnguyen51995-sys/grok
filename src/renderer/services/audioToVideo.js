@@ -131,7 +131,7 @@ export async function transcribeAudio(apiKeys, base64, mimeType, onSwitch) {
       segments.push({ start: 0, end: -1, text: fullText });
     }
     return { fullText, segments };
-  // maxCycles: 2 — tối đa 2 vòng key rotation.
+  // maxCycles: 2 — transcription quan trọng, cho phép 2 vòng
   // TRANSCRIBE_TIMEOUT là "lỗi khác" → keyRotation throw ngay, retryOnError xử lý retry.
   }, apiKeys, { onSwitch, maxCycles: 2 });
 }
@@ -457,7 +457,8 @@ Return ONLY valid JSON (no markdown):
     const parsed = extractFirstJSON(raw.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim());
     if (!parsed) throw new Error(`Không parse được JSON phân tích tổng quát: ${raw.slice(0, 200)}`);
     return parsed;
-  }, apiKeys, { onSwitch });
+  // maxCycles: 1 — overall analysis: thử mỗi key 1 lần, fail fast để không đốt quota
+  }, apiKeys, { onSwitch, maxCycles: 1 });
 }
 
 // ─── 4. Tạo Veo prompt cho 1 chunk ───────────────────────────────────────────
@@ -576,7 +577,8 @@ REMINDER: Include ALL 9 required elements — Subject, Environment, Camera Movem
     if (!prompt.toLowerCase().includes('cinematic') && prompt.length < 80)
       throw new Error('Prompt quá ngắn hoặc bị cắt — thử lại');
     return prompt;
-  }, apiKeys, { onSwitch });
+  // maxCycles: 1 — prompt gen: thử mỗi key 1 lần, skip nếu tất cả fail (không đốt quota)
+  }, apiKeys, { onSwitch, maxCycles: 1 });
 }
 
 // ─── 5a. Tạo Veo prompt cho nhiều scene trong 1 API call ─────────────────────
@@ -686,7 +688,8 @@ No markdown, no extra text, no explanation outside the JSON array.`;
     return prompts.map(p =>
       String(p).replace(/^["']|["']$/g, '').trim()
     );
-  }, apiKeys, { onSwitch });
+  // maxCycles: 1 — batch prompt gen: 1 vòng qua tất cả key, fail fast
+  }, apiKeys, { onSwitch, maxCycles: 1 });
 }
 
 // ─── 5b. Xử lý toàn bộ chunks — dynamic batch + parallel 2, fallback đơn lẻ ──
@@ -837,7 +840,7 @@ Return ONLY a JSON array of exactly ${batch.length} keyword strings:
         for (let j = 0; j < batch.length; j++) {
           results[i + j] = (arr[j] || '').trim() || fallbackKw(i + j);
         }
-      }, apiKeys, {});
+      }, apiKeys, { maxCycles: 1 });
     } catch (e) {
       // Fallback đơn giản từ transcript text
       for (let j = 0; j < batch.length; j++) {

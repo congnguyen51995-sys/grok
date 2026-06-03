@@ -223,6 +223,98 @@ function applyVeoPolicy(prompt) {
   return p + VEO_SAFE_SUFFIX;
 }
 
+// ── Escalating prompt repair — 4 cấp độ ngày càng mạnh hơn ──────────────────
+// Gọi khi prompt vi phạm chính sách Veo ngay cả sau khi sanitizePrompt()
+function getEscalatedPrompt(originalPrompt, level) {
+  const base = (originalPrompt || '').trim();
+
+  if (level === 1) {
+    // Level 1: sanitize thông thường (thay từ + suffix)
+    return sanitizePrompt(base);
+  }
+
+  if (level === 2) {
+    // Level 2: giữ chỉ các yếu tố cinematic an toàn, loại bỏ narrative
+    const safeFragments = base.split(/[,;.]+/).map(s => s.trim()).filter(s => {
+      const lo = s.toLowerCase();
+      return /\b(camera|shot|lighting|color|lens|drone|aerial|pan|zoom|track|dolly|crane|close.up|wide|angle|cinematic|documentary|morning|sunset|golden.hour|soft|natural|studio|4k|16.9|landscape|cityscape|nature|forest|ocean|mountain|urban|sky|interior|exterior|slow|smooth|subtle)\b/.test(lo)
+        && !/\b(blood|gore|weapon|gun|knife|murder|kill|nude|naked|sexual|drug|bomb|terror)\b/.test(lo);
+    });
+    const cleanBase = safeFragments.slice(0, 4).join(', ') || 'cinematic establishing shot';
+    return `${cleanBase}, smooth camera movement, warm natural lighting, soft color palette, cinematic style, no people or characters, peaceful atmosphere, safe for all audiences, family-friendly, aspect ratio 16:9, cinematic shot`;
+  }
+
+  if (level === 3) {
+    // Level 3: chỉ giữ mood + setting, thay thế hoàn toàn nội dung nhạy cảm
+    const moodMap = { dramatic: 'tense cinematic', uplifting: 'inspiring sunrise', mysterious: 'foggy atmospheric', epic: 'vast mountain panorama', serene: 'peaceful nature', tense: 'dramatic storm clouds', emotional: 'golden hour landscape', dark: 'moody forest' };
+    const moodMatch = base.match(/\b(dramatic|uplifting|mysterious|epic|serene|tense|emotional|dark|peaceful|vibrant)\b/i);
+    const mood = moodMatch ? (moodMap[moodMatch[1].toLowerCase()] || moodMatch[1]) : 'cinematic';
+    const settingMatch = base.match(/\b(city|urban|nature|forest|ocean|sea|mountain|hill|indoor|office|street|sky|space|desert|field|garden)\b/i);
+    const setting = settingMatch ? settingMatch[1] : 'landscape';
+    return `Wide aerial ${mood} shot over a beautiful ${setting}, slow drone gliding forward, golden hour warm lighting, cinematic color grade with rich oranges and blues, documentary visual style, no people, ambient nature sounds, safe for all audiences, family-friendly, aspect ratio 16:9, cinematic shot`;
+  }
+
+  // Level 4: pure generic fallback — 100% an toàn
+  return 'Wide aerial establishing shot of a beautiful natural landscape with rolling green hills and valleys, slow smooth cinematic drone pan across the scenery, golden hour warm sunlight, rich warm color palette, documentary cinematic style, no people or characters, peaceful serene atmosphere, ambient bird and wind sounds, safe for all audiences, family-friendly, no violent or adult content, aspect ratio 16:9, cinematic shot';
+}
+
+// ── Policy Repair Loop — chạy cho từng task vi phạm cho đến khi ra kết quả ──
+// Gọi sau khi tất cả retry thông thường đã xong, còn task vi phạm chính sách
+// repairMap: Map<taskId, sceneIdx> — để biết lưu kết quả vào đâu
+// resultArray: mảng output (orderedVPaths / orderedResults)
+// veoRunFn: async (task) => { files: [{id, filePath, isError, error}] }
+async function runPolicyRepairLoop(repairTasks, repairMap, resultArray, veoRunFn, addLog, stopRef) {
+  if (!repairTasks?.length) return;
+  addLog(`\n🔧 ════ POLICY REPAIR ════ Sửa đổi + chạy lại ${repairTasks.length} prompt vi phạm...`, 'info');
+
+  for (let i = 0; i < repairTasks.length; i++) {
+    if (stopRef?.current) return;
+    const task = repairTasks[i];
+    const sceneIdx = repairMap.get(task.id);
+    let success = false;
+
+    addLog(`🔧 [Repair ${i + 1}/${repairTasks.length}] Prompt gốc: "${(task.prompt || '').slice(0, 60)}..."`, 'info');
+
+    for (let level = 1; level <= 4 && !success; level++) {
+      if (stopRef?.current) return;
+      const repairedPrompt = getEscalatedPrompt(task.prompt, level);
+      const repairId = `${task.id}_repair_L${level}_${Date.now()}`;
+
+      addLog(`  ↳ Level ${level}: "${repairedPrompt.slice(0, 70)}..."`, 'info');
+
+      try {
+        const vr = await veoRunFn({ ...task, id: repairId, prompt: repairedPrompt });
+        const files = vr?.files || [];
+        const won   = files.filter(f => !f.isError && f.filePath);
+
+        if (won.length > 0) {
+          const result = won[0];
+          if (sceneIdx !== undefined && resultArray) {
+            // resultArray có thể chứa filePath (string) hoặc object (Storyboard)
+            resultArray[sceneIdx] = result.filePath ?? result;
+          }
+          addLog(`✅ [Repair ${i + 1}] Thành công Level ${level}! → ${(result.filePath || '').split(/[\\/]/).pop()}`, 'success');
+          success = true;
+        } else {
+          const err = files[0]?.error || '';
+          const stillPolicy = isPolicyViolation(err);
+          addLog(`  Level ${level} thất bại${stillPolicy ? ' (vẫn vi phạm chính sách)' : ` — ${err.slice(0, 60)}`} → thử level cao hơn...`, 'error');
+          await new Promise(r => setTimeout(r, 5000));
+        }
+      } catch (e) {
+        addLog(`  Level ${level} lỗi: ${e.message} → thử level cao hơn...`, 'error');
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+
+    if (!success) {
+      addLog(`⚠️ [Repair ${i + 1}] Không thể sửa được prompt sau 4 cấp độ — bỏ qua task này`, 'error');
+    }
+  }
+
+  addLog(`✅ Policy Repair hoàn tất`, 'success');
+}
+
 // Phát hiện giới tính nhân vật từ ID + mô tả
 function detectCharGender(charId = '', description = '') {
   const text = `${charId} ${description}`.toLowerCase();
@@ -743,8 +835,16 @@ function IdeaToVideoPanel() {
             else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`, 'error');
           }
         }
-        if (pendingTasks.length > 0)
-          addLog(`❌ [Veo] ${pendingTasks.length} video thất bại sau tất cả vòng retry — bỏ qua`, 'error');
+        // Policy Repair: sửa đổi prompt vi phạm cho đến khi ra kết quả
+        if (pendingTasks.length > 0) {
+          addLog(`❌ ${pendingTasks.length} video vẫn lỗi — chạy Policy Repair...`, 'error');
+          const repMap = new Map(pendingTasks.map(t => [t.id, veoTaskMap.get(t.id)]));
+          await runPolicyRepairLoop(
+            pendingTasks, repMap, orderedVPaths,
+            async (task) => window.electronAPI.runVeo({ mediaType:'Video', tasks:[task], aspectRatio:ratio, model:vidMdl, genCount:'1x', quality:vidQuality, outputFolder:vidDir, duration:`${sceneDur}s` }),
+            addLog, stopRef
+          );
+        }
 
         // Đẩy vào vPaths theo đúng thứ tự cảnh
         const sortedVeo = orderedVPaths.filter(Boolean);
@@ -1574,7 +1674,12 @@ function ScriptToVideoPanel() {
             else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`,'error');
           }
         }
-        if (pendingTasks.length>0) addLog(`❌ [Veo] ${pendingTasks.length} video thất bại sau tất cả vòng retry — bỏ qua`,'error');
+        // Policy Repair
+        if (pendingTasks.length>0) {
+          addLog(`❌ ${pendingTasks.length} video vẫn lỗi — chạy Policy Repair...`,'error');
+          const rpMap=new Map(pendingTasks.map(t=>[t.id,veoTaskMap.get(t.id)]));
+          await runPolicyRepairLoop(pendingTasks,rpMap,orderedVPaths,async(task)=>window.electronAPI.runVeo({mediaType:'Video',tasks:[task],aspectRatio:ratio,model:vidMdl,genCount:'1x',quality:vidQuality,outputFolder:vidDir,duration:`${sceneDur}s`}),addLog,stopRef);
+        }
 
         const sortedVeo=orderedVPaths.filter(Boolean);
         sortedVeo.forEach(p=>vPaths.push(p)); setVideoPaths(sortedVeo);
@@ -2620,7 +2725,14 @@ function AudioToVideoPanel() {
               else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`, 'error');
             }
           }
-          if (pendingTasks.length > 0) addLog(`❌ ${pendingTasks.length} video thất bại sau tất cả vòng retry`, 'error');
+          // Policy Repair — sửa đổi prompt vi phạm cho đến khi ra kết quả
+          if (pendingTasks.length > 0) {
+            addLog(`❌ ${pendingTasks.length} video vẫn lỗi — chạy Policy Repair...`, 'error');
+            const rpMap = new Map(pendingTasks.map(t => [t.id, a2vTaskMap.get(t.id)]));
+            await runPolicyRepairLoop(pendingTasks, rpMap, orderedA2VPaths,
+              async (task) => window.electronAPI.runVeo({ mediaType:'Video', tasks:[task], aspectRatio:_vidRatio, model:_vidModel, genCount:'1x', quality:_vidQuality, outputFolder:_vidDir, duration:`${_vidSceneDur}s` }),
+              addLog, stopRef);
+          }
 
           orderedA2VPaths.filter(Boolean).forEach(p => { vPaths.push(p); setVideoPaths(prev => [...prev, p]); });
         }
@@ -5422,7 +5534,14 @@ function UrlToVideoPanel() {
           else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`, 'error');
         }
       }
-      if (pendingTasks.length > 0) addLog(`❌ [Veo] ${pendingTasks.length} video thất bại sau tất cả vòng retry — bỏ qua`, 'error');
+      // Policy Repair
+      if (pendingTasks.length > 0) {
+        addLog(`❌ ${pendingTasks.length} video vẫn lỗi — chạy Policy Repair...`, 'error');
+        const rpMap = new Map(pendingTasks.map(t => [t.id, veoTaskMap.get(t.id)]));
+        await runPolicyRepairLoop(pendingTasks, rpMap, orderedVPaths,
+          async (task) => window.electronAPI.runVeo({ mediaType:'Video', tasks:[task], aspectRatio:ratio, model:vidMdl, genCount:'1x', quality:vidQuality, outputFolder:vidDir, duration:'8s' }),
+          addLog, stopRef);
+      }
 
       const sortedVeo = orderedVPaths.filter(Boolean);
       setVideoPaths(sortedVeo);
@@ -6885,8 +7004,17 @@ Script:
           }
         }
 
-        if (pendingTasks.length > 0)
-          addLog(`❌ ${pendingTasks.length} task thất bại sau tất cả vòng retry — bỏ qua`, 'error');
+        // ── Policy Repair Loop: sửa đổi prompt vi phạm cho đến khi ra kết quả ──
+        if (pendingTasks.length > 0) {
+          addLog(`❌ ${pendingTasks.length} task thất bại sau tất cả vòng retry — chạy Policy Repair...`, 'error');
+          const repairMap = new Map();
+          pendingTasks.forEach(t => repairMap.set(t.id, taskIdxMap.get(t.id)));
+          await runPolicyRepairLoop(
+            pendingTasks, repairMap, orderedResults,
+            async (task) => window.electronAPI.runVeo({ ...baseParams, tasks: [task] }),
+            addLog, stopRef
+          );
+        }
 
         const resultMap = {};
         tasks.forEach((t, i) => { if (orderedResults[i]) resultMap[t.id] = orderedResults[i]; });

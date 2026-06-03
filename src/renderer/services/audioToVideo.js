@@ -457,8 +457,8 @@ Return ONLY valid JSON (no markdown):
     const parsed = extractFirstJSON(raw.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim());
     if (!parsed) throw new Error(`Không parse được JSON phân tích tổng quát: ${raw.slice(0, 200)}`);
     return parsed;
-  // maxCycles: 1 — overall analysis: thử mỗi key 1 lần, fail fast để không đốt quota
-  }, apiKeys, { onSwitch, maxCycles: 1 });
+  // maxCycles: 2 — thử hết key 1 lần, chờ 15s, thử lại 1 lần nữa (66 calls max vs 165 cũ)
+  }, apiKeys, { onSwitch, maxCycles: 2 });
 }
 
 // ─── 4. Tạo Veo prompt cho 1 chunk ───────────────────────────────────────────
@@ -577,8 +577,8 @@ REMINDER: Include ALL 9 required elements — Subject, Environment, Camera Movem
     if (!prompt.toLowerCase().includes('cinematic') && prompt.length < 80)
       throw new Error('Prompt quá ngắn hoặc bị cắt — thử lại');
     return prompt;
-  // maxCycles: 1 — prompt gen: thử mỗi key 1 lần, skip nếu tất cả fail (không đốt quota)
-  }, apiKeys, { onSwitch, maxCycles: 1 });
+  // maxCycles: 2 — 66 calls max (giảm từ 165), có 1 lần chờ 15s để rate-limit reset
+  }, apiKeys, { onSwitch, maxCycles: 2 });
 }
 
 // ─── 5a. Tạo Veo prompt cho nhiều scene trong 1 API call ─────────────────────
@@ -688,8 +688,31 @@ No markdown, no extra text, no explanation outside the JSON array.`;
     return prompts.map(p =>
       String(p).replace(/^["']|["']$/g, '').trim()
     );
-  // maxCycles: 1 — batch prompt gen: 1 vòng qua tất cả key, fail fast
-  }, apiKeys, { onSwitch, maxCycles: 1 });
+  // maxCycles: 2 — 66 calls max, có 1 chờ 15s giữa 2 vòng
+  }, apiKeys, { onSwitch, maxCycles: 2 });
+}
+
+// ─── Tạo fallback prompt từ dialogue khi tất cả key fail ─────────────────────
+// Dùng chính text của chunk để prompt vẫn liên quan đến audio, không bị lệch cảnh
+function buildFallbackPrompt(chunk) {
+  const text = (chunk.exactText || '').trim();
+  const isSilent = !text || text.startsWith('[Không') || text.startsWith('[No') || text.length < 5;
+
+  if (isSilent) {
+    return 'Cinematic wide establishing shot with smooth dolly movement, warm natural lighting, calm documentary visual style, peaceful ambient setting, no people, safe for all audiences, family-friendly, aspect ratio 16:9, cinematic shot';
+  }
+
+  // Dùng tối đa 120 ký tự đầu của dialogue làm visual concept
+  const concept = text.slice(0, 120).replace(/["""'']/g, '').trim();
+
+  // Xác định tone từ nội dung
+  const lower = concept.toLowerCase();
+  const isQuestion  = lower.includes('?') || lower.match(/\b(what|why|how|when|where|who|did|do|does|is|are|was|were)\b/);
+  const isExcited   = lower.includes('!') || lower.match(/\b(amazing|incredible|fantastic|great|best|love|excited|happy|yes)\b/);
+  const isSerious   = lower.match(/\b(problem|issue|challenge|difficult|hard|fail|wrong|bad|crisis|important)\b/);
+  const mood = isExcited ? 'uplifting cinematic' : isSerious ? 'dramatic cinematic' : isQuestion ? 'curious exploratory' : 'smooth cinematic';
+
+  return `${mood} scene conveying the essence of: "${concept}". Medium shot with smooth camera movement, warm natural lighting, relevant symbolic or environmental imagery matching the mood and topic, clean professional framing, no text on screen, no real people or celebrities, safe for all audiences, family-friendly, aspect ratio 16:9, cinematic shot`;
 }
 
 // ─── 5b. Xử lý toàn bộ chunks — dynamic batch + parallel 2, fallback đơn lẻ ──
@@ -764,11 +787,12 @@ export async function analyzeScenes(apiKeys, chunks, targetDuration, overallCont
           results[absIdx] = sceneData;
           onSceneReady?.(sceneData, false);
         } catch (e) {
+          // Fallback dùng dialogue text để prompt vẫn khớp với audio tại timestamp này
           const fallback = {
             sceneNumber:    chunk.scene,
             timeEstimation: chunk.time,
             dialogue:       chunk.exactText,
-            veoVideoPrompt: 'Cinematic establishing shot, smooth camera movement, aspect ratio 16:9, cinematic shot',
+            veoVideoPrompt: buildFallbackPrompt(chunk),
             error:          e.message,
           };
           results[absIdx] = fallback;
@@ -840,7 +864,7 @@ Return ONLY a JSON array of exactly ${batch.length} keyword strings:
         for (let j = 0; j < batch.length; j++) {
           results[i + j] = (arr[j] || '').trim() || fallbackKw(i + j);
         }
-      }, apiKeys, { maxCycles: 1 });
+      }, apiKeys, { maxCycles: 2 });
     } catch (e) {
       // Fallback đơn giản từ transcript text
       for (let j = 0; j < batch.length; j++) {

@@ -259,6 +259,9 @@ Generate EXACTLY ${toScene - fromScene + 1} scene objects for scenes ${fromScene
 Scene ${fromScene} timestamp starts at ${(fromScene - 1) * config.sceneDuration}s. Each scene = ${config.sceneDuration}s.
 ${dialogueRules}
 
+🚫 VEO CONTENT POLICY (MANDATORY — ZERO EXCEPTIONS):
+RULE POLICY — ALL final_prompt values MUST comply with Google Veo's content policy. You MUST NOT generate prompts that describe: graphic violence, blood, gore, weapons used violently, murder, torture, execution, decapitation, or any other graphic harm; adult/sexual content, nudity, explicit or erotic scenes; hate speech, racism, discrimination; drug use or manufacture; terrorism, bombs, mass violence. Instead, describe scenes in a cinematic, tasteful, family-friendly manner. Replace any sensitive content with neutral, safe alternatives (e.g., "intense confrontation" instead of "bloody fight", "dramatic tension" instead of "murder scene"). Every prompt MUST be suitable for general audiences.
+
 ⚠️ NO TEXT ON SCREEN (ABSOLUTE — NO EXCEPTIONS):
 RULE F — NEVER include text overlays, captions, subtitles, watermarks, titles, labels, or any written text rendered visually on the frame. Even when a character speaks dialogue, the spoken text MUST be audio-only — it MUST NOT appear as subtitle, caption, or any readable text on the video frame. Dialogue is voice synthesis, NOT text overlay. Physical props (signs, books, documents) may be described as props but never as text rendered on screen.
 RULE G — final_prompt closing tail (mandatory for ALL scenes — two variants):

@@ -166,6 +166,9 @@ MỤC TIÊU: ${goal} | GIỌNG ĐIỆU: ${tone}${charBlock ? '\n' + charBlock : 
 `Bạn là nhà biên kịch và đạo diễn điện ảnh chuyên nghiệp.
 ${baseInfo}
 ---
+🚫 CHÍNH SÁCH NỘI DUNG VEO (BẮT BUỘC — KHÔNG NGOẠI LỆ):
+Kịch bản phải tuân thủ chính sách nội dung của Google Veo. TUYỆT ĐỐI KHÔNG mô tả: bạo lực đồ họa/máu me/gore, vũ khí được sử dụng bạo lực, cảnh giết người chi tiết, tra tấn, hành quyết; nội dung người lớn/tình dục/khỏa thân; phát ngôn thù ghét/phân biệt chủng tộc; ma túy/khủng bố/bom mìn; hình ảnh gây rối loạn tâm lý. Thay thế bằng cách mô tả điện ảnh an toàn, phù hợp khán giả chung (VD: "đối đầu căng thẳng" thay vì "cảnh đánh nhau đẫm máu").
+---
 ## PHẦN 1: PROJECT BIBLE
 
 **LOGLINE:** [2–3 câu: cốt truyện + cao trào + thông điệp]

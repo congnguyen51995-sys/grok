@@ -170,17 +170,57 @@ const VOICE_POOL_NEUTRAL = VOICE_POOL.filter(v => v.gender === 'neutral');
 // ── Policy violation helpers ─────────────────────────────────────────────────
 const POLICY_REGEX = /safety|policy|violat|content.?filter|inappropriat|harmful|prohibited|blocked|community.?guideline|terms.of.service|unable.to.generate|cannot.generate|not.able.to|restricted|flagged|adult.content|nsfw|explicit/i;
 
+// Suffix an toàn — thêm vào TẤT CẢ prompt gửi Veo để tránh vi phạm chính sách
+const VEO_SAFE_SUFFIX = ', safe for all audiences, family-friendly, no graphic violence, no blood or gore, no adult or sexual content, no nudity, no weapons displayed aggressively, no disturbing imagery, tasteful and cinematic, appropriate for general viewing';
+
 function isPolicyViolation(errorMsg) {
   return POLICY_REGEX.test(errorMsg || '');
 }
 
-// Xử lý prompt vi phạm chính sách: xóa từ nhạy cảm + thêm hậu tố an toàn
+// Làm sạch prompt vi phạm: thay từ nhạy cảm + đảm bảo có safe suffix
 function sanitizePrompt(prompt) {
-  const BANNED = /\b(blood|gore|violent(ly)?|weapon|gun|knife|sword|murder|kill(ing)?|death|corpse|nude|naked|explicit|sexual|erotic|adult|nsfw|hate|racist|discrimination|drug|bomb|terrorist)\b/gi;
-  const SAFE_SUFFIX = ', safe for all audiences, family-friendly, cinematic, tasteful, no graphic content, no explicit material, appropriate for general viewing';
-  let cleaned = (prompt || '').replace(BANNED, '').replace(/\s{2,}/g, ' ').trim();
-  if (!cleaned.toLowerCase().includes('safe for all')) cleaned += SAFE_SUFFIX;
+  if (!prompt) return '';
+  // Thay từ nhạy cảm bằng mô tả trung tính (không xóa hẳn để tránh câu vô nghĩa)
+  const BANNED_MAP = [
+    [/\bblood(?:y|ied)?\b/gi,           'dramatic scene'],
+    [/\bgore\b/gi,                        'intense moment'],
+    [/\bviolent(?:ly)?\b/gi,             'intense'],
+    [/\bweapons?\b/gi,                    'objects'],
+    [/\bguns?\b/gi,                       'equipment'],
+    [/\bkni(?:fe|ves)\b/gi,              'tool'],
+    [/\bswords?\b/gi,                     'prop'],
+    [/\bmurder\b/gi,                      'dramatic confrontation'],
+    [/\bkill(?:ing|ed|er)?\b/gi,         'defeat'],
+    [/\bcorpse\b/gi,                      'figure'],
+    [/\bnude\b|\bnaked\b/gi,             'person'],
+    [/\bexplicit\b|\berotic\b/gi,        'dramatic'],
+    [/\bsexual\b|\bnsfw\b/gi,            'emotional'],
+    [/\bhate.speech\b/gi,                'argument'],
+    [/\bterrorist?\b/gi,                  'character'],
+    [/\bbomb\b/gi,                        'object'],
+    [/\btorture\b/gi,                     'difficult scene'],
+    [/\bexecut(?:e|ion|ed)\b/gi,         'dramatic scene'],
+    [/\bslaughter\b|\bmassacre\b/gi,     'dramatic event'],
+    [/\bdecapitat\w*/gi,                  'action scene'],
+  ];
+  let cleaned = prompt;
+  BANNED_MAP.forEach(([regex, replacement]) => {
+    cleaned = cleaned.replace(regex, replacement);
+  });
+  cleaned = cleaned.replace(/\s{2,}/g, ' ').trim();
+  // Thêm safe suffix nếu chưa có
+  if (!cleaned.toLowerCase().includes('safe for all') && !cleaned.toLowerCase().includes('family-friendly')) {
+    cleaned += VEO_SAFE_SUFFIX;
+  }
   return cleaned;
+}
+
+// Áp dụng safe suffix vào prompt khi tạo task lần đầu (không thay từ, chỉ thêm suffix)
+function applyVeoPolicy(prompt) {
+  if (!prompt) return '';
+  const p = prompt.trim();
+  if (p.toLowerCase().includes('safe for all') || p.toLowerCase().includes('family-friendly')) return p;
+  return p + VEO_SAFE_SUFFIX;
 }
 
 // Phát hiện giới tính nhân vật từ ID + mô tả
@@ -614,7 +654,7 @@ function IdeaToVideoPanel() {
             sceneEnvId ? envImgMap[sceneEnvId] : null,
             ...sceneObjIds.map(id => objImgMap[id]),
           ].filter(Boolean);
-          const task = { id: tid, prompt: buildVideoPrompt(s) };
+          const task = { id: tid, prompt: applyVeoPolicy(buildVideoPrompt(s)) };
           const speakChar = sceneCharIds.find(id => charVoiceMap[id] && (charMediaMap[id] || charImgMap[id]));
           if (speakChar) {
             task.voiceId = charVoiceMap[speakChar];
@@ -1468,7 +1508,7 @@ function ScriptToVideoPanel() {
             sceneEnvId?envImgMap[sceneEnvId]:null,
             ...sceneObjIds.map(id=>objImgMap[id]),
           ].filter(Boolean);
-          const task={ id:tid, prompt:buildVideoPrompt(s) };
+          const task={ id:tid, prompt:applyVeoPolicy(buildVideoPrompt(s)) };
           const speakChar=sceneCharIds.find(id=>charVoiceMap[id]&&(charMediaMap[id]||charImgMap[id]));
           if (speakChar) {
             task.voiceId=charVoiceMap[speakChar];
@@ -5249,7 +5289,7 @@ function UrlToVideoPanel() {
         const charLockArr  = Array.isArray(scene.character_lock) ? scene.character_lock : [];
         const sceneCharIds = charLockArr.map(c => c?.id).filter(Boolean);
 
-        const prompt = buildU2VPrompt(scene);
+        const prompt = applyVeoPolicy(buildU2VPrompt(scene));
         const task = { id: tid, prompt };
 
         // ── Smart DNA selection — prompt-aware, max 6 ────────────────────────────
@@ -6634,6 +6674,11 @@ Rules:
 - dna_prompt for each character: must begin with the ethnicity sentence verbatim from desc, then full desc, then the 8-panel turnaround format
 - Keep character visual descriptions perfectly consistent with character_anchor and desc across all scenes
 - Shot types must vary: ECU, CU, MCU, MS, MLS, LS, WS, EWS, POV, OTS, Dutch Angle, Bird's Eye, Low Angle, High Angle, Tracking, Dolly, Handheld, Crane
+🚫 VEO CONTENT POLICY — MANDATORY IN ALL SHOT ACTIONS AND PROMPTS:
+- NEVER describe: graphic violence, blood, gore, weapons used violently, murder, torture, execution, adult/sexual content, nudity, hate speech, drugs, terrorism, disturbing imagery
+- Replace sensitive content with neutral cinematic alternatives: "intense confrontation" not "bloody fight", "dramatic tension" not "murder scene", "athletic struggle" not "violent attack"
+- All shot "action" fields must be safe, family-friendly, and suitable for general audiences
+- Every desc and dna_prompt must be tasteful and appropriate for all viewers
 Script:
 ` + finalScript;
 
@@ -6856,8 +6901,8 @@ Script:
           sceneNum:    sc.sceneNum || i + 1,
           title:       sc.title || `Cảnh ${i + 1}`,
           numShots:    (sc.shots || []).length,
-          prompt:      buildImagePrompt(sc, parsed),
-          videoPrompt: buildVideoPrompt(sc, parsed),
+          prompt:      applyVeoPolicy(buildImagePrompt(sc, parsed)),
+          videoPrompt: applyVeoPolicy(buildVideoPrompt(sc, parsed)),
           hasDialogue: !!sc.hasDialogue,
           speakerName: sc.speakerName || '',
           dialogue:    sc.dialogue || '',

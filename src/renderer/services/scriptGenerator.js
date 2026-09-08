@@ -6,7 +6,7 @@
 import { GoogleGenAI } from '@google/genai';
 import { retryWithKeyRotation } from './keyRotation.js';
 
-const GEMINI_MODEL   = 'gemini-2.5-flash';
+const GEMINI_MODEL   = 'gemini-3.5-flash';
 const SCENE_CHUNK    = 25; // scenes per API call — same as Creator
 
 // Normalise language code/label → display label used in prompts
@@ -121,6 +121,8 @@ export async function generateScript(apiKeys, config, onProgress) {
       if (c.ethnicity) s += `  • Sắc tộc / Quốc tịch: ${c.ethnicity}\n`;
       if (c.appearance) s += `  • Ngoại hình chi tiết: ${c.appearance}\n`;
       if (c.clothing) s += `  • Trang phục & Phụ kiện: ${c.clothing}\n`;
+      if (c.accessories && c.accessories !== 'none') s += `  • Phụ kiện: ${c.accessories}\n`;
+      if (c.distinctiveFeatures && c.distinctiveFeatures !== 'none') s += `  • Đặc điểm nổi bật: ${c.distinctiveFeatures}\n`;
       if (c.role) s += `  • Vai trò trong kịch bản: ${c.role}\n`;
       return s;
     };
@@ -243,4 +245,102 @@ BẮT ĐẦU NGAY từ [CẢNH ${fromScene}:] — viết đủ ${toScene - fromS
   }
 
   return fullScript;
+}
+
+// ─── Exported prompt builder — used by generateScriptClaude for identical prompts ─
+export function buildScriptPrompt(config, ci, fromScene, toScene, numChunks, numScenes, projectBible) {
+  const {
+    topic, platform = 'TikTok dọc', sceneDuration = 8, totalDuration = 3,
+    language = 'vi', style = 'Mặc định', goal = 'Giải trí & Viral',
+    tone = 'Bi tráng & Hào hùng', audience = 'Người trẻ (Gen Z & Alpha)',
+    mainChar = null, secChars = [],
+  } = config;
+
+  const noDialogue = language === 'none' || language === 'no-dialogue';
+  const langLabel  = noDialogue ? 'Không lời thoại' : (LANG_LABEL_MAP[language] || language);
+  const isFirst    = ci === 0;
+  const isLast     = toScene === numScenes;
+
+  const hasMain   = mainChar && (mainChar.name || mainChar.appearance || mainChar.clothing || mainChar.ethnicity);
+  const validSec  = (secChars || []).filter(c => c.name || c.appearance);
+  const fmtChar   = (c, label) => {
+    let s = `${label}\n`;
+    if (c.name) s += `  • Tên: ${c.name}\n`;
+    s += `  • Giới tính: ${c.gender || 'Nam'}${c.age ? ` | Độ tuổi: ${c.age}` : ''}\n`;
+    if (c.ethnicity) s += `  • Sắc tộc / Quốc tịch: ${c.ethnicity}\n`;
+    if (c.appearance) s += `  • Ngoại hình chi tiết: ${c.appearance}\n`;
+    if (c.clothing) s += `  • Trang phục & Phụ kiện: ${c.clothing}\n`;
+    if (c.role) s += `  • Vai trò trong kịch bản: ${c.role}\n`;
+    return s;
+  };
+  let charBlock = '';
+  if (hasMain || validSec.length) {
+    charBlock = `\n${'═'.repeat(46)}\nHỒ SƠ NHÂN VẬT (XÁC ĐỊNH SẴN — BẮT BUỘC DÙNG CHÍNH XÁC, KHÔNG THAY ĐỔI):\n\n`;
+    if (hasMain) charBlock += fmtChar(mainChar, '👤 NHÂN VẬT CHÍNH:') + '\n';
+    validSec.forEach((c, i) => { charBlock += fmtChar(c, `👥 NHÂN VẬT PHỤ ${i + 1}:`) + '\n'; });
+    charBlock += `⚠️ Tuyệt đối KHÔNG thay đổi, KHÔNG sáng tác lại tên, ngoại hình, trang phục của các nhân vật trên.\n${'═'.repeat(46)}`;
+  }
+
+  const baseInfo =
+`CHỦ ĐỀ: "${topic}"
+NỀN TẢNG: ${platform} | ${noDialogue ? 'CHẾ ĐỘ: KHÔNG CÓ THOẠI' : `NGÔN NGỮ THOẠI: ${langLabel}`} | PHONG CÁCH: ${style}
+MỖI CẢNH: ${sceneDuration}s | TỔNG: ${numScenes} cảnh | ĐỐI TƯỢNG: ${audience}
+MỤC TIÊU: ${goal} | GIỌNG ĐIỆU: ${tone}${charBlock ? '\n' + charBlock : ''}`;
+
+  if (isFirst) {
+    return `Bạn là nhà biên kịch và đạo diễn điện ảnh chuyên nghiệp.
+${baseInfo}
+---
+🚫 CHÍNH SÁCH NỘI DUNG VEO (BẮT BUỘC — KHÔNG NGOẠI LỆ):
+Kịch bản phải tuân thủ chính sách nội dung của Google Veo. TUYỆT ĐỐI KHÔNG mô tả: bạo lực đồ họa/máu me/gore, vũ khí được sử dụng bạo lực, cảnh giết người chi tiết, tra tấn, hành quyết; nội dung người lớn/tình dục/khỏa thân; phát ngôn thù ghét/phân biệt chủng tộc; ma túy/khủng bố/bom mìn; hình ảnh gây rối loạn tâm lý. Thay thế bằng cách mô tả điện ảnh an toàn, phù hợp khán giả chung (VD: "đối đầu căng thẳng" thay vì "cảnh đánh nhau đẫm máu").
+---
+## PHẦN 1: PROJECT BIBLE
+
+**LOGLINE:** [2–3 câu: cốt truyện + cao trào + thông điệp]
+**BỐI CẢNH:** [Quốc gia/thời đại, địa điểm, thời gian, thời tiết, tone màu]
+**CHARACTER BIBLE** ⚠️ (tham chiếu AI tạo ảnh — bất biến):
+${charBlock
+  ? 'Hoàn thiện thêm chi tiết còn thiếu, giữ nguyên thông tin gốc:'
+  : 'Tạo nhân vật phù hợp chủ đề (chính trước, phụ sau, tối đa 5 phụ):'}
+[NHÂN VẬT CHÍNH] Tên | Giới tính | Tuổi | Quốc tịch/Sắc tộc
+→ Ngoại hình: Khuôn mặt, Mắt, Tóc, Da, Vóc dáng
+→ Trang phục & Phụ kiện/Vũ khí: [màu sắc, chất liệu cụ thể]
+→ Tính cách & Biểu cảm đặc trưng:
+[NHÂN VẬT PHỤ N] ...tương tự...
+**VẬT THỂ/ĐẠO CỤ CHÍNH:** [Mô tả hình dáng, màu sắc, chất liệu]
+
+---
+## PHẦN 2: KỊCH BẢN PHÂN CẢNH — CẢNH ${fromScene} ĐẾN CẢNH ${toScene}${numChunks > 1 ? ` (PHẦN 1/${numChunks}, tổng ${numScenes} cảnh)` : ` — ĐỦ ${numScenes} CẢNH`}
+
+${noDialogue
+  ? '⚠️ QUY TẮC LỜI THOẠI — ƯU TIÊN CAO NHẤT: NGHIÊM CẤM LỜI THOẠI — tất cả cảnh im lặng hoàn toàn.'
+  : `QUY TẮC LỜI THOẠI — ƯU TIÊN CAO NHẤT: Lời thoại viết THUẦN ${langLabel} — TUYỆT ĐỐI KHÔNG kèm bản dịch, phiên âm, hay chú thích ngôn ngữ khác dù là trong ngoặc đơn (...). Sau mỗi câu thoại chỉ được có dấu câu, KHÔNG có nội dung nào khác.`}
+QUY TẮC: Mỗi cảnh ${sceneDuration}s. Cảnh n bắt đầu tại (n−1)×${sceneDuration}s. Số shot linh hoạt 1–5 theo nội dung (xem QUY TẮC SHOT ở trên). Mỗi shot góc máy KHÁC nhau. KHÔNG dùng bảng.
+Cảnh 1 = hook mạnh.${isLast ? ` Cảnh ${numScenes} = Call To Action rõ ràng.` : ''}
+
+${SCENE_FORMAT(langLabel, noDialogue)}
+
+BẮT ĐẦU NGAY từ [CẢNH ${fromScene}:] — viết đủ ${toScene - fromScene + 1} cảnh liên tiếp không bỏ sót.`;
+  } else {
+    return `Bạn là nhà biên kịch đang tiếp tục viết kịch bản.
+
+THÔNG TIN DỰ ÁN:
+${baseInfo}
+
+PROJECT BIBLE ĐÃ XÁC LẬP (GIỮ NGUYÊN NHÂN VẬT & BỐI CẢNH):
+${projectBible}
+
+---
+NHIỆM VỤ: Tiếp tục viết CẢNH ${fromScene} ĐẾN CẢNH ${toScene} (phần ${ci + 1}/${numChunks}, tổng ${numScenes} cảnh).
+Cảnh ${fromScene} bắt đầu tại ${(fromScene - 1) * sceneDuration}s.${isLast ? ` Cảnh ${numScenes} = Call To Action rõ ràng.` : ''}
+
+${noDialogue
+  ? '⚠️ QUY TẮC LỜI THOẠI — ƯU TIÊN CAO NHẤT: NGHIÊM CẤM LỜI THOẠI — tất cả cảnh im lặng hoàn toàn.'
+  : `QUY TẮC LỜI THOẠI — ƯU TIÊN CAO NHẤT: Lời thoại viết THUẦN ${langLabel} — TUYỆT ĐỐI KHÔNG kèm bản dịch, phiên âm, hay chú thích ngôn ngữ khác dù là trong ngoặc đơn (...). Sau mỗi câu thoại chỉ được có dấu câu, KHÔNG có nội dung nào khác.`}
+QUY TẮC: Mỗi cảnh ${sceneDuration}s. Số shot linh hoạt 1–5 theo nội dung (xem QUY TẮC SHOT ở trên). Mỗi shot góc máy KHÁC nhau. KHÔNG dùng bảng. KHÔNG lặp lại Project Bible.
+
+${SCENE_FORMAT(langLabel, noDialogue)}
+
+BẮT ĐẦU NGAY từ [CẢNH ${fromScene}:] — viết đủ ${toScene - fromScene + 1} cảnh liên tiếp không bỏ sót.`;
+  }
 }

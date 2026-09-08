@@ -65,10 +65,16 @@ async function setupYtDlp(onProgress) {
   return { ok: true, path: dest };
 }
 
+async function ensureYtDlp() {
+  const found = findYtDlp();
+  if (found) return found;
+  fs.mkdirSync(getYtDlpDir(), { recursive: true });
+  await downloadFile(YTDLP_RELEASE, getYtDlpPath(), () => {});
+  return getYtDlpPath();
+}
+
 function getVideoInfo(url) {
-  const ytdlp = findYtDlp();
-  if (!ytdlp) return Promise.reject(new Error('yt-dlp chưa được cài đặt'));
-  return new Promise((resolve, reject) => {
+  return ensureYtDlp().then(ytdlp => new Promise((resolve, reject) => {
     const proc = spawn(ytdlp, [
       '--no-playlist', '--dump-json', '--no-warnings',
       '--socket-timeout', '15',
@@ -102,11 +108,30 @@ function getVideoInfo(url) {
       } catch (e) { reject(new Error('Lỗi phân tích dữ liệu: ' + e.message)); }
     });
     proc.on('error', e => reject(new Error(`Không thể chạy yt-dlp: ${e.message}`)));
-  });
+  }));
 }
 
-function buildArgs(url, outputTemplate, quality, format) {
-  const args = ['--no-playlist', '--newline', '--no-warnings', '-o', outputTemplate];
+function buildArgs(url, outputTemplate, quality, format, useCookies = false) {
+  const args = [
+    '--no-playlist', '--newline', '--no-warnings',
+    '-o', outputTemplate,
+    // Chống throttle / ngắt kết nối giữa chừng
+    '--retries', '15',
+    '--fragment-retries', '15',
+    '--retry-sleep', 'linear=1::3',   // tăng dần 1s → 3s giữa retries
+    '--socket-timeout', '30',
+    '--concurrent-fragments', '4',
+    '--extractor-retries', '5',
+    // Giả browser để tránh 403 — YouTube kiểm tra User-Agent
+    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    // player_client web_creator ít bị chặn hơn android/ios trên server mới của YT
+    '--extractor-args', 'youtube:player_client=web,default',
+  ];
+  // Khi bị 403: thử dùng cookie từ browser để xác thực
+  // Firefox trước vì Chrome v127+ dùng DPAPI encryption mới mà yt-dlp chưa hỗ trợ
+  if (useCookies) {
+    args.push('--cookies-from-browser', 'firefox');
+  }
   if (format === 'mp3') {
     args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
   } else {
@@ -132,44 +157,107 @@ function parseProgressLine(line) {
   return null;
 }
 
-let _activeProc = null;
+let _activeProc  = null;           // single download
+const _batchProcs = new Map();      // id → proc (parallel batch)
 
-function startDownload({ url, outputFolder, quality, format }, mainWindow) {
-  const ytdlp = findYtDlp();
-  if (!ytdlp) return Promise.reject(new Error('yt-dlp chưa được cài đặt'));
-  const outputTemplate = path.join(outputFolder, '%(title)s.%(ext)s');
-  const args = buildArgs(url, outputTemplate, quality, format);
-
+function runYtDlp(ytdlp, args, mainWindow, progressChannel = 'downloader:progress', itemId = null) {
   return new Promise((resolve, reject) => {
-    _activeProc = spawn(ytdlp, args);
-    let errOut = '';
-    let lastFile = '';
+    const proc = spawn(ytdlp, args);
+    if (itemId === null) _activeProc = proc;
+    else _batchProcs.set(itemId, proc);
 
-    _activeProc.stdout.on('data', (d) => {
+    let errOut = '', lastFile = '';
+
+    proc.stdout.on('data', (d) => {
       d.toString().split('\n').forEach(line => {
         const prog = parseProgressLine(line.trim());
         if (!prog) return;
         if (prog.filename) lastFile = prog.filename;
-        mainWindow?.webContents?.send('downloader:progress', { ...prog, filename: lastFile });
+        const payload = { ...prog, filename: lastFile };
+        if (itemId !== null) payload.id = itemId;
+        mainWindow?.webContents?.send(progressChannel, payload);
       });
     });
 
-    _activeProc.stderr.on('data', d => { errOut += d.toString(); });
+    proc.stderr.on('data', d => { errOut += d.toString(); });
 
-    _activeProc.on('close', (code) => {
-      _activeProc = null;
-      if (code === 0 || code === null) resolve({ success: true, cancelled: code === null });
-      else {
-        const msg = errOut.split('\n').find(l => l.includes('ERROR:')) || `Lỗi thoát ${code}`;
-        reject(new Error(msg.replace('ERROR: ', '')));
-      }
+    proc.on('close', (code) => {
+      if (itemId === null) _activeProc = null;
+      else _batchProcs.delete(itemId);
+      if (code === 0 || code === null) resolve({ success: true, cancelled: code === null, errOut });
+      else reject(Object.assign(new Error(
+        (errOut.split('\n').find(l => l.includes('ERROR:')) || `Lỗi thoát ${code}`).replace('ERROR: ', '')
+      ), { errOut }));
     });
-    _activeProc.on('error', e => { _activeProc = null; reject(new Error(`yt-dlp: ${e.message}`)); });
+    proc.on('error', e => {
+      if (itemId === null) _activeProc = null;
+      else _batchProcs.delete(itemId);
+      reject(new Error(`yt-dlp: ${e.message}`));
+    });
   });
+}
+
+async function startDownload({ url, outputFolder, quality, format }, mainWindow) {
+  const ytdlp = await ensureYtDlp();
+  const outputTemplate = path.join(outputFolder, '%(title)s.%(ext)s');
+  try {
+    return await runYtDlp(ytdlp, buildArgs(url, outputTemplate, quality, format, false), mainWindow);
+  } catch (err) {
+    const needsAuth = err.errOut && (
+      err.errOut.includes('403') || err.errOut.includes('Forbidden') ||
+      err.errOut.includes('Sign in') || err.errOut.includes('sign in') ||
+      err.errOut.includes('authentication') || err.errOut.includes('cookies') ||
+      err.errOut.includes('HTTP Error 401') || err.errOut.includes('login') ||
+      err.errOut.includes('age') || err.errOut.includes('Premium') ||
+      err.errOut.includes('DPAPI') || err.errOut.includes('decrypt')
+    );
+    if (!needsAuth) throw err;
+    mainWindow?.webContents?.send('downloader:progress', { status: '🍪 Cần xác thực — thử lại với cookie trình duyệt...' });
+    return await runYtDlp(ytdlp, buildArgs(url, outputTemplate, quality, format, true), mainWindow);
+  }
+}
+
+async function startBatchDownload(items, mainWindow) {
+  const ytdlp = await ensureYtDlp();
+
+  const results = await Promise.allSettled(items.map(async (item) => {
+    const outputTemplate = path.join(item.outputFolder, '%(title)s.%(ext)s');
+    const send = (extra) => mainWindow?.webContents?.send('downloader:batch-progress', { id: item.id, ...extra });
+    try {
+      await runYtDlp(ytdlp, buildArgs(item.url, outputTemplate, item.quality, item.format, false),
+        mainWindow, 'downloader:batch-progress', item.id);
+      return { id: item.id, success: true };
+    } catch (err) {
+      const is403 = err.errOut && (
+        err.errOut.includes('403') || err.errOut.includes('Forbidden') ||
+        err.errOut.includes('Sign in') || err.errOut.includes('sign in') ||
+        err.errOut.includes('authentication') || err.errOut.includes('cookies') ||
+        err.errOut.includes('HTTP Error 401') || err.errOut.includes('login') ||
+        err.errOut.includes('age') || err.errOut.includes('Premium') ||
+        err.errOut.includes('DPAPI') || err.errOut.includes('decrypt')
+      );
+      if (!is403) return { id: item.id, success: false, error: err.message };
+      send({ status: '🍪 403 → thử cookie...' });
+      try {
+        await runYtDlp(ytdlp, buildArgs(item.url, outputTemplate, item.quality, item.format, true),
+          mainWindow, 'downloader:batch-progress', item.id);
+        return { id: item.id, success: true };
+      } catch (e2) {
+        return { id: item.id, success: false, error: e2.message };
+      }
+    }
+  }));
+
+  return results.map(r => r.status === 'fulfilled' ? r.value : { success: false, error: r.reason?.message });
 }
 
 function cancelDownload() {
   if (_activeProc) { _activeProc.kill(); _activeProc = null; }
+}
+
+function cancelBatch() {
+  for (const proc of _batchProcs.values()) { try { proc.kill(); } catch {} }
+  _batchProcs.clear();
 }
 
 function registerDownloaderHandlers(mainWindow) {
@@ -193,6 +281,47 @@ function registerDownloaderHandlers(mainWindow) {
   });
 
   ipcMain.handle('downloader:cancel', () => { cancelDownload(); return { success: true }; });
+
+  ipcMain.handle('downloader:batch-start', async (_, items) => {
+    try   { return await startBatchDownload(items, mainWindow); }
+    catch (e) { return items.map(i => ({ id: i.id, success: false, error: e.message })); }
+  });
+
+  ipcMain.handle('downloader:batch-cancel', () => { cancelBatch(); return { success: true }; });
+
+  ipcMain.handle('downloader:batch-pause', (_, id) => {
+    const proc = _batchProcs.get(id);
+    if (proc) { try { proc.kill(); } catch {} _batchProcs.delete(id); }
+    return { success: true };
+  });
+
+  ipcMain.handle('downloader:batch-resume', async (_, item) => {
+    let ytdlp; try { ytdlp = await ensureYtDlp(); } catch(e) { return { id: item.id, success: false, error: e.message }; }
+    const outputTemplate = path.join(item.outputFolder, '%(title)s.%(ext)s');
+    try {
+      await runYtDlp(ytdlp, buildArgs(item.url, outputTemplate, item.quality, item.format, false),
+        mainWindow, 'downloader:batch-progress', item.id);
+      return { id: item.id, success: true };
+    } catch (err) {
+      const is403 = err.errOut && (
+        err.errOut.includes('403') || err.errOut.includes('Forbidden') ||
+        err.errOut.includes('Sign in') || err.errOut.includes('sign in') ||
+        err.errOut.includes('authentication') || err.errOut.includes('cookies') ||
+        err.errOut.includes('HTTP Error 401') || err.errOut.includes('login') ||
+        err.errOut.includes('age') || err.errOut.includes('Premium') ||
+        err.errOut.includes('DPAPI') || err.errOut.includes('decrypt')
+      );
+      if (!is403) return { id: item.id, success: false, error: err.message };
+      mainWindow?.webContents?.send('downloader:batch-progress', { id: item.id, status: '🍪 403 → thử cookie...' });
+      try {
+        await runYtDlp(ytdlp, buildArgs(item.url, outputTemplate, item.quality, item.format, true),
+          mainWindow, 'downloader:batch-progress', item.id);
+        return { id: item.id, success: true };
+      } catch (e2) {
+        return { id: item.id, success: false, error: e2.message };
+      }
+    }
+  });
 }
 
 module.exports = { registerDownloaderHandlers };

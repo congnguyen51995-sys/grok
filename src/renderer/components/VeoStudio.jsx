@@ -2,31 +2,41 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Play, Square, Pause, FolderOpen, RefreshCw, CheckCircle2, Key, Image as ImageIcon, Film, CreditCard, Trash2, Loader2, X, AlertCircle, Settings2, Layers, Cpu, ImagePlus, FileImage, Plus, FolderPlus, FileText, Trash, Wifi, WifiOff, Maximize2, Edit3, CheckCircle, Download, HelpCircle, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Terminal, Ban, Mic, Volume2, VolumeX } from 'lucide-react';
 
 const VOICE_LIST = [
-  { id: '',                label: 'Không có giọng' },
-  { id: 'random',          label: '🎲 Ngẫu nhiên' },
-  { id: 'achernar',        label: 'Achernar — Nữ, nhẹ nhàng, cao' },
-  { id: 'achird',          label: 'Achird — Nam, thân thiện, trung' },
-  { id: 'algenib',         label: 'Algenib — Nam, khàn, trầm' },
-  { id: 'algieba',         label: 'Algieba — Nam, dễ chịu, trầm-vừa' },
-  { id: 'alnilam',         label: 'Alnilam — Nam, cứng rắn, trầm-vừa' },
-  { id: 'leda',            label: 'Leda — Nữ, trẻ trung, trung-cao' },
-  { id: 'orus',            label: 'Orus — Nam, cứng, trầm-vừa' },
-  { id: 'puck',            label: 'Puck — Nam, sôi nổi, trung' },
-  { id: 'pulcherrima',     label: 'Pulcherrima — Trung tính, mạnh, trung-cao' },
-  { id: 'rasalgethi',      label: 'Rasalgethi — Nam, thông tin, trung' },
-  { id: 'sadachbia',       label: 'Sadachbia — Nam, linh hoạt, thấp' },
-  { id: 'sadaltager',      label: 'Sadaltager — Nam, am hiểu, trung' },
-  { id: 'schedar',         label: 'Schedar — Nam, đều đặn, trầm-vừa' },
-  { id: 'sulafat',         label: 'Sulafat — Nữ, ấm áp, trung' },
-  { id: 'umbriel',         label: 'Umbriel — Nam, mượt mà, thấp' },
-  { id: 'vindemiatrix',    label: 'Vindemiatrix — Nữ, nhẹ nhàng, trung' },
-  { id: 'zephyr',          label: 'Zephyr — Nữ, tươi sáng, trung-cao' },
-  { id: 'zubenelgenubi',   label: 'Zubenelgenubi — Nam, thoải mái, trầm-vừa' },
+  { id: '',              gender: '',  label: 'Không có giọng' },
+  { id: 'random',        gender: '',  label: '🎲 Ngẫu nhiên' },
+  { id: 'Achernar',      gender: 'F', label: 'Achernar — Nữ, nhẹ nhàng, cao' },
+  { id: 'Achird',        gender: 'M', label: 'Achird — Nam, thân thiện, trung' },
+  { id: 'Algenib',       gender: 'M', label: 'Algenib — Nam, khàn, trầm' },
+  { id: 'Algieba',       gender: 'M', label: 'Algieba — Nam, dễ chịu, trầm-vừa' },
+  { id: 'Alnilam',       gender: 'M', label: 'Alnilam — Nam, cứng rắn, trầm-vừa' },
+  { id: 'Aoede',         gender: 'F', label: 'Aoede — Nữ, nhẹ nhàng, trung-cao' },
+  { id: 'Autonoe',       gender: 'F', label: 'Autonoe — Nữ, tươi sáng, trung' },
+  { id: 'Callirrhoe',    gender: 'F', label: 'Callirrhoe — Nữ, dễ chịu, trung' },
+  { id: 'Charon',        gender: 'M', label: 'Charon — Nam, thông tin, thấp' },
+  { id: 'Despina',       gender: 'F', label: 'Despina — Nữ, mượt mà, trung' },
+  { id: 'Enceladus',     gender: 'M', label: 'Enceladus — Nam, mạnh mẽ, thấp' },
+  { id: 'Gacrux',        gender: 'F', label: 'Gacrux — Nữ, chín chắn, trung' },
+  { id: 'Iapetus',       gender: 'M', label: 'Iapetus — Nam, rõ ràng, trầm-vừa' },
+  { id: 'Kore',          gender: 'F', label: 'Kore — Nữ, mạnh mẽ, trung' },
+  { id: 'Laomedeia',     gender: 'F', label: 'Laomedeia — Nữ, vui vẻ, trung-cao' },
+  { id: 'Leda',          gender: 'F', label: 'Leda — Nữ, trẻ trung, trung-cao' },
+  { id: 'Orus',          gender: 'M', label: 'Orus — Nam, cứng, trầm-vừa' },
+  { id: 'Puck',          gender: 'M', label: 'Puck — Nam, sôi nổi, trung' },
+  { id: 'Pulcherrima',   gender: 'N', label: 'Pulcherrima — Trung tính, mạnh, trung-cao' },
+  { id: 'Rasalgethi',    gender: 'M', label: 'Rasalgethi — Nam, thông tin, trung' },
+  { id: 'Sadachbia',     gender: 'M', label: 'Sadachbia — Nam, linh hoạt, thấp' },
+  { id: 'Sadaltager',    gender: 'M', label: 'Sadaltager — Nam, am hiểu, trung' },
+  { id: 'Schedar',       gender: 'M', label: 'Schedar — Nam, đều đặn, trầm-vừa' },
+  { id: 'Sulafat',       gender: 'F', label: 'Sulafat — Nữ, ấm áp, trung' },
+  { id: 'Umbriel',       gender: 'M', label: 'Umbriel — Nam, mượt mà, thấp' },
+  { id: 'Vindemiatrix',  gender: 'F', label: 'Vindemiatrix — Nữ, nhẹ nhàng, trung' },
+  { id: 'Zephyr',        gender: 'F', label: 'Zephyr — Nữ, tươi sáng, trung-cao' },
+  { id: 'Zubenelgenubi', gender: 'M', label: 'Zubenelgenubi — Nam, thoải mái, trầm-vừa' },
 ];
 const VOICE_POOL = VOICE_LIST.filter(v => v.id && v.id !== 'random');
 
 export default function VeoStudio({ dark = true }) {
-    const [inputMode, setInputMode] = useState('Image'); 
+    const [inputMode, setInputMode] = useState('Image');
     const [model, setModel] = useState('Nano Banana Pro');
     const mediaType = inputMode === 'Image' ? 'Image' : 'Video';
 
@@ -41,7 +51,7 @@ export default function VeoStudio({ dark = true }) {
     const [genCount, setGenCount] = useState('1x');
     const [imageQuality, setImageQuality] = useState('1K');
     const [videoQuality, setVideoQuality] = useState('720p');
-    const [duration, setDuration] = useState('4s');
+    const [duration, setDuration] = useState('8s');
 
     // Extend Chain state
     const [extendPrompts, setExtendPrompts]     = useState('');  // mỗi dòng 1 prompt
@@ -74,29 +84,6 @@ export default function VeoStudio({ dark = true }) {
     const [sidebarOpen, setSidebarOpen] = useState(true);
     const [logOpen, setLogOpen] = useState(false);
     const logsEndRef = useRef(null);
-
-    // ── Proxy xoay status (read-only, managed in Settings tab) ──────────────
-    const [proxyEnabled, setProxyEnabled] = useState(false);
-    const [proxyCount, setProxyCount]     = useState(0);
-
-    useEffect(() => {
-        window.electronAPI?.veoProxyGet?.().then(data => {
-            if (data) {
-                setProxyEnabled(!!data.enabled);
-                setProxyCount(Array.isArray(data.proxies) ? data.proxies.filter(p => p.enabled).length : 0);
-            }
-        }).catch(() => {});
-        // Re-check every 5s in case user changes in Settings tab
-        const t = setInterval(() => {
-            window.electronAPI?.veoProxyGet?.().then(data => {
-                if (data) {
-                    setProxyEnabled(!!data.enabled);
-                    setProxyCount(Array.isArray(data.proxies) ? data.proxies.filter(p => p.enabled).length : 0);
-                }
-            }).catch(() => {});
-        }, 5000);
-        return () => clearInterval(t);
-    }, []);
 
     const aspectRatios = ['16:9', '4:3', '1:1', '3:4', '9:16'];
     const genCounts = ['1x', 'x2', 'x3', 'x4'];
@@ -200,7 +187,7 @@ export default function VeoStudio({ dark = true }) {
                 });
 
                 if (!['progress', 'job_start', 'job_success', 'job_fail'].includes(type) && text.trim() !== '') {
-                    setLogs(prev => [...prev, { time: data.time || new Date().toLocaleTimeString(), text: text, type: type }]);
+                    setLogs(prev => [...prev.slice(-299), { time: data.time || new Date().toLocaleTimeString(), text: text, type: type }]);
                 }
             });
         }
@@ -264,18 +251,18 @@ export default function VeoStudio({ dark = true }) {
         setIsGenerating(false);
         setIsPaused(false);
         window.electronAPI?.stopVeo?.();
-        setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: '⛔ Đã dừng toàn bộ tiến trình.', type: 'error' }]);
+        setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: '⛔ Đã dừng toàn bộ tiến trình.', type: 'error' }]);
     };
 
     const handlePauseResume = () => {
         if (isPaused) {
             setIsPaused(false);
             window.electronAPI?.resumeVeo?.();
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: '▶ Tiếp tục tiến trình.', type: 'info' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: '▶ Tiếp tục tiến trình.', type: 'info' }]);
         } else {
             setIsPaused(true);
             window.electronAPI?.pauseVeo?.();
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: '⏸ Tạm dừng tiến trình.', type: 'info' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: '⏸ Tạm dừng tiến trình.', type: 'info' }]);
         }
     };
 
@@ -302,7 +289,7 @@ export default function VeoStudio({ dark = true }) {
             : j
         ));
         setIsGenerating(true);
-        setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `🔄 Tạo lại: ${jobId}`, type: 'info' }]);
+        setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `🔄 Tạo lại: ${jobId}`, type: 'info' }]);
 
         const actualGenCount = jobMediaType === 'Video' ? '1x' : genCount;
         const actualQuality = jobMediaType === 'Image' ? imageQuality : videoQuality;
@@ -329,9 +316,10 @@ export default function VeoStudio({ dark = true }) {
 
         const result = await window.electronAPI.runVeo(payload);
         if (result?.success) {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: '✅ Tạo lại thành công!', type: 'success' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: '✅ Tạo lại thành công!', type: 'success' }]);
         } else {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `❌ Tạo lại thất bại: ${result?.error || 'Lỗi không xác định'}`, type: 'error' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `❌ Tạo lại thất bại: ${result?.error || 'Lỗi không xác định'}`, type: 'error' }]);
+            setLogOpen(true);
         }
     };
 
@@ -341,17 +329,17 @@ export default function VeoStudio({ dark = true }) {
         if (!sysStatus.extensionConnected) return alert("Chưa kết nối Extension!");
         if (!outputFolder) return alert("Vui lòng chọn thư mục lưu file!");
 
-        const failedJobs = jobs.filter(j => j.status === 'failed');
-        if (failedJobs.length === 0) return alert("Không có video lỗi nào để tạo lại!");
+        const failedJobs = jobs.filter(j => j.status === 'error');
+        if (failedJobs.length === 0) return alert("Không có ảnh/video lỗi nào để tạo lại!");
 
-        // Reset tất cả failed jobs về pending ngay lập tức
+        // Reset tất cả error jobs về pending ngay lập tức
         setJobs(prev => prev.map(j =>
-            j.status === 'failed' ? { ...j, status: 'pending', progress: 0, files: [] } : j
+            j.status === 'error' ? { ...j, status: 'pending', progress: 0, files: [] } : j
         ));
         setIsGenerating(true);
-        setLogs(prev => [...prev, {
+        setLogs(prev => [...prev.slice(-299), {
             time: new Date().toLocaleTimeString(),
-            text: `🔄 Tạo lại ${failedJobs.length} video lỗi...`,
+            text: `🔄 Tạo lại ${failedJobs.length} mục lỗi...`,
             type: 'info'
         }]);
 
@@ -384,9 +372,9 @@ export default function VeoStudio({ dark = true }) {
 
         const result = await window.electronAPI.runVeo(payload);
         if (result?.success) {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `✅ Tạo lại hoàn tất!`, type: 'success' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `✅ Tạo lại hoàn tất!`, type: 'success' }]);
         } else {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${result?.error || 'Không xác định'}`, type: 'error' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${result?.error || 'Không xác định'}`, type: 'error' }]);
         }
         setIsGenerating(false);
     };
@@ -418,7 +406,7 @@ export default function VeoStudio({ dark = true }) {
                 const obj = JSON.parse(t);
                 const VOICE_PFX = /^\[[^\]]*\bvoice\b[^\]]*\],?\s*/i;
                 const COMMENT   = /^\s*\/\//;
-                const candidates = [obj.final_prompt, obj.dna_prompt, obj.prompt, obj.action_description, obj.title]
+                const candidates = [obj.final_prompt, obj.dna_prompt, obj.ai_video_prompt, obj.prompt, obj.video_prompt, obj.action_description, obj.title]
                     .filter(Boolean)
                     .map(s => s.replace(VOICE_PFX, '').trim())
                     .filter(s => s.length > 0);
@@ -507,7 +495,23 @@ export default function VeoStudio({ dark = true }) {
         } else if (inputMode === 'Ingredients') {
             if (ingredientImages.length === 0) return alert("Vui lòng thêm ít nhất 1 ảnh Ingredient!");
             if (!ingredientsPrompt.trim()) return alert("Vui lòng nhập Prompt mô tả video cần tạo!");
-            const ingrPromptList = ingredientsPrompt.split('\n').map(p => extractPromptFromLine(p)).filter(Boolean);
+            // Thử parse toàn bộ input như JSON array/object trước
+            let ingrPromptList = [];
+            const trimmedIngr = ingredientsPrompt.trim();
+            if (trimmedIngr.startsWith('[') || trimmedIngr.startsWith('{')) {
+                try {
+                    const parsed = JSON.parse(trimmedIngr);
+                    const arr = Array.isArray(parsed) ? parsed : [parsed];
+                    ingrPromptList = arr.map(item => {
+                        if (typeof item === 'string') return item.trim();
+                        const candidates = [item.final_prompt, item.dna_prompt, item.ai_video_prompt, item.prompt, item.video_prompt, item.action_description, item.title].filter(Boolean);
+                        return (candidates[0] || '').trim();
+                    }).filter(Boolean);
+                } catch { /* không phải JSON hợp lệ → fallback */ }
+            }
+            if (ingrPromptList.length === 0) {
+                ingrPromptList = ingredientsPrompt.split('\n').map(p => extractPromptFromLine(p)).filter(Boolean);
+            }
             // Ghép 1:1 nếu số ảnh == số prompts; ngược lại tất cả ảnh → tất cả prompts
             const ingrPerPrompt = ingredientImages.length > 1 && ingredientImages.length === ingrPromptList.length;
 
@@ -525,14 +529,14 @@ export default function VeoStudio({ dark = true }) {
                 if (!usedVoices.has(vid)) { voiceImgMap[slot.imgIdx] = vid; usedVoices.add(vid); }
             });
 
+            // Dùng đường dẫn file trực tiếp — veo-engine upload qua Extension (cùng Chrome session)
             tasks = ingrPromptList.map((p, index) => {
                 const taskImgIndices = ingrPerPrompt ? [index] : ingredientImages.map((_, i) => i);
-                const taskImgs = taskImgIndices.map(i => ingredientImages[i]);
                 const task = {
                     id: 'ingr_' + Date.now() + '_' + index,
                     prompt: p,
-                    ingredientImages: taskImgs,
                     fileIndex: baseIndex + index + 1,
+                    ingredientImages: taskImgIndices.map(i => ingredientImages[i]).slice(0, 3),
                 };
                 const speakIdx = taskImgIndices.find(i => voiceImgMap[i] !== undefined);
                 if (speakIdx !== undefined) task.voiceId = voiceImgMap[speakIdx];
@@ -566,13 +570,13 @@ export default function VeoStudio({ dark = true }) {
                         if (lastPath) setExtendFinalFile(lastPath);
                     }
                     const count = result.files?.length || 0;
-                    setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `✅ Extend Chain hoàn tất! ${count} video đã tạo.`, type: 'success' }]);
-                    setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `🎬 Hoàn thành! ${count} video đã tạo liên tiếp.`, type: 'success' }]);
+                    setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `✅ Extend Chain hoàn tất! ${count} video đã tạo.`, type: 'success' }]);
+                    setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `🎬 Hoàn thành! ${count} video đã tạo liên tiếp.`, type: 'success' }]);
                 } else {
-                    setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${result?.error || 'Không xác định'}`, type: 'error' }]);
+                    setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${result?.error || 'Không xác định'}`, type: 'error' }]);
                 }
             } catch (err) {
-                setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${err.message}`, type: 'error' }]);
+                setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${err.message}`, type: 'error' }]);
             }
             setExtChainRun(false);
             return;
@@ -614,11 +618,12 @@ export default function VeoStudio({ dark = true }) {
         const result = await window.electronAPI.runVeo(payload);
 
         if (result.success) {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: '✅ Đã hoàn tất toàn bộ danh sách!', type: 'success' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: '✅ Đã hoàn tất toàn bộ danh sách!', type: 'success' }]);
         } else {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `❌ Bị dừng: ${result.error}`, type: 'error' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `❌ Bị dừng: ${result.error}`, type: 'error' }]);
+            setLogOpen(true);
         }
-        setIsGenerating(false); 
+        setIsGenerating(false);
     };
 
     const getFileUrl = (fileName) => `file:///${encodeURI((outputFolder + '\\' + fileName).replace(/\\/g, '/'))}`;
@@ -711,28 +716,6 @@ export default function VeoStudio({ dark = true }) {
                     </div>
                     {/* HẾT KHỐI TRẠNG THÁI */}
 
-                    {/* ── PROXY STATUS BADGE (cấu hình tại tab Cài đặt) ──── */}
-                    <div className={`flex items-center justify-between px-3 py-2 rounded-lg border text-[10px] font-bold ${
-                        proxyEnabled && proxyCount > 0
-                            ? 'bg-cyan-500/10 border-cyan-500/20 text-cyan-400'
-                            : proxyEnabled
-                                ? 'bg-amber-500/10 border-amber-500/20 text-amber-400'
-                                : 'bg-[#1e293b]/60 border-slate-700/60 text-slate-500'
-                    }`}>
-                        <span className="flex items-center gap-1.5">
-                            🔄 Proxy Xoay
-                            {proxyEnabled && proxyCount > 0 && (
-                                <span className="font-bold">· BẬT · {proxyCount} proxy</span>
-                            )}
-                            {proxyEnabled && proxyCount === 0 && (
-                                <span>· BẬT · Chưa có proxy</span>
-                            )}
-                            {!proxyEnabled && <span>· Tắt</span>}
-                        </span>
-                        <span className="text-[9px] text-slate-500 font-normal">Cài đặt →</span>
-                    </div>
-                    {/* HẾT PROXY BADGE */}
-
                     <div className="flex gap-1 bg-[#0f1524] p-1.5 rounded-lg border border-slate-800 flex-wrap">
                         <button onClick={() => setInputMode('Image')} className={`flex-1 py-1.5 rounded-md text-[10px] font-bold transition-all ${inputMode === 'Image' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-300'}`}>Tạo Ảnh</button>
                         <button onClick={() => setInputMode('TextToVideo')} className={`flex-1 py-1.5 rounded-md text-[10px] font-bold transition-all ${inputMode === 'TextToVideo' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-300'}`}>T2V</button>
@@ -748,42 +731,25 @@ export default function VeoStudio({ dark = true }) {
                                 <optgroup label="✨ Tạo Ảnh (Text/Image to Image)">
                                     <option value="Nano Banana Pro">Nano Banana Pro</option>
                                     <option value="Nano Banana 2">Nano Banana 2</option>
-                                    <option value="Imagen 4">Imagen 4</option>
+                                    <option value="Nano Banana 2 Lite">Nano Banana 2 Lite</option>
                                 </optgroup>
                             ) : inputMode === 'Ingredients' ? (
                                 <>
-                                    <optgroup label="⚡ Omni Flash">
-                                        <option value="Omni Flash">Omni Flash r2v (4s/6s/8s/10s)</option>
-                                    </optgroup>
-                                    <optgroup label="🧪 Veo 3.1 r2v">
-                                        <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 Lite r2v [Lower Priority]</option>
-                                        <option value="Veo 3.1 - Lite (Fast)">Veo 3.1 Lite r2v (Fast)</option>
-                                        <option value="Veo 3.1 - Fast (Balanced)">Veo 3.1 Fast r2v (Balanced)</option>
-                                        <option value="Veo 3.1 - Quality (High)">Veo 3.1 Quality r2v (High)</option>
-                                    </optgroup>
+                                    <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 - Lite [Lower Priority]</option>
+                                    <option value="Omni 1.1 Flash">Omni 1.1 Flash r2v (4s/6s/8s/10s)</option>
                                 </>
                             ) : inputMode === 'Extend' ? (
                                 <optgroup label="🎬 T2V (video đầu tiên)">
                                     <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 - Lite [Lower Priority]</option>
-                                    <option value="Veo 3.1 - Lite (Fast)">Veo 3.1 - Lite (Fast)</option>
-                                    <option value="Veo 3.1 - Fast (Balanced)">Veo 3.1 - Fast (Balanced)</option>
-                                    <option value="Veo 3.1 - Quality (High)">Veo 3.1 - Quality (High)</option>
                                 </optgroup>
                             ) : (
                                 <>
-                                    <optgroup label="⚡ Omni Flash">
-                                        <option value="Omni Flash">Omni Flash (4s/6s/8s/10s)</option>
-                                    </optgroup>
-                                    <optgroup label="🎬 Veo 3.1">
-                                        <option value="Veo 3.1 - Lite (Fast)">Veo 3.1 - Lite (Fast)</option>
-                                        <option value="Veo 3.1 - Fast (Balanced)">Veo 3.1 - Fast (Balanced)</option>
-                                        <option value="Veo 3.1 - Quality (High)">Veo 3.1 - Quality (High)</option>
-                                        <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 - Lite [Lower Priority]</option>
-                                    </optgroup>
+                                    <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 - Lite [Lower Priority]</option>
+                                    <option value="Omni 1.1 Flash">Omni 1.1 Flash (4s/6s/8s/10s)</option>
                                 </>
                             )}
                         </select>
-                        {model === 'Omni Flash' && (
+                        {model === 'Omni 1.1 Flash' && (
                             <p className="text-[9px] text-amber-400/80 mt-1 flex items-center gap-1">
                                 ⚡ Omni Flash tốn <span className="font-bold text-amber-300">30 tín dụng</span> / video
                             </p>
@@ -811,7 +777,7 @@ export default function VeoStudio({ dark = true }) {
                             <>
                                 <div className="flex flex-col gap-1">
                                     <label className="text-[9px] font-bold text-violet-400 ml-1 uppercase">Thời lượng</label>
-                                    {model === 'Omni Flash' ? (
+                                    {model === 'Omni 1.1 Flash' ? (
                                         <select value={duration} onChange={(e) => setDuration(e.target.value)} className="bg-[#1e293b] border border-violet-500/50 text-violet-300 font-bold text-xs rounded px-2 py-1.5 outline-none cursor-pointer">
                                             {['4s', '6s', '8s', '10s'].map(d => <option key={d} value={d}>{d}</option>)}
                                         </select>
@@ -847,14 +813,14 @@ export default function VeoStudio({ dark = true }) {
                                 <div className="flex flex-col gap-1">
                                     <label className="text-[9px] font-bold text-blue-400 ml-1 uppercase">Thời lượng</label>
                                     <select value={duration} onChange={(e) => setDuration(e.target.value)} className="bg-[#1e293b] border border-blue-500/50 text-blue-300 font-bold text-xs rounded px-2 py-1.5 outline-none cursor-pointer">
-                                        {(model === 'Omni Flash' ? ['4s', '6s', '8s', '10s'] : durations).map(d => <option key={d} value={d}>{d}</option>)}
+                                        {(model === 'Omni 1.1 Flash' ? ['4s', '6s', '8s', '10s'] : durations).map(d => <option key={d} value={d}>{d}</option>)}
                                     </select>
                                 </div>
                                 <div className="flex flex-col gap-1">
                                     <label className="text-[9px] font-bold text-blue-400 ml-1 uppercase">Độ phân giải</label>
                                     <select value={videoQuality} onChange={(e) => setVideoQuality(e.target.value)} className="bg-[#1e293b] border border-blue-500/50 text-blue-300 font-bold text-xs rounded px-2 py-1.5 outline-none cursor-pointer">
                                         <option value="720p">720p (Nhanh)</option>
-                                        {duration === '8s' && model !== 'Omni Flash' && <option value="1080p">1080p (Nét)</option>}
+                                        {duration === '8s' && model !== 'Omni 1.1 Flash' && <option value="1080p">1080p (Nét)</option>}
                                     </select>
                                 </div>
                             </>
@@ -969,6 +935,20 @@ export default function VeoStudio({ dark = true }) {
                                         >
                                             {VOICE_LIST.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
                                         </select>
+                                        {slot.voiceId && slot.voiceId !== 'random' && (
+                                            <button
+                                                title="Nghe thử giọng"
+                                                disabled={isGenerating}
+                                                onClick={async () => {
+                                                    const res = await window.electronAPI.voicePreview({ voiceId: slot.voiceId, text: 'xin chào, tôi là trợ lý AI của bạn' });
+                                                    if (res?.success && res.audioBase64) {
+                                                        const audio = new Audio(`data:${res.mimeType || 'audio/mp3'};base64,${res.audioBase64}`);
+                                                        audio.play().catch(() => {});
+                                                    }
+                                                }}
+                                                className="text-violet-400 hover:text-violet-200 shrink-0 disabled:opacity-40 text-[13px]"
+                                            >🔊</button>
+                                        )}
                                         {voiceSlots.length > 1 && (
                                             <button
                                                 onClick={() => setVoiceSlots(prev => prev.filter((_, i) => i !== idx))}
@@ -1086,10 +1066,7 @@ export default function VeoStudio({ dark = true }) {
                                 <label className="text-[9px] font-bold text-cyan-400 mb-1 block uppercase tracking-wider">Model Extend (dòng 2+)</label>
                                 <select value={extendModel} onChange={e => setExtendModel(e.target.value)} disabled={extendChainRunning}
                                     className="w-full bg-[#1e293b] border border-cyan-500/40 text-cyan-300 text-xs font-semibold rounded-lg px-3 py-2 focus:outline-none cursor-pointer">
-                                    <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 Extension Lite [Lower Priority]</option>
-                                    <option value="Veo 3.1 - Lite (Fast)">Veo 3.1 Extension Lite (Fast)</option>
-                                    <option value="Veo 3.1 - Fast (Balanced)">Veo 3.1 Extension Fast (Balanced)</option>
-                                    <option value="Veo 3.1 - Quality (High)">Veo 3.1 Extension Quality (High)</option>
+                                    <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 - Lite [Lower Priority]</option>
                                 </select>
                             </div>
 
@@ -1243,13 +1220,13 @@ export default function VeoStudio({ dark = true }) {
                     </div>
                     <div className="flex items-center gap-2">
                         {/* Nút tạo lại tất cả video lỗi — chỉ hiện khi có ít nhất 1 job failed và không đang chạy */}
-                        {!isGenerating && jobs.some(j => j.status === 'failed') && (
+                        {!isGenerating && jobs.some(j => j.status === 'error') && (
                             <button
                                 onClick={handleRetryAllFailed}
-                                title="Tạo lại tất cả video thất bại"
+                                title="Tạo lại tất cả ảnh/video thất bại"
                                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg bg-orange-900/30 hover:bg-orange-800/50 text-orange-400 border border-orange-700/40 transition-colors"
                             >
-                                <RefreshCw size={12} /> Tạo lại tất cả lỗi ({jobs.filter(j => j.status === 'failed').length})
+                                <RefreshCw size={12} /> Tạo lại lỗi ({jobs.filter(j => j.status === 'error').length})
                             </button>
                         )}
                         {isGenerating && (

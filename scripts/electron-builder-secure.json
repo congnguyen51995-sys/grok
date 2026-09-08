@@ -7,7 +7,7 @@
   },
   "extraMetadata": {
     "main": "build-protected/main/bootstrap.js",
-    "version": "2.4.1"
+    "version": "5.2.4"
   },
   "files": [
     "dist/**/*",
@@ -24,6 +24,10 @@
     {
       "from": "src/main/resources/grok-worker",
       "to": "grok-worker"
+    },
+    {
+      "from": "assets/voicestudio",
+      "to": "voicestudio"
     }
   ],
   "win": {

@@ -1,22 +1,23 @@
 import { GoogleGenAI } from "@google/genai";
 import { retryWithKeyRotation } from './keyRotation.js';
 
-const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_MODEL = 'gemini-3.5-flash';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ─── Core Gemini call ─────────────────────────────────────────────────────────
-async function geminiGenerate(apiKeys, systemInstruction, contentParts, maxTokens, onSwitch) {
+async function geminiGenerate(apiKeys, systemInstruction, contentParts, maxTokens, onSwitch, model) {
+  const useModel = model || GEMINI_MODEL;
   return retryWithKeyRotation(async (key) => {
     const ai = new GoogleGenAI({ apiKey: key });
     let response;
     try {
       response = await ai.models.generateContent({
-        model: GEMINI_MODEL,
+        model: useModel,
         contents: [{ role: 'user', parts: contentParts }],
         config: {
           systemInstruction: systemInstruction || undefined,
           maxOutputTokens: maxTokens,
-          thinkingConfig: { thinkingBudget: 0 },
+          ...(useModel === 'gemini-2.5-flash' ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
         }
       });
     } catch (err) {
@@ -144,7 +145,7 @@ export async function uploadVideoToGemini(apiKeys, file, onProgress) {
 
 // ─── Pha 1: Quét cấu trúc tổng thể video (output nhỏ, nhanh) ─────────────────
 // Mục tiêu: biết tổng thời lượng + danh sách đoạn 90-120s để chia nhỏ pha 2
-async function getVideoStructure(apiKeys, input, onSwitch) {
+async function getVideoStructure(apiKeys, input, onSwitch, model) {
   const videoParts = buildVideoContentPart(input);
 
   const prompt = `Xem toàn bộ video này và phân tích cấu trúc. Trả về JSON (chỉ JSON, không markdown, không giải thích):
@@ -166,7 +167,7 @@ QUY TẮC chia đoạn:
 - Đoạn cuối kết thúc đúng bằng total_duration_sec
 - Trả về JSON hợp lệ duy nhất`;
 
-  const raw = await geminiGenerate(apiKeys, null, [...videoParts, { text: prompt }], 3072, onSwitch);
+  const raw = await geminiGenerate(apiKeys, null, [...videoParts, { text: prompt }], 3072, onSwitch, model);
 
   const jsonMatch = raw.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error('Không đọc được cấu trúc video (AI không trả về JSON hợp lệ).');
@@ -196,7 +197,7 @@ const LANG_FULL = {
 };
 
 // ─── Pha 2: Phân tích chi tiết 1 đoạn theo chế độ ────────────────────────────
-async function analyzeSegment(apiKeys, input, seg, totalSegs, mode, channelTopic, newTopic, structure, onSwitch, stylePrompt = null, targetLang = null) {
+async function analyzeSegment(apiKeys, input, seg, totalSegs, mode, channelTopic, newTopic, structure, onSwitch, stylePrompt = null, targetLang = null, model) {
   const videoParts = buildVideoContentPart(input);
 
   const modeInstructions = {
@@ -292,12 +293,12 @@ ${mode === 6 ? `4. PHẢI xuất đủ ${Math.round((seg.to_sec - seg.from_sec) 
     apiKeys, null,
     [...videoParts, { text: prompt }],
     mode === 6 ? Math.max(16384, Math.round((seg.to_sec - seg.from_sec) / 8) * 900) : 6144,
-    onSwitch
+    onSwitch, model
   );
 }
 
 // ─── Pha 3: Tổng hợp kết quả Mode 2 (cần merge thông minh) ───────────────────
-async function synthesizeMode2(apiKeys, results, structure, channelTopic, onSwitch) {
+async function synthesizeMode2(apiKeys, results, structure, channelTopic, onSwitch, model) {
   const allAnalyses = results.map(r =>
     `ĐOẠN ${r.segment.idx} (${r.segment.from}–${r.segment.to}) — "${r.segment.title}":\n${r.content}`
   ).join('\n\n---\n\n');
@@ -320,7 +321,7 @@ Tổng hợp toàn bộ thành báo cáo hoàn chỉnh:
 ## 💡 Bài Học Áp Dụng Cho Kênh "${channelTopic || 'của bạn'}"
 [3-5 điểm cụ thể, thực tế có thể làm ngay]`;
 
-  return await geminiGenerate(apiKeys, null, [{ text: prompt }], 4096, onSwitch);
+  return await geminiGenerate(apiKeys, null, [{ text: prompt }], 4096, onSwitch, model);
 }
 
 // ─── Mode 6: Parse JSON lines từ raw text ────────────────────────────────────
@@ -339,7 +340,7 @@ function parseMode6Scenes(rawText) {
 }
 
 // ─── Mode 6: Bổ sung cảnh thiếu sau mỗi segment ──────────────────────────────
-async function fillMissingMode6Scenes(apiKeys, input, seg, structure, rawContent, onProgress, onSwitch, stylePrompt = null, targetLang = null) {
+async function fillMissingMode6Scenes(apiKeys, input, seg, structure, rawContent, onProgress, onSwitch, stylePrompt = null, targetLang = null, model) {
   const startId = Math.round(seg.from_sec / 8) + 1;
   const endId   = Math.round(seg.to_sec   / 8);
   const sceneMap = parseMode6Scenes(rawContent);
@@ -377,7 +378,7 @@ Xuất đúng ${missing.length} dòng JSON (scene_id: ${missing.join(', ')}):
 
   try {
     const raw = await geminiGenerate(apiKeys, null, [...videoParts, { text: fillPrompt }],
-      Math.max(4096, missing.length * 1200), onSwitch);
+      Math.max(4096, missing.length * 1200), onSwitch, model);
     const newMap = parseMode6Scenes(raw);
     for (const [id, line] of newMap) {
       if (missing.includes(id)) sceneMap.set(id, line);
@@ -389,14 +390,14 @@ Xuất đúng ${missing.length} dòng JSON (scene_id: ${missing.join(', ')}):
 }
 
 // ─── Main export ──────────────────────────────────────────────────────────────
-export async function analyzeAndCloneScript(apiKeys, input, mode, channelTopic, newTopic, onSwitch, onProgress, stylePrompt = null, targetLang = null) {
+export async function analyzeAndCloneScript(apiKeys, input, mode, channelTopic, newTopic, onSwitch, onProgress, stylePrompt = null, targetLang = null, model) {
 
   // ══ Pha 1: Quét cấu trúc video ══════════════════════════════════════════════
   onProgress?.({ phase: 'structure', done: 0, total: 0, message: '🔍 Pha 1/3: Đang quét cấu trúc tổng thể video...' });
 
   let structure;
   try {
-    structure = await getVideoStructure(apiKeys, input, onSwitch);
+    structure = await getVideoStructure(apiKeys, input, onSwitch, model);
   } catch (e) {
     // Nếu Gemini không truy cập được YouTube → throw ngay, không fallback vô ích
     if (e.message.includes('Gemini không thể truy cập') || e.message.includes('text/html') || e.message.includes('Unsupported MIME type')) {
@@ -404,7 +405,7 @@ export async function analyzeAndCloneScript(apiKeys, input, mode, channelTopic, 
     }
     // Fallback: đơn giản hóa nếu quét cấu trúc lỗi (video rất ngắn hoặc URL không hợp lệ)
     onProgress?.({ phase: 'fallback', done: 0, total: 1, message: `⚠️ Quét cấu trúc lỗi (${e.message.slice(0, 80)}), chuyển sang xử lý đơn...` });
-    return singlePassFallback(apiKeys, input, mode, channelTopic, newTopic, onSwitch, stylePrompt, targetLang);
+    return singlePassFallback(apiKeys, input, mode, channelTopic, newTopic, onSwitch, stylePrompt, targetLang, model);
   }
 
   const { segments } = structure;
@@ -435,12 +436,12 @@ export async function analyzeAndCloneScript(apiKeys, input, mode, channelTopic, 
     try {
       let detail = await analyzeSegment(
         apiKeys, input, seg, segments.length,
-        mode, channelTopic, newTopic, structure, onSwitch, stylePrompt, targetLang
+        mode, channelTopic, newTopic, structure, onSwitch, stylePrompt, targetLang, model
       );
 
       // Mode 6: kiểm tra và bổ sung cảnh thiếu ngay sau mỗi segment
       if (mode === 6) {
-        detail = await fillMissingMode6Scenes(apiKeys, input, seg, structure, detail, onProgress, onSwitch, stylePrompt, targetLang);
+        detail = await fillMissingMode6Scenes(apiKeys, input, seg, structure, detail, onProgress, onSwitch, stylePrompt, targetLang, model);
       }
 
       results.push({ segment: seg, content: detail });
@@ -474,7 +475,7 @@ export async function analyzeAndCloneScript(apiKeys, input, mode, channelTopic, 
 
   if (mode === 2) {
     // Mode 2 cần merge thông minh — gọi thêm 1 lần Gemini để tổng hợp
-    finalOutput = await synthesizeMode2(apiKeys, results, structure, channelTopic, onSwitch);
+    finalOutput = await synthesizeMode2(apiKeys, results, structure, channelTopic, onSwitch, model);
 
   } else if (mode === 6) {
     // Mode 6: gom tất cả scenes, sort theo scene_id, loại trùng
@@ -503,7 +504,7 @@ export async function analyzeAndCloneScript(apiKeys, input, mode, channelTopic, 
 }
 
 // ─── Fallback: gửi 1 lần (video ngắn / cấu trúc lỗi) ────────────────────────
-async function singlePassFallback(apiKeys, input, mode, channelTopic, newTopic, onSwitch, stylePrompt = null, targetLang = null) {
+async function singlePassFallback(apiKeys, input, mode, channelTopic, newTopic, onSwitch, stylePrompt = null, targetLang = null, model) {
   const videoParts = buildVideoContentPart(input);
 
   const systemInstruction = `
@@ -530,5 +531,5 @@ Phân tích TOÀN BỘ video từ đầu đến cuối. Bao phủ 100% nội dun
     modeNote += `\n🌐 NGÔN NGỮ THOẠI BẮT BUỘC: Tất cả "lines" trong audio.dialogue PHẢI viết bằng ${tLangFull.toUpperCase()}.`;
   }
   const contentParts = [...videoParts, { text: `${modeNote}.\nPhân tích TOÀN BỘ video từ đầu đến cuối, không bỏ sót phần nào.` }];
-  return await geminiGenerate(apiKeys, systemInstruction, contentParts, mode === 6 ? 16384 : 8192, onSwitch);
+  return await geminiGenerate(apiKeys, systemInstruction, contentParts, mode === 6 ? 16384 : 8192, onSwitch, model);
 }

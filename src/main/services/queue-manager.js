@@ -7,7 +7,7 @@ class QueueManager {
     this.playwrightEngine = options.playwrightEngine;
     this.queue = null;
     this.isRunning = true;
-    this.concurrency = options.concurrency || 1;
+    this.concurrency = 8;
   }
 
   async init() {
@@ -22,10 +22,8 @@ class QueueManager {
   /**
    * Thay đổi số lượng chạy song song
    */
-  setConcurrency(n) {
-    const oldConcurrency = this.queue.concurrency;
-    this.queue.concurrency = Math.max(1, n);
-    console.log(`Concurrency changed: ${oldConcurrency} -> ${this.queue.concurrency}`);
+  setConcurrency(_n) {
+    // Hardcoded to 8 — không cho phép thay đổi
   }
 
   /**

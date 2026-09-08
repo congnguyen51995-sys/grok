@@ -1,0 +1,6 @@
+{
+  "version": "5.2.4",
+  "releaseNotes": "- AI Agent: SCENES strip hiển thị thumbnail video (frame đầu) thay vì màu đen\n- AI Agent: mặc định 16:9, brollMode auto, TTS 4 luồng song song (giảm tải CPU)\n- AI Agent: chế độ Video AI bypass hoàn toàn stock footage, dùng Veo tạo video AI\n- AI Agent: pre-render check đúng — block render khi còn cảnh thiếu visual (tối đa 3 lần)\n- AI Agent: fix React error #31 khi narration là object {text:...}\n- GPU auto-detection: Kokoro TTS và Demucs tự dùng CUDA/DirectML nếu máy hỗ trợ",
+  "downloadUrl": "REPLACE_WITH_INSTALLER_DOWNLOAD_URL",
+  "mandatory": false
+}

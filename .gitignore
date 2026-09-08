@@ -25,6 +25,8 @@ debug/
 .env
 .env.*
 .env.local
+src/main/system-keys.json
+groq-keys.json
 
 # OS files
 .DS_Store

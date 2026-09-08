@@ -1,4 +1,17 @@
-﻿import React, { useState, useEffect, useCallback, useRef } from 'react'
+﻿import React, { useState, useEffect, useCallback, useRef, Component } from 'react'
+
+class ErrorBoundary extends Component {
+  state = { error: null };
+  static getDerivedStateFromError(e) { return { error: e }; }
+  render() {
+    if (this.state.error) return (
+      <div style={{padding:32,color:'#f87171',fontFamily:'monospace',whiteSpace:'pre-wrap'}}>
+        <b>⚠️ Lỗi render:</b>{'\n'}{this.state.error.message}{'\n\n'}{this.state.error.stack}
+      </div>
+    );
+    return this.props.children;
+  }
+}
 import {
   Play, Plus, Download, RefreshCw, Trash2, X, Pause, Ban,
   ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Terminal, LogIn, Pencil,
@@ -9,9 +22,15 @@ import {
 import JobCard from './components/JobCard'
 import VoiceStudio from './components/VoiceStudio'
 import VideoStudio from './components/VideoStudio'
+import CapCutEditor from './components/CapCutEditor'
 import VeoStudio from './components/VeoStudio'
 import CreatorStudio from './components/CreatorStudio'
 import AutoAnimation from './components/AutoAnimation'
+import DramaStudio from './components/DramaStudio'
+import ReupVideo from './components/ReupVideo'
+import AudioStoryPanel from './components/AudioStoryPanel'
+import RemotionStudio from './components/RemotionStudio'
+import AIVideoRemixer from './components/AIVideoRemixer'
 import Settings from './components/Settings'
 
 const MODES = [
@@ -98,12 +117,6 @@ function SettingsModal({ profile, downloadsDir, onSave, onClose, dark }) {
             </div>
           </div>
           <div>
-            <p className={`text-[11px] font-semibold uppercase tracking-widest mb-2 ${label}`}>Số luồng song song</p>
-            <input type="number" min="1" max="50" value={conc}
-              onChange={e => setConc(Math.max(1, parseInt(e.target.value) || 1))}
-              className={`w-full border rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${dark ? 'bg-slate-700 border-slate-600 text-slate-100' : 'border-gray-200 text-gray-700'}`} />
-          </div>
-          <div>
             <p className={`text-[11px] font-semibold uppercase tracking-widest mb-2 ${label}`}>Thư mục lưu file</p>
             <div className={`flex items-center gap-2 p-2.5 rounded-xl border ${dark ? 'bg-slate-700 border-slate-600' : 'bg-gray-50 border-gray-200'}`}>
               <FolderOpen className={`w-4 h-4 flex-shrink-0 ${dark ? 'text-blue-400' : 'text-blue-500'}`} />
@@ -123,8 +136,89 @@ function SettingsModal({ profile, downloadsDir, onSave, onClose, dark }) {
   )
 }
 
+// ─── Navigation groups ────────────────────────────────────────────────────────
+const NAV_GROUPS = [
+  {
+    id: 'ai-agent', label: '🤖 AI Agent',
+    activeCls: 'bg-purple-600 text-white shadow-lg shadow-purple-900/40',
+    inactiveCls: 'bg-purple-900/30 text-purple-300 hover:bg-purple-700 hover:text-white border border-purple-700/40',
+    tabs: [
+      { id: 'ai-remixer', label: 'AI Agent', emoji: '🤖', activeCls: 'bg-purple-600 text-white', inactiveCls: 'bg-purple-900/40 text-purple-300 hover:bg-purple-600/70 hover:text-white border border-purple-700/40' },
+    ],
+  },
+  {
+    id: 'sang-tac', label: '✍️ Sáng Tác',
+    activeCls: 'bg-violet-600 text-white shadow-lg shadow-violet-900/40',
+    inactiveCls: 'bg-violet-900/30 text-violet-300 hover:bg-violet-700 hover:text-white border border-violet-700/40',
+    tabs: [
+      { id: 'creator', label: 'Nội Dung',  emoji: '📝', activeCls: 'bg-violet-600 text-white', inactiveCls: 'bg-violet-900/40 text-violet-300 hover:bg-violet-600/70 hover:text-white border border-violet-700/40' },
+      { id: 'voice',   label: 'Voice TTS', emoji: '🎙️', activeCls: 'bg-emerald-600 text-white', inactiveCls: 'bg-emerald-900/40 text-emerald-300 hover:bg-emerald-600/70 hover:text-white border border-emerald-700/40' },
+    ],
+  },
+  {
+    id: 'video-ai', label: '🎬 Tạo Video AI',
+    activeCls: 'bg-orange-600 text-white shadow-lg shadow-orange-900/40',
+    inactiveCls: 'bg-orange-900/30 text-orange-300 hover:bg-orange-700 hover:text-white border border-orange-700/40',
+    tabs: [
+      { id: 'veo',     label: 'Veo Studio',     emoji: '🎬', activeCls: 'bg-orange-600 text-white', inactiveCls: 'bg-orange-900/40 text-orange-300 hover:bg-orange-600/70 hover:text-white border border-orange-700/40' },
+      { id: 'auto',    label: 'Auto Animation', emoji: '⚡', activeCls: 'bg-purple-600 text-white', inactiveCls: 'bg-purple-900/40 text-purple-300 hover:bg-purple-600/70 hover:text-white border border-purple-700/40' },
+      { id: 'grok',    label: 'Grok Queue',     emoji: '🚀', activeCls: 'bg-sky-600 text-white',      inactiveCls: 'bg-sky-900/40 text-sky-300 hover:bg-sky-600/70 hover:text-white border border-sky-700/40' },
+      { id: 'drama',   label: 'Drama AI',       emoji: '🎭', activeCls: 'bg-emerald-600 text-white',  inactiveCls: 'bg-emerald-900/40 text-emerald-300 hover:bg-emerald-600/70 hover:text-white border border-emerald-700/40' },
+    ],
+  },
+  {
+    id: 'reup', label: '🔄 Reup',
+    activeCls: 'bg-rose-600 text-white shadow-lg shadow-rose-900/40',
+    inactiveCls: 'bg-rose-900/30 text-rose-300 hover:bg-rose-700 hover:text-white border border-rose-700/40',
+    tabs: [
+      { id: 'reup',         label: 'Reup Video',  emoji: '🎥', activeCls: 'bg-rose-600 text-white',   inactiveCls: 'bg-rose-900/40 text-rose-300 hover:bg-rose-600/70 hover:text-white border border-rose-700/40' },
+      { id: 'reup-taitao',  label: 'Tái Tạo',    emoji: '🎬', activeCls: 'bg-orange-600 text-white', inactiveCls: 'bg-orange-900/40 text-orange-300 hover:bg-orange-600/70 hover:text-white border border-orange-700/40' },
+      { id: 'mc-studio',    label: 'Truyện Audio', emoji: '🎙️', activeCls: 'bg-pink-600 text-white',   inactiveCls: 'bg-pink-900/40 text-pink-300 hover:bg-pink-600/70 hover:text-white border border-pink-700/40' },
+    ],
+  },
+  {
+    id: 'video-editor', label: '🎞️ Video Editor',
+    activeCls: 'bg-teal-600 text-white shadow-lg shadow-teal-900/40',
+    inactiveCls: 'bg-teal-900/30 text-teal-300 hover:bg-teal-700 hover:text-white border border-teal-700/40',
+    tabs: [
+      { id: 'video',    label: 'Video Editor',    emoji: '🎞️', activeCls: 'bg-teal-600 text-white',   inactiveCls: 'bg-teal-900/40 text-teal-300 hover:bg-teal-600/70 hover:text-white border border-teal-700/40' },
+      { id: 'remotion', label: 'Remotion Studio', emoji: '🎬', activeCls: 'bg-violet-600 text-white', inactiveCls: 'bg-violet-900/40 text-violet-300 hover:bg-violet-600/70 hover:text-white border border-violet-700/40' },
+    ],
+  },
+  {
+    id: 'capcut', label: '✂️ CapCut',
+    activeCls: 'bg-cyan-600 text-white shadow-lg shadow-cyan-900/40',
+    inactiveCls: 'bg-cyan-900/30 text-cyan-300 hover:bg-cyan-700 hover:text-white border border-cyan-700/40',
+    tabs: [{ id: 'capcut', label: 'CapCut Editor', emoji: '✂️', activeCls: 'bg-cyan-600 text-white', inactiveCls: '' }],
+  },
+  {
+    id: 'settings', label: '⚙️ Cài đặt',
+    activeCls: 'bg-slate-600 text-white shadow-lg shadow-slate-900/40',
+    inactiveCls: 'bg-slate-800/60 text-slate-400 hover:bg-slate-700 hover:text-white border border-slate-700/40',
+    tabs: [{ id: 'settings', label: 'Cài đặt', emoji: '⚙️', activeCls: 'bg-slate-600 text-white', inactiveCls: '' }],
+  },
+];
+function getGroupByTab(tabId) {
+  return NAV_GROUPS.find(g => g.tabs.some(t => t.id === tabId)) || NAV_GROUPS[0];
+}
+
 export default function App({ onLicenseExpired }) {
-  const [currentTab,      setCurrentTab]      = useState('grok') 
+  const [currentTab, setCurrentTab] = useState(() => localStorage.getItem('fluxy_last_tab') || 'ai-remixer')
+  const [mainGroup,  setMainGroup]  = useState(() => getGroupByTab(localStorage.getItem('fluxy_last_tab') || 'ai-remixer').id)
+
+  const switchTab = (tab) => {
+    setCurrentTab(tab);
+    setMainGroup(getGroupByTab(tab).id);
+    localStorage.setItem('fluxy_last_tab', tab);
+  }
+  const switchGroup = (groupId) => {
+    const group = NAV_GROUPS.find(g => g.id === groupId);
+    if (!group) return;
+    setMainGroup(groupId);
+    // Navigate to first tab of group (or keep current if already in this group)
+    const inGroup = group.tabs.some(t => t.id === currentTab);
+    if (!inGroup) switchTab(group.tabs[0].id);
+  }
   const [jobs,            setJobs]            = useState([])
   const [profiles,        setProfiles]        = useState(DEFAULT_PROFILES)
   const [loginStatus,     setLoginStatus]     = useState({})
@@ -149,6 +243,44 @@ export default function App({ onLicenseExpired }) {
 
   useEffect(() => {
     window.electronAPI?.getAppVersion?.().then(v => setAppVersion(v || ''));
+  }, []);
+
+  // Nạp system Gemini keys (built-in) — merge vào localStorage nếu chưa có
+  useEffect(() => {
+    window.electronAPI?.getSystemGeminiKeys?.().then(systemKeys => {
+      if (!systemKeys?.length) return;
+      const LS_KEY = 'fluxy_gemini_api_keys';
+      const current = (() => { try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch { return []; } })();
+      const merged = [...new Set([...systemKeys, ...current])];
+      if (merged.length !== current.length) {
+        localStorage.setItem(LS_KEY, JSON.stringify(merged));
+        // Cũng lưu vào electron db để persist qua reinstall
+        window.electronAPI?.setSetting?.(LS_KEY, JSON.stringify(merged)).catch(() => {});
+      }
+    }).catch(() => {});
+  }, []);
+
+  // Sync API keys từ electron db → localStorage khi app khởi động
+  // (localStorage có thể bị xóa khi reinstall, electron db thì không)
+  useEffect(() => {
+    const API_KEY_SLOTS = [
+      { db: 'fluxy_gemini_api_keys',   ls: 'fluxy_gemini_api_keys',   isJson: true  },
+      { db: 'fluxy_groq_api_keys',     ls: 'fluxy_groq_api_keys',     isJson: true  },
+      { db: 'fluxy_groq_model',        ls: 'fluxy_groq_model',        isJson: false },
+      { db: 'fluxy_claude_api_key',    ls: 'fluxy_claude_api_key',    isJson: false },
+      { db: 'fluxy_claude_model',      ls: 'fluxy_claude_model',      isJson: false },
+      { db: 'elevenlabs_api_keys_v3',  ls: 'elevenlabs_api_keys_v3',  isJson: true  },
+    ];
+    if (!window.electronAPI?.getSetting) return;
+    API_KEY_SLOTS.forEach(({ db, ls, isJson }) => {
+      window.electronAPI.getSetting(db, isJson ? '[]' : '').then(val => {
+        if (!val || val === (isJson ? '[]' : '')) return;
+        const current = localStorage.getItem(ls);
+        if (!current || current === (isJson ? '[]' : '') || current === 'null') {
+          localStorage.setItem(ls, val);
+        }
+      }).catch(() => {});
+    });
   }, []);
 
   // --- STATE BẢN QUYỀN GLOBAL ---
@@ -215,21 +347,10 @@ export default function App({ onLicenseExpired }) {
       setUpdateProgress(percent);
     });
 
-    // Tải xong → đếm ngược 30s rồi tự cài
+    // Tải xong → hiển thị "đang cài đặt", main process sẽ tự chạy silent installer
     window.electronAPI?.onUpdateDownloaded?.(() => {
       setUpdatePhase('ready');
-      setCountdown(30);
-      if (countdownRef.current) clearInterval(countdownRef.current);
-      countdownRef.current = setInterval(() => {
-        setCountdown(prev => {
-          if (prev <= 1) {
-            clearInterval(countdownRef.current);
-            window.electronAPI?.installUpdate?.();
-            return 0;
-          }
-          return prev - 1;
-        });
-      }, 1000);
+      // Main process tự cài /S sau 3s — renderer chỉ cần thông báo
     });
 
     // Lỗi tải → hiển thị, main sẽ tự thử lại sau 2 phút
@@ -383,7 +504,6 @@ export default function App({ onLicenseExpired }) {
       if (newSettings.downloadsDir) setDownloadsDir(newSettings.downloadsDir);
       setShowSettings(false);
       await window.electronAPI.setSetting('profiles', JSON.stringify(updatedProfiles));
-      await window.electronAPI.setConcurrency(newSettings.concurrency);
     } catch (error) { console.error(error); }
   }
 
@@ -435,7 +555,6 @@ export default function App({ onLicenseExpired }) {
   const handleAddToQueue = async () => {
     setAdding(true)
     try {
-      await window.electronAPI.setConcurrency(activeProfile.concurrency)
       setGrokLogs(prev => [...prev.slice(-199), { time: new Date().toLocaleTimeString(), text: `Đang thêm jobs vào hàng đợi — profile: ${activeProfile.name}`, type: 'info' }])
 
       const baseIndex = jobs.length;
@@ -697,8 +816,10 @@ export default function App({ onLicenseExpired }) {
         </div>
       )}
 
-      {/* --- CẬP NHẬT HEADER BAO GỒM BẢN QUYỀN --- */}
-      <header className="h-14 bg-black flex items-center px-4 gap-3 flex-shrink-0">
+      {/* --- HEADER --- */}
+      <header className="bg-black flex-shrink-0">
+        {/* Row 1: Logo + Group tabs + License */}
+        <div className="h-14 flex items-center px-4 gap-3">
 
         {/* Logo Fluxy */}
         <div className="flex items-center gap-2 border-r border-slate-800 pr-4 mr-1 shrink-0">
@@ -713,29 +834,17 @@ export default function App({ onLicenseExpired }) {
           </div>
         </div>
 
-        {/* Nút Tab */}
-        <div className="flex items-center gap-1.5 border-r border-slate-800 pr-3 mr-1">
-            <button onClick={() => setCurrentTab('grok')} className={`px-4 py-1.5 rounded-md text-sm font-bold transition-colors ${currentTab === 'grok' ? 'bg-white text-black' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}>
-            Grok Studio
-            </button>
-            <button onClick={() => setCurrentTab('veo')} className={`px-4 py-1.5 rounded-md text-sm font-bold transition-colors flex items-center gap-2 ${currentTab === 'veo' ? 'bg-orange-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}>
-            Veo Studio
-            </button>
-            <button onClick={() => setCurrentTab('voice')} className={`px-4 py-1.5 rounded-md text-sm font-bold transition-colors flex items-center gap-2 ${currentTab === 'voice' ? 'bg-emerald-500 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}>
-            <Mic size={16} /> Voice Studio
-            </button>
-            <button onClick={() => setCurrentTab('video')} className={`px-4 py-1.5 rounded-md text-sm font-bold transition-colors flex items-center gap-2 ${currentTab === 'video' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}>
-            <Film size={16} /> Video Editor
-            </button>
-            <button onClick={() => setCurrentTab('creator')} className={`px-4 py-1.5 rounded-md text-sm font-bold transition-colors flex items-center gap-2 ${currentTab === 'creator' ? 'bg-violet-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}>
-            <Sparkles size={16} /> Creator
-            </button>
-            <button onClick={() => setCurrentTab('auto')} className={`px-4 py-1.5 rounded-md text-sm font-bold transition-colors flex items-center gap-2 ${currentTab === 'auto' ? 'bg-purple-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}>
-            <Layers size={16} /> Auto Animation
-            </button>
-            <button onClick={() => setCurrentTab('settings')} className={`px-4 py-1.5 rounded-md text-sm font-bold transition-colors flex items-center gap-2 ${currentTab === 'settings' ? 'bg-slate-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}>
-            <SettingsIcon size={16} /> Cài đặt
-            </button>
+        {/* ── Group tabs (5 nhóm) ── */}
+        <div className="flex items-center gap-2 border-r border-slate-800 pr-4 mr-1">
+          {NAV_GROUPS.map(group => {
+            const isActive = mainGroup === group.id;
+            return (
+              <button key={group.id} onClick={() => switchGroup(group.id)}
+                className={`px-4 py-2 rounded-lg text-[13px] font-black transition-all ${isActive ? group.activeCls : group.inactiveCls}`}>
+                {group.label}
+              </button>
+            );
+          })}
         </div>
 
         {/* --- KHỐI BẢN QUYỀN GLOBAL --- */}
@@ -762,6 +871,30 @@ export default function App({ onLicenseExpired }) {
           </div>
         )}
 
+        </div>{/* end row 1 */}
+
+        {/* Row 2: Sub-tabs of active group (hidden when group has only 1 tab) */}
+        {(() => {
+          const group = NAV_GROUPS.find(g => g.id === mainGroup);
+          if (!group || group.tabs.length <= 1) return null;
+          return (
+            <div className="h-10 border-t border-slate-800/80 bg-[#060a12] flex items-center px-4 gap-2">
+              {group.tabs.map(tab => {
+                const isActive = currentTab === tab.id;
+                return (
+                  <button key={tab.id} onClick={() => switchTab(tab.id)}
+                    className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-[13px] font-black transition-all ${
+                      isActive ? tab.activeCls : tab.inactiveCls
+                    }`}>
+                    <span className="text-[14px]">{tab.emoji}</span>
+                    <span>{tab.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          );
+        })()}
+
       </header>
 
       {/* --- KHU VỰC HIỂN THỊ NỘI DUNG TÙY THEO TAB --- */}
@@ -773,6 +906,7 @@ export default function App({ onLicenseExpired }) {
           <VeoStudio dark={dark} />
         </div>
 
+
         {/* ── VOICE STUDIO (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'voice' ? 'flex' : 'none' }}>
           <VoiceStudio dark={dark} />
@@ -783,6 +917,13 @@ export default function App({ onLicenseExpired }) {
           <VideoStudio dark={dark} />
         </div>
 
+        {/* ── CAPCUT EDITOR (mount on first visit) ── */}
+        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'capcut' ? 'flex' : 'none' }}>
+          <ErrorBoundary>
+            <CapCutEditor />
+          </ErrorBoundary>
+        </div>
+
         {/* ── CREATOR STUDIO (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'creator' ? 'flex' : 'none' }}>
           <CreatorStudio />
@@ -791,6 +932,38 @@ export default function App({ onLicenseExpired }) {
         {/* ── AUTO ANIMATION (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'auto' ? 'flex' : 'none' }}>
           <AutoAnimation />
+        </div>
+
+        {/* ── REUP VIDEO: YouTube + Bilibili (always mounted) ── */}
+        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'reup' ? 'flex' : 'none' }}>
+          <ReupVideo initialTab="ytchannel" />
+        </div>
+
+        {/* ── TÁI TẠO VIDEO (always mounted) ── */}
+        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'reup-taitao' ? 'flex' : 'none' }}>
+          <ReupVideo initialTab="recreate" />
+        </div>
+
+
+
+        {/* ── MC STUDIO (always mounted) ── */}
+        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'mc-studio' ? 'flex' : 'none' }}>
+          <ErrorBoundary><AudioStoryPanel /></ErrorBoundary>
+        </div>
+
+        {/* ── REMOTION STUDIO (always mounted) ── */}
+        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'remotion' ? 'flex' : 'none' }}>
+          <ErrorBoundary><RemotionStudio /></ErrorBoundary>
+        </div>
+
+        {/* ── AI VIDEO REMIXER (always mounted) ── */}
+        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'ai-remixer' ? 'flex' : 'none' }}>
+          <ErrorBoundary><AIVideoRemixer /></ErrorBoundary>
+        </div>
+
+        {/* ── DRAMA AI STUDIO (always mounted) ── */}
+        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'drama' ? 'flex' : 'none' }}>
+          <ErrorBoundary><DramaStudio /></ErrorBoundary>
         </div>
 
         {/* ── SETTINGS (always mounted) ── */}
@@ -898,19 +1071,6 @@ export default function App({ onLicenseExpired }) {
                       </select>
                     </div>
                   )}
-                </div>
-
-                {/* Số luồng song song */}
-                <div className="flex flex-col gap-1">
-                  <label className="text-[9px] font-bold text-slate-500 ml-1 uppercase">Số luồng song song</label>
-                  <div className="flex gap-1">
-                    {[1,2,3,5,8,10].map(n => (
-                      <button key={n} onClick={() => saveProfiles(profiles.map(p => p.id === activeProfileId ? { ...p, concurrency: n } : p))}
-                        className={`flex-1 py-1.5 rounded-md text-[10px] font-bold border transition-all ${(activeProfile?.concurrency || 5) === n ? 'bg-blue-600 border-blue-500 text-white' : 'bg-[#1e293b] border-slate-700 text-slate-500 hover:text-slate-300'}`}>
-                        {n}
-                      </button>
-                    ))}
-                  </div>
                 </div>
 
                 {/* Thư mục lưu file */}

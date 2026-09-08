@@ -1,26 +1,41 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { generateCinematicPrompts } from '../services/geminiPrompt';
+﻿import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { generateSeoMetadata, generateThumbnailPromptsOnly, analyzeThumbImageToPrompt } from './CreatorStudio';
+import { generateCinematicPrompts, setGeminiPromptModel } from '../services/geminiPrompt';
 import { generateScript } from '../services/scriptGenerator';
 import { analyzeAndCloneScript, uploadVideoToGemini } from '../services/geminiClone';
 import {
   transcribeAudio, transcribeAudioChunked,
   createTimeBasedChunks, createNaturalChunks,
   analyzeScenes, analyzeOverallContent,
-  exportToTxt, exportToJson, exportToMarkdown
+  analyzeScenesContinuity,
+  exportToTxt, exportToJson, exportToMarkdown,
+  generateStockKeywordsAI,
+  analyzeForGeminiStock,
+  setAudioToVideoLLMModel,
 } from '../services/audioToVideo';
 import { transcribeLocalChunked } from '../services/whisperLocal.js';
 import { retryWithKeyRotation } from '../services/keyRotation.js';
+import { generateScriptClaude } from '../services/claudeService';
+import { generateCinematicPromptsClaude, analyzeScenesClaude, analyzeOverallContentClaude, callClaudeVision } from '../services/claudePrompt';
+import { loadGroqKeys, loadGroqModel, DEFAULT_GROQ_MODEL, transcribeGroqChunked, callGroqWithRotation } from '../services/groqService';
+import { generateScriptGroq, generateCinematicPromptsGroq, analyzeOverallContentGroq, analyzeScenesToGroq, generateStockKeywordsGroq } from '../services/groqPrompt';
 import {
   Play, Square, Pause, FolderOpen, CheckCircle2, Loader2, Zap, Music2,
   AlertCircle, ChevronRight, ChevronLeft, Film, Image as ImageIcon, Sparkles,
   FileText, Brain, Layers, Copy, Check, ChevronDown, ChevronUp,
   Video, Scissors, ExternalLink, Cpu, Wand2,
   UploadCloud, Download, Clock, Mic, RefreshCw,
-  Languages, Flame, Terminal, Link, Volume2, VolumeX, X, Users, ImagePlus,
+  Languages, Flame, Terminal, Link, Volume2, VolumeX, X, Users, ImagePlus, Plus,
 } from 'lucide-react';
 
+
 // ─── Constants ───────────────────────────────────────────────────────────────
-const LS_KEYS = 'fluxy_gemini_api_keys';
+const LS_KEYS        = 'fluxy_gemini_api_keys';
+const LS_CLAUDE_KEY  = 'fluxy_claude_api_key';
+const LS_CLAUDE_MDL  = 'fluxy_claude_model';
+const CLAUDE_DEFAULT = 'claude-sonnet-4-5';
+function loadClaudeKey()   { return localStorage.getItem(LS_CLAUDE_KEY)  || ''; }
+function loadClaudeModel() { return localStorage.getItem(LS_CLAUDE_MDL)  || CLAUDE_DEFAULT; }
 
 const PLATFORMS = ['TikTok dọc', 'YouTube ngang', 'YouTube Shorts', 'Instagram Reels', 'Facebook'];
 const LANGUAGES = [
@@ -73,10 +88,11 @@ const TONES = [
   'Hài hước & Châm biếm', 'Sâu lắng & Cảm động',
   'Hiện đại & Năng động', 'Hoài cổ & Cinematic',
 ];
-const RATIOS    = ['9:16', '16:9', '1:1'];
-const DURS_VEO  = [4, 6, 8];
-const IMG_MDL   = ['Nano Banana Pro', 'Nano Banana 2', 'Imagen 4'];
-const VID_MDL   = ['Veo 3.1 - Lite [Lower Priority]', 'Veo 3.1 - Lite (Fast)', 'Veo 3.1 - Fast (Balanced)', 'Omni Flash'];
+const RATIOS      = ['16:9', '9:16', '1:1', '4:3', '3:4'];
+const IMG_QUALITY = ['1K', '2K', '4K'];
+const DURS_VEO    = [4, 6, 8];
+const IMG_MDL     = ['Nano Banana Pro', 'Nano Banana 2', 'Nano Banana 2 Lite'];
+const VID_MDL   = ['Veo 3.1 - Lite [Lower Priority]', 'Omni 1.1 Flash'];
 const VOICE_LIST = [
   { id: '',                gender: null,      label: 'Không có giọng' },
   { id: 'random',          gender: null,      label: '🎲 Ngẫu nhiên' },
@@ -166,6 +182,30 @@ function makeSubmitGuard() {
 const VOICE_POOL_MALE    = VOICE_POOL.filter(v => v.gender === 'male');
 const VOICE_POOL_FEMALE  = VOICE_POOL.filter(v => v.gender === 'female');
 const VOICE_POOL_NEUTRAL = VOICE_POOL.filter(v => v.gender === 'neutral');
+
+// ── Pre-upload Ingredient images → thay ingredientImages bằng ingredientMediaIds ──
+// Upload từng đường dẫn file duy nhất 1 lần, tất cả tasks dùng chung mediaId
+async function preUploadIngredients(tasks, logFn) {
+  if (!window.electronAPI?.uploadDnaImage) return tasks;
+  const uniquePaths = [...new Set(tasks.flatMap(t => t.ingredientImages || []))];
+  if (!uniquePaths.length) return tasks;
+  logFn?.(`⬆️ Pre-upload ${uniquePaths.length} ảnh Ingredient (1 lần, tất cả tasks dùng chung)...`, 'info');
+  const pathToId = {};
+  for (const p of uniquePaths) {
+    try {
+      const r = await window.electronAPI.uploadDnaImage({ imgPath: p, taskId: 'pre_ingr' });
+      if (r?.mediaId) { pathToId[p] = r.mediaId; logFn?.(`✅ ${p.split(/[\\/]/).pop()} → ${r.mediaId}`, 'success'); }
+      else logFn?.(`⚠️ Upload không có mediaId: ${p.split(/[\\/]/).pop()}`, 'warn');
+    } catch (e) { logFn?.(`⚠️ Upload lỗi: ${p.split(/[\\/]/).pop()}: ${e.message}`, 'warn'); }
+  }
+  return tasks.map(t => {
+    if (!t.ingredientImages?.length) return t;
+    const ids = t.ingredientImages.map(p => pathToId[p]).filter(Boolean);
+    if (!ids.length) return t; // upload failed → giữ nguyên fallback path
+    const { ingredientImages: _removed, ...rest } = t;
+    return { ...rest, ingredientMediaIds: [...(rest.ingredientMediaIds || []), ...ids] };
+  });
+}
 
 // ── Policy violation helpers ─────────────────────────────────────────────────
 const POLICY_REGEX = /safety|policy|violat|content.?filter|inappropriat|harmful|prohibited|blocked|community.?guideline|terms.of.service|unable.to.generate|cannot.generate|not.able.to|restricted|flagged|adult.content|nsfw|explicit|PROMINENT_PEOPLE|prominent.people|public.figure|real.person|celebrity.filter/i;
@@ -321,12 +361,121 @@ function getEscalatedPrompt(originalPrompt, level) {
   return 'Wide aerial establishing shot of a beautiful natural landscape with rolling green hills and valleys, slow smooth cinematic drone pan across the scenery, golden hour warm sunlight, rich warm color palette, documentary cinematic style, no people or characters, peaceful serene atmosphere, ambient bird and wind sounds, safe for all audiences, family-friendly, no violent or adult content, aspect ratio 16:9, cinematic shot';
 }
 
+// ── AI Prompt Rewrite — dùng AI đơn giản hóa prompt thất bại (lỗi chung) ─────
+// Khác repairPromptWithAI (chỉ fix policy): hàm này fix MỌI lỗi — prompt quá
+// phức tạp, quá dài, hành động khó render, v.v.
+async function rewritePromptForVeo(originalPrompt, errorMsg, aiConfig) {
+  const { aiMode, apiKeys, claudeKey, claudeModel, groqKeys, groqModel, geminiModel } = aiConfig || {};
+
+  const systemPrompt = `You are a Veo 3.1 video prompt engineer. A video generation prompt failed and you must rewrite it to succeed.
+
+Rules for rewriting:
+- Simplify complex actions into clear, single-moment visual descriptions
+- Remove abstract/narrative language — describe only WHAT IS VISUALLY SEEN in the frame
+- Keep camera movement simple: "slow pan", "static shot", "gentle zoom"
+- Max 2-3 visual elements per scene (character + setting + lighting)
+- Keep the same mood, style, and setting — just make it simpler and more concrete
+- Keep any "safe for all audiences" or "no text" suffixes if present
+- Output ONLY the rewritten prompt — no explanation, no quotes, no extra text
+- Target length: 50-80 words`;
+
+  const errorHint = errorMsg ? `\nError that caused failure: ${errorMsg.slice(0, 120)}` : '';
+  const userMsg = `Rewrite this failed Veo video prompt to be simpler and more likely to succeed:${errorHint}\n\nOriginal prompt:\n${originalPrompt}`;
+
+  try {
+    if (aiMode === 'gemini' && apiKeys?.length) {
+      const { GoogleGenAI } = await import('@google/genai');
+      const key = apiKeys[Math.floor(Math.random() * apiKeys.length)];
+      const ai = new GoogleGenAI({ apiKey: key });
+      const res = await ai.models.generateContent({
+        model: geminiModel || 'gemini-2.5-flash',
+        contents: [{ role: 'user', parts: [{ text: systemPrompt + '\n\n' + userMsg }] }],
+        config: { maxOutputTokens: 300, temperature: 0.4 },
+      });
+      return res.text?.trim() || null;
+    }
+    if (aiMode === 'claude' && claudeKey) {
+      const { callClaudeWithRetry } = await import('../services/claudeService.js');
+      const raw = await callClaudeWithRetry({
+        apiKey: claudeKey, model: claudeModel,
+        system: systemPrompt, prompt: userMsg,
+        maxTokens: 300, temperature: 0.4,
+      });
+      return raw?.trim() || null;
+    }
+    if (aiMode === 'groq' && groqKeys?.length) {
+      const { callGroqWithRotation } = await import('../services/groqService.js');
+      const raw = await callGroqWithRotation(groqKeys, {
+        model: groqModel, system: systemPrompt, prompt: userMsg,
+        maxTokens: 300, temperature: 0.4,
+      });
+      return raw?.trim() || null;
+    }
+  } catch (e) {
+    console.warn('[AI Rewrite] Lỗi:', e.message);
+  }
+  return null;
+}
+
+// ── AI Prompt Repair — dùng AI để viết lại prompt vi phạm chính sách ────────
+async function repairPromptWithAI(originalPrompt, aiConfig) {
+  const { aiMode, apiKeys, claudeKey, claudeModel, groqKeys, groqModel, geminiModel } = aiConfig || {};
+
+  const systemPrompt = `You are a video prompt safety editor. Your job is to rewrite AI video generation prompts that were rejected by content policy filters.
+
+Rules:
+- Keep the SAME scene, setting, mood, and visual style
+- Remove or replace ANY content that could trigger safety filters: violence, blood, weapons, nudity, real person names, political figures, celebrities, harmful/illegal activity
+- Replace sensitive elements with safe cinematic alternatives (e.g., "battle" → "dramatic confrontation silhouette", "gun" → "prop", named celebrity → "a person")
+- Add this suffix if not present: ", safe for all audiences, family-friendly, no graphic content, cinematic style"
+- Output ONLY the rewritten prompt — no explanation, no quotes, no extra text`;
+
+  const userMsg = `Rewrite this rejected video prompt to pass content policy:\n\n${originalPrompt}`;
+
+  try {
+    if (aiMode === 'gemini' && apiKeys?.length) {
+      const { GoogleGenAI } = await import('@google/genai');
+      const key = apiKeys[Math.floor(Math.random() * apiKeys.length)];
+      const ai = new GoogleGenAI({ apiKey: key });
+      const res = await ai.models.generateContent({
+        model: geminiModel || 'gemini-2.5-flash',
+        contents: [{ role: 'user', parts: [{ text: systemPrompt + '\n\n' + userMsg }] }],
+        config: { maxOutputTokens: 512, temperature: 0.3 },
+      });
+      return res.text?.trim() || null;
+    }
+
+    if (aiMode === 'claude' && claudeKey) {
+      const { callClaudeWithRetry } = await import('../services/claudeService.js');
+      const raw = await callClaudeWithRetry({
+        apiKey: claudeKey, model: claudeModel,
+        system: systemPrompt, prompt: userMsg,
+        maxTokens: 512, temperature: 0.3,
+      });
+      return raw?.trim() || null;
+    }
+
+    if (aiMode === 'groq' && groqKeys?.length) {
+      const { callGroqWithRotation } = await import('../services/groqService.js');
+      const raw = await callGroqWithRotation(groqKeys, {
+        model: groqModel, system: systemPrompt, prompt: userMsg,
+        maxTokens: 512, temperature: 0.3,
+      });
+      return raw?.trim() || null;
+    }
+  } catch (e) {
+    console.warn('[AI Repair] Lỗi:', e.message);
+  }
+  return null;
+}
+
 // ── Policy Repair Loop — chạy cho từng task vi phạm cho đến khi ra kết quả ──
 // Gọi sau khi tất cả retry thông thường đã xong, còn task vi phạm chính sách
 // repairMap: Map<taskId, sceneIdx> — để biết lưu kết quả vào đâu
 // resultArray: mảng output (orderedVPaths / orderedResults)
 // veoRunFn: async (task) => { files: [{id, filePath, isError, error}] }
-async function runPolicyRepairLoop(repairTasks, repairMap, resultArray, veoRunFn, addLog, stopRef) {
+// aiConfig: { aiMode, apiKeys, claudeKey, claudeModel, groqKeys, groqModel }
+async function runPolicyRepairLoop(repairTasks, repairMap, resultArray, veoRunFn, addLog, stopRef, aiConfig) {
   if (!repairTasks?.length) return;
   addLog(`\n🔧 ════ POLICY REPAIR ════ Sửa đổi + chạy lại ${repairTasks.length} prompt vi phạm...`, 'info');
 
@@ -338,6 +487,36 @@ async function runPolicyRepairLoop(repairTasks, repairMap, resultArray, veoRunFn
 
     addLog(`🔧 [Repair ${i + 1}/${repairTasks.length}] Prompt gốc: "${(task.prompt || '').slice(0, 60)}..."`, 'info');
 
+    // ── Level 0: AI tự động viết lại prompt (thông minh nhất) ──────────────
+    if (aiConfig) {
+      if (stopRef?.current) return;
+      try {
+        addLog(`  ↳ Level 0 (AI): Đang nhờ AI viết lại prompt an toàn...`, 'info');
+        const aiPrompt = await repairPromptWithAI(task.prompt, aiConfig);
+        if (aiPrompt && aiPrompt.length > 20) {
+          addLog(`  ↳ Level 0 (AI): "${aiPrompt.slice(0, 80)}..."`, 'info');
+          const repairId = `${task.id}_repair_AI_${Date.now()}`;
+          const vr = await veoRunFn({ ...task, id: repairId, prompt: aiPrompt });
+          const files = vr?.files || [];
+          const won = files.filter(f => !f.isError && f.filePath);
+          if (won.length > 0) {
+            const result = won[0];
+            if (sceneIdx !== undefined && resultArray) resultArray[sceneIdx] = result.filePath ?? result;
+            addLog(`✅ [Repair ${i + 1}] AI sửa thành công! → ${(result.filePath || '').split(/[\\/]/).pop()}`, 'success');
+            success = true;
+          } else {
+            addLog(`  Level 0 (AI) thất bại → thử rule-based levels...`, 'error');
+            await new Promise(r => setTimeout(r, 3000));
+          }
+        } else {
+          addLog(`  Level 0 (AI) không tạo được prompt → thử rule-based levels...`, 'error');
+        }
+      } catch (e) {
+        addLog(`  Level 0 (AI) lỗi: ${e.message} → thử rule-based levels...`, 'error');
+      }
+    }
+
+    // ── Level 1–4: rule-based escalation (fallback nếu AI thất bại) ────────
     for (let level = 1; level <= 4 && !success; level++) {
       if (stopRef?.current) return;
       const repairedPrompt = getEscalatedPrompt(task.prompt, level);
@@ -353,7 +532,6 @@ async function runPolicyRepairLoop(repairTasks, repairMap, resultArray, veoRunFn
         if (won.length > 0) {
           const result = won[0];
           if (sceneIdx !== undefined && resultArray) {
-            // resultArray có thể chứa filePath (string) hoặc object (Storyboard)
             resultArray[sceneIdx] = result.filePath ?? result;
           }
           addLog(`✅ [Repair ${i + 1}] Thành công Level ${level}! → ${(result.filePath || '').split(/[\\/]/).pop()}`, 'success');
@@ -371,7 +549,7 @@ async function runPolicyRepairLoop(repairTasks, repairMap, resultArray, veoRunFn
     }
 
     if (!success) {
-      addLog(`⚠️ [Repair ${i + 1}] Không thể sửa được prompt sau 4 cấp độ — bỏ qua task này`, 'error');
+      addLog(`⚠️ [Repair ${i + 1}] Không thể sửa được prompt sau AI + 4 cấp độ — bỏ qua task này`, 'error');
     }
   }
 
@@ -481,6 +659,11 @@ function StepBadge({ step, status }) {
 // ─── Idea to Video ────────────────────────────────────────────────────────────
 function IdeaToVideoPanel() {
   const [apiKeys]   = useState(loadKeys);
+  const [aiMode,     setAiMode]    = useState('gemini'); // 'gemini' | 'claude' | 'groq'
+  const [claudeKey]  = useState(loadClaudeKey);
+  const [claudeModel] = useState(loadClaudeModel);
+  const [groqKeys]   = useState(loadGroqKeys);
+  const [groqModel]  = useState(loadGroqModel);
   const [idea,       setIdea]      = useState('');
   const [platform,   setPlatform]  = useState('YouTube ngang');
   const [language,   setLang]      = useState('vi');
@@ -493,6 +676,7 @@ function IdeaToVideoPanel() {
   const [totalMins,  setMins]      = useState(3);
   const [ratio,      setRatio]     = useState('16:9');
   const [imgMdl,     setImgMdl]    = useState('Nano Banana Pro');
+  const [imgQuality, setImgQuality] = useState('1K');
   const [vidMdl,     setVidMdl]    = useState('Veo 3.1 - Lite [Lower Priority]');
   const [charVoices, setCharVoices] = useState(['random', '', '']); // [char1, char2, char3]
   const [vidQuality, setVidQuality] = useState('720p');
@@ -559,8 +743,8 @@ function IdeaToVideoPanel() {
 
       addLog(clean, data.type === 'error' ? 'error' : data.type === 'success' ? 'success' : 'info');
     };
-    window.electronAPI?.onVeoLog?.(handler);
-    return () => window.electronAPI?.removeAllListeners?.('veo-log');
+    const _w = window.electronAPI?.onVeoLog?.(handler);
+    return () => { if (_w) window.electronAPI?.removeListener?.('veo-log', _w); };
   }, [running, addLog]);
 
   const markDone = (id) => { setDone(s => [...s, id]); setActive(null); };
@@ -572,7 +756,9 @@ function IdeaToVideoPanel() {
 
   const handleStart = async () => {
     if (!idea.trim())       { setError('Vui lòng nhập ý tưởng hoặc kịch bản.'); return; }
-    if (!apiKeys.length)   { setError('Chưa có API Key Gemini. Vào Creator → nhập key.'); return; }
+    if (aiMode === 'gemini' && !apiKeys.length) { setError('Chưa có API Key Gemini. Vào Settings → API Key.'); return; }
+    if (aiMode === 'claude' && !claudeKey)      { setError('Chưa có Claude API Key. Vào Settings → API Key → Claude.'); return; }
+    if (aiMode === 'groq'   && !groqKeys.length){ setError('Chưa có Groq API Key. Vào Settings → API Key → Groq.'); return; }
     if (!refDir || !vidDir) { setError('Vui lòng chọn đủ thư mục lưu file.'); return; }
 
     setRunning(true); setError(''); setLogs([]);
@@ -596,24 +782,35 @@ function IdeaToVideoPanel() {
       const langLabel = LANGUAGES.find(l => l.v === language)?.l || 'Tiếng Việt';
       addLog(`Đang viết kịch bản (${numScenes} cảnh × ${sceneDur}s, ${platform})...`, 'info');
 
-      const sText = await generateScript(apiKeys, {
-        topic:         idea,
-        platform,
-        sceneDuration: sceneDur,
-        totalDuration: totalMins,
-        language,                   // 'vi' | 'en' | 'ja' | 'zh'
-        style,
-        goal:     goal,
-        tone:     tone,
-        audience: audience,
-      }, (evt) => {
-        if (evt.type === 'chunk')
-          addLog(evt.message, 'info');
-        else if (evt.type === 'chunk_done' && evt.total > 25)
-          setScriptText(evt.scriptSoFar);   // update preview progressively
-        else if (evt.type === 'key_switch')
-          addLog(evt.message, 'info');
-      });
+      const sText = aiMode === 'groq'
+        ? await generateScriptGroq(groqKeys, {
+            topic: idea, platform, sceneDuration: sceneDur, totalDuration: totalMins,
+            language, style, goal, tone, audience,
+          }, (evt) => { if (evt.type === 'chunk') addLog(evt.message, 'info'); else if (evt.type === 'key_switch') addLog(evt.message, 'info'); }, groqModel)
+        : aiMode === 'claude'
+        ? await generateScriptClaude({
+            apiKey: claudeKey, model: claudeModel,
+            topic: idea, platform, sceneDuration: sceneDur, totalDuration: totalMins,
+            language, style, goal, tone, audience,
+          })
+        : await generateScript(apiKeys, {
+            topic:         idea,
+            platform,
+            sceneDuration: sceneDur,
+            totalDuration: totalMins,
+            language,
+            style,
+            goal:     goal,
+            tone:     tone,
+            audience: audience,
+          }, (evt) => {
+            if (evt.type === 'chunk')
+              addLog(evt.message, 'info');
+            else if (evt.type === 'chunk_done' && evt.total > 25)
+              setScriptText(evt.scriptSoFar);
+            else if (evt.type === 'key_switch')
+              addLog(evt.message, 'info');
+          });
 
       if (!sText) throw new Error('AI không tạo được kịch bản.');
       setScriptText(sText);
@@ -666,15 +863,19 @@ function IdeaToVideoPanel() {
       const envDnaTaskMap  = new Map(); // taskId → envId
       const objDnaTaskMap  = new Map(); // taskId → objId
       let _dnaIdx = 1; // fileIndex toàn cục — tránh trùng tên file
-      dna?.characters?.forEach((c,i) => {
+
+      // Hard cap: tối đa 5 nhân vật + 5 vật thể + 3 môi trường = 10 ảnh DNA
+      const MAX_CHAR = 5, MAX_OBJ = 5, MAX_ENV = 3;
+      (dna?.characters || []).slice(0, MAX_CHAR).forEach((c,i) => {
         if (c.dna_prompt) { dnaTasks.push({ id:`dna_c${i}`, prompt:c.dna_prompt, fileIndex:_dnaIdx++ }); charDnaTaskMap.set(`dna_c${i}`, c.id); }
       });
-      dna?.environments?.forEach((e,i) => {
+      (dna?.environments || []).slice(0, MAX_ENV).forEach((e,i) => {
         if (e.dna_prompt) { dnaTasks.push({ id:`dna_e${i}`, prompt:e.dna_prompt, fileIndex:_dnaIdx++ }); envDnaTaskMap.set(`dna_e${i}`, e.id); }
       });
-      dna?.key_objects?.forEach((o,i) => {
+      (dna?.key_objects || []).slice(0, MAX_OBJ).forEach((o,i) => {
         if (o.dna_prompt) { dnaTasks.push({ id:`dna_o${i}`, prompt:o.dna_prompt, fileIndex:_dnaIdx++ }); objDnaTaskMap.set(`dna_o${i}`, o.id); }
       });
+      if (dnaTasks.length > 10) dnaTasks.length = 10;
 
       let dnaImgPaths = [];
       let dnaMediaIds = []; // UUID từ Veo Studio — dùng làm Ingredients
@@ -686,7 +887,7 @@ function IdeaToVideoPanel() {
         {
           // ── Veo Studio: batchGenerateImages → trả về file path + UUID
           addLog(`[Veo] Đang tạo ${dnaTasks.length} ảnh DNA tham chiếu bằng Veo Studio...`, 'info');
-          const r = await window.electronAPI.runVeo({ mediaType:'Image', tasks:dnaTasks, aspectRatio:ratio, model:imgMdl, genCount:'1x', quality:'720p', outputFolder:refDir, duration:null });
+          const r = await window.electronAPI.runVeo({ mediaType:'Image', tasks:dnaTasks, aspectRatio:ratio, model:imgMdl, genCount:'1x', quality:imgQuality||'1K', outputFolder:refDir, duration:null });
           const dnaResults = (r?.files||[]).filter(f=>!f.isError&&f.filePath);
           dnaImgPaths = dnaResults.map(f=>f.filePath);
           dnaMediaIds = dnaResults.map(f=>f.mediaId).filter(Boolean);
@@ -810,25 +1011,25 @@ function IdeaToVideoPanel() {
             ...sceneObjIds.map(id => objImgMap[id]),
           ].filter(Boolean);
           const task = { id: tid, prompt: applyVeoPolicy(stripProminentPeople(buildVideoPrompt(s))) };
-          const speakChar = sceneCharIds.find(id => charVoiceMap[id] && (charMediaMap[id] || charImgMap[id]));
+          const speakChar = sceneCharIds.find(id => charVoiceMap[id] && charImgMap[id]);
           if (speakChar) {
             task.voiceId = charVoiceMap[speakChar];
-            if (charMediaMap[speakChar]) task.ingredientMediaIds = [charMediaMap[speakChar]];
-            else task.ingredientImages = [charImgMap[speakChar]];
-          } else if (hasMediaIds && sceneMediaIds.length > 0) {
-            // Cap tối đa 6 — ưu tiên nhân vật trước (chars → env → objects)
-            task.ingredientMediaIds = sceneMediaIds.slice(0, 6);
+            task.ingredientImages = [charImgMap[speakChar]];
           } else if (sceneImgPaths.length > 0) {
-            task.ingredientImages = sceneImgPaths.slice(0, 6);
+            const maxRef = vidMdl === 'Omni 1.1 Flash' ? 7 : 3;
+            task.ingredientImages = sceneImgPaths.slice(0, maxRef);
           }
           const refLabels = [...sceneCharIds, ...(sceneEnvId?[sceneEnvId]:[]), ...sceneObjIds];
-          const refCount  = speakChar ? `1 (${speakChar}+${task.voiceId})` : (task.ingredientMediaIds?.length || task.ingredientImages?.length || 0);
+          const refCount  = task.ingredientImages?.length || 0;
           addLog(`[Veo] Cảnh ${i+1}: ${refLabels.length > 0 ? `${refLabels.join(', ')} → ${refCount} ảnh DNA` : 'không có tham chiếu → text-to-video'}`, 'info');
           return task;
         });
 
         // Dedup prompt trùng trước khi gửi
         let pendingTasks = dedupTasksByPrompt(allTasks, addLog);
+
+        // taskErrorMap: taskId → error message gần nhất (dùng cho AI rewrite)
+        const taskErrorMap = new Map();
 
         // ── Helper: 1 vòng retry, tham số maxRetry ────────────────────────────
         const i2vPolicySet = new Set();
@@ -850,8 +1051,9 @@ function IdeaToVideoPanel() {
             const failedIds    = new Set(failedFiles.map(f => f.id));
             succeeded.forEach(f => { orderedVPaths[veoTaskMap.get(f.id) ?? 0] = f.filePath; });
             if (succeeded.length > 0) addLog(`✅ ${passLabel}[Veo] Lần ${attempt}: ${succeeded.length}/${safeTasks.length} thành công`, 'success');
-            // Policy violation detection
+            // Lưu error message để AI rewrite dùng sau
             for (const ff of failedFiles) {
+              if (ff.error) taskErrorMap.set(ff.id, ff.error);
               if (isPolicyViolation(ff.error)) {
                 i2vPolicySet.add(ff.id);
                 addLog(`🚫 [Chính sách Veo] Cảnh vi phạm: "${(ff.error || '').slice(0, 80)}" → đổi prompt an toàn`, 'error');
@@ -860,6 +1062,8 @@ function IdeaToVideoPanel() {
             pendingTasks = safeTasks.filter(t => failedIds.has(t.id)).map(t => {
               const ni = `${t.id}_r${attempt}`;
               veoTaskMap.set(ni, veoTaskMap.get(t.id)); veoTaskMap.delete(t.id);
+              // Chuyển error sang id mới
+              if (taskErrorMap.has(t.id)) { taskErrorMap.set(ni, taskErrorMap.get(t.id)); taskErrorMap.delete(t.id); }
               if (i2vPolicySet.has(t.id)) {
                 i2vPolicySet.delete(t.id); i2vPolicySet.add(ni);
                 const cp = sanitizePrompt(t.prompt);
@@ -878,6 +1082,41 @@ function IdeaToVideoPanel() {
         await runIdeaVeoPass('', MAX_FIRST_RETRY_I2V);
         if (pendingTasks.length > 0)
           addLog(`⏭️ ${pendingTasks.length} video vẫn lỗi sau ${MAX_FIRST_RETRY_I2V} lần → bỏ qua, tiếp tục`, 'warn');
+
+        // ── AI Prompt Fix — viết lại prompt thất bại rồi retry 3 lần ─────────
+        if (pendingTasks.length > 0) {
+          addLog(`\n🤖 ════ AI PROMPT FIX ════ Nhờ AI viết lại ${pendingTasks.length} prompt thất bại...`, 'info');
+          const aiCfg = { aiMode, apiKeys, claudeKey, claudeModel, groqKeys, groqModel };
+          const fixedTasks = [];
+          for (const t of pendingTasks) {
+            if (stopRef.current) break;
+            const errMsg = taskErrorMap.get(t.id) || '';
+            try {
+              addLog(`  🤖 Đang phân tích lỗi + viết lại prompt cảnh: "${(t.prompt || '').slice(0, 50)}..."`, 'info');
+              const rewritten = await rewritePromptForVeo(t.prompt, errMsg, aiCfg);
+              if (rewritten && rewritten.length > 20) {
+                const ni = `${t.id}_aifix`;
+                veoTaskMap.set(ni, veoTaskMap.get(t.id));
+                addLog(`  ✏️ Prompt mới: "${rewritten.slice(0, 80)}..."`, 'info');
+                fixedTasks.push({ ...t, id: ni, prompt: rewritten });
+              } else {
+                fixedTasks.push(t); // giữ nguyên nếu AI không trả về gì
+              }
+            } catch (e) {
+              fixedTasks.push(t);
+            }
+          }
+          if (fixedTasks.length > 0) {
+            pendingTasks = fixedTasks;
+            addLog(`  ▶ Retry ${pendingTasks.length} video với prompt đã sửa (3 lần)...`, 'info');
+            await sleep(3000);
+            await runIdeaVeoPass('[AI-Fix]', 3);
+            if (pendingTasks.length === 0)
+              addLog(`✅ AI Prompt Fix hoàn tất — tất cả video đã thành công!`, 'success');
+            else
+              addLog(`⚠️ AI Prompt Fix: còn ${pendingTasks.length} video lỗi → chuyển sang Global Retry...`, 'error');
+          }
+        }
 
         // Global retry: sau khi hoàn thành TẤT CẢ → quay lại retry lỗi 20 lần
         if (pendingTasks.length > 0) {
@@ -898,14 +1137,15 @@ function IdeaToVideoPanel() {
             else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`, 'error');
           }
         }
-        // Policy Repair: sửa đổi prompt vi phạm cho đến khi ra kết quả
+        // Policy Repair: AI viết lại prompt vi phạm → nếu AI thất bại → rule-based 4 cấp
         if (pendingTasks.length > 0) {
-          addLog(`❌ ${pendingTasks.length} video vẫn lỗi — chạy Policy Repair...`, 'error');
+          addLog(`❌ ${pendingTasks.length} video vẫn lỗi — chạy Policy Repair (AI + rule-based)...`, 'error');
           const repMap = new Map(pendingTasks.map(t => [t.id, veoTaskMap.get(t.id)]));
+          const aiCfg = { aiMode, apiKeys, claudeKey, claudeModel, groqKeys, groqModel };
           await runPolicyRepairLoop(
             pendingTasks, repMap, orderedVPaths,
             async (task) => window.electronAPI.runVeo({ mediaType:'Video', tasks:[task], aspectRatio:ratio, model:vidMdl, genCount:'1x', quality:vidQuality, outputFolder:vidDir, duration:`${sceneDur}s` }),
-            addLog, stopRef
+            addLog, stopRef, aiCfg
           );
         }
 
@@ -1129,6 +1369,30 @@ function IdeaToVideoPanel() {
         </div>
 
         <div className="flex-1 px-4 py-3 space-y-3.5">
+          {/* AI Provider */}
+          <div className="border-t border-slate-800/60 pt-3">
+            <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1.5 block">AI Provider</label>
+            <div className="flex rounded-lg overflow-hidden border border-slate-700/60">
+              {[{id:'gemini',label:'✨ Gemini'},{id:'claude',label:'🤖 Claude'},{id:'groq',label:'⚡ Groq'}].map(m => (
+                <button key={m.id} disabled={running} onClick={() => setAiMode(m.id)}
+                  className={cn('flex-1 py-1.5 text-[10px] font-bold transition-colors',
+                    aiMode === m.id
+                      ? (m.id === 'groq' ? 'bg-green-600 text-white' : m.id === 'claude' ? 'bg-orange-600 text-white' : 'bg-blue-600 text-white')
+                      : 'bg-slate-800/50 text-slate-500 hover:text-slate-300 border-transparent')}>
+                  {m.label}
+                </button>
+              ))}
+            </div>
+            {aiMode === 'claude' && !claudeKey && (
+              <p className="text-[9px] text-orange-400 mt-1">⚠️ Chưa có Claude API Key — vào Settings để thêm</p>
+            )}
+            {aiMode === 'groq' && !groqKeys.length && (
+              <p className="text-[9px] text-green-400 mt-1">⚠️ Chưa có Groq API Key — vào Settings để thêm</p>
+            )}
+            {aiMode === 'groq' && groqKeys.length > 0 && (
+              <p className="text-[9px] text-green-500/60 mt-0.5">💡 Nên chọn Llama 3.1 8B trong Settings để tránh rate limit</p>
+            )}
+          </div>
           {/* Idea */}
           <div>
             <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider">Ý tưởng / Kịch bản *</label>
@@ -1194,12 +1458,26 @@ function IdeaToVideoPanel() {
           {/* Ratio */}
           <div>
             <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider">Tỉ lệ khung hình</label>
-            <div className="flex gap-1.5 mt-1">
+            <div className="flex gap-1 mt-1 flex-wrap">
               {RATIOS.map(r=>(
                 <button key={r} disabled={running} onClick={()=>setRatio(r)}
-                  className={cn('flex-1 py-1.5 rounded-lg text-[10px] font-bold border transition-all',
+                  className={cn('px-2 py-1.5 rounded-lg text-[10px] font-bold border transition-all',
                     ratio===r ? 'bg-violet-600 border-violet-500 text-white' : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
                   {r}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Image Quality */}
+          <div>
+            <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider">Chất lượng ảnh</label>
+            <div className="flex gap-1.5 mt-1">
+              {IMG_QUALITY.map(q=>(
+                <button key={q} disabled={running} onClick={()=>setImgQuality(q)}
+                  className={cn('flex-1 py-1.5 rounded-lg text-[10px] font-bold border transition-all',
+                    imgQuality===q ? 'bg-cyan-600 border-cyan-500 text-white' : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
+                  {q}
                 </button>
               ))}
             </div>
@@ -1311,7 +1589,7 @@ function IdeaToVideoPanel() {
             <button onClick={handleStart}
               className="w-full text-white font-bold py-2.5 rounded-xl flex items-center justify-center gap-2 transition-all text-xs shadow-lg bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-500 hover:to-purple-500 shadow-violet-500/20">
               <Play size={13} fill="currentColor"/>
-              Bắt đầu · Veo
+              Bắt đầu · {aiMode === 'claude' ? 'Claude' : 'Gemini'}
             </button>
           ) : (
             <div className="flex gap-2">
@@ -1415,6 +1693,11 @@ const RESULT_TABS_S2V = [
 
 function ScriptToVideoPanel() {
   const [apiKeys]  = useState(loadKeys);
+  const [aiMode,     setAiMode]    = useState('gemini');
+  const [claudeKey]  = useState(loadClaudeKey);
+  const [claudeModel] = useState(loadClaudeModel);
+  const [groqKeys]   = useState(loadGroqKeys);
+  const [groqModel]  = useState(loadGroqModel);
   const [script,      setScript]      = useState('');
   const [platform,    setPlatform]    = useState('YouTube ngang');
   const [language,    setLang]        = useState('vi');
@@ -1424,6 +1707,7 @@ function ScriptToVideoPanel() {
   const [totalMins,   setMins]        = useState(3);
   const [ratio,       setRatio]       = useState('16:9');
   const [imgMdl,      setImgMdl]      = useState('Nano Banana Pro');
+  const [imgQuality,  setImgQuality]  = useState('1K');
   const [vidMdl,      setVidMdl]      = useState('Veo 3.1 - Lite [Lower Priority]');
   const [charVoices,  setCharVoices]  = useState(['random', '', '']); // [char1, char2, char3]
   const [vidQuality,  setVidQuality]  = useState('720p');
@@ -1482,8 +1766,8 @@ function ScriptToVideoPanel() {
       }
       addLog(clean, data.type === 'error' ? 'error' : data.type === 'success' ? 'success' : 'info');
     };
-    window.electronAPI?.onVeoLog?.(handler);
-    return () => window.electronAPI?.removeAllListeners?.('veo-log');
+    const _w = window.electronAPI?.onVeoLog?.(handler);
+    return () => { if (_w) window.electronAPI?.removeListener?.('veo-log', _w); };
   }, [running, addLog]);
 
   const markDone = (id) => { setDone(s => [...s, id]); setActive(null); };
@@ -1492,9 +1776,36 @@ function ScriptToVideoPanel() {
   const handleResume = () => { pauseRef.current = false; setPaused(false); addLog('▶️ Tiếp tục...', 'info'); };
   const checkPause   = async () => { while (pauseRef.current) { if (stopRef.current) throw new Error('Đã dừng.'); await sleep(500); } };
 
+  // ── Batch mode ──────────────────────────────────────────────────────────────
+  const stockMode = false; // Script-to-Video chỉ dùng Veo, không có stock mode
+  const [batchMode,      setBatchMode]      = useState(false);
+  const [batchFiles,     setBatchFiles]     = useState([]);
+  const [batchOutputDir, setBatchOutputDir] = useState('');
+  const [batchRunning,   setBatchRunning]   = useState(false);
+  const [batchProgress,  setBatchProgress]  = useState({ current: 0, total: 0 });
+  const [batchResults,   setBatchResults]   = useState([]);
+  // 'stock' | 'aiveo' — chế độ video cho batch
+  const [batchVideoMode, setBatchVideoMode] = useState(() => {
+    try { return localStorage.getItem('fluxy_batch_video_mode') || 'stock'; } catch { return 'stock'; }
+  });
+  const [batchLogs,      setBatchLogs]      = useState([]);
+  const batchStopRef = useRef(false);
+  const handleBatchPickFiles = async () => {
+    const result = await window.electronAPI?.selectMultipleFiles?.();
+    if (!result?.length) return;
+    setBatchFiles(prev => {
+      const existPaths = new Set(prev.map(f => f.path));
+      return [...prev, ...result.filter(f => !existPaths.has(f.path))];
+    });
+  };
+  const removeBatchFile = (path) => setBatchFiles(prev => prev.filter(f => f.path !== path));
+  const handleBatchStart = async () => {};
+
   const handleStart = async () => {
     if (!script.trim())     { setError('Vui lòng nhập kịch bản!'); return; }
-    if (!apiKeys.length)    { setError('Chưa có API Key Gemini. Vào Creator → nhập key.'); return; }
+    if (aiMode === 'gemini' && !apiKeys.length) { setError('Chưa có API Key Gemini. Vào Settings → API Key.'); return; }
+    if (aiMode === 'claude' && !claudeKey)      { setError('Chưa có Claude API Key. Vào Settings → API Key → Claude.'); return; }
+    if (aiMode === 'groq'   && !groqKeys.length){ setError('Chưa có Groq API Key. Vào Settings → API Key → Groq.'); return; }
     if (!refDir || !vidDir) { setError('Vui lòng chọn đủ thư mục lưu file.'); return; }
 
     setRunning(true); setError(''); setLogs([]);
@@ -1520,14 +1831,16 @@ function ScriptToVideoPanel() {
         none: 'no-dialogue',
       }[language] || 'vi-VN';
       addLog(`Đang phân tích DNA & tạo AI Prompts từ kịch bản (${numScenes} cảnh)...`, 'info');
-      const pRes = await generateCinematicPrompts(apiKeys, {
-        subject: script, quantity: numScenes,
-        sceneDuration: sceneDur, style, language: langCode,
-        characters: [], environments: [],
-      }, ({ message, phase, fromIdx, toIdx }) => {
+      const _p2Config = { subject: script, quantity: numScenes, sceneDuration: sceneDur, style, language: langCode, characters: [], environments: [] };
+      const _p2Cb = ({ message, phase, fromIdx, toIdx }) => {
         if (message) addLog(message, 'info');
         if (phase === 'key_switch') addLog(`🔄 Key ${fromIdx+1} → Key ${toIdx+1}`, 'info');
-      });
+      };
+      const pRes = aiMode === 'groq'
+        ? await generateCinematicPromptsGroq(groqKeys, _p2Config, _p2Cb, groqModel)
+        : aiMode === 'claude'
+        ? await generateCinematicPromptsClaude(claudeKey, _p2Config, _p2Cb, claudeModel)
+        : await generateCinematicPrompts(apiKeys, _p2Config, _p2Cb);
 
       const scenes   = pRes?.prompts  || [];
       const fullJson = pRes?.fullJson  || {};
@@ -1555,15 +1868,19 @@ function ScriptToVideoPanel() {
       const envDnaTaskMap  = new Map(); // taskId → envId
       const objDnaTaskMap  = new Map(); // taskId → objId
       let _dnaIdx = 1; // fileIndex toàn cục — tránh trùng tên file
-      dna?.characters?.forEach((c,i) => {
+
+      // Hard cap: tối đa 5 nhân vật + 5 vật thể + 3 môi trường = 10 ảnh DNA
+      const MAX_CHAR = 5, MAX_OBJ = 5, MAX_ENV = 3;
+      (dna?.characters || []).slice(0, MAX_CHAR).forEach((c,i) => {
         if (c.dna_prompt) { dnaTasks.push({ id:`dna_c${i}`, prompt:c.dna_prompt, fileIndex:_dnaIdx++ }); charDnaTaskMap.set(`dna_c${i}`, c.id); }
       });
-      dna?.environments?.forEach((e,i) => {
+      (dna?.environments || []).slice(0, MAX_ENV).forEach((e,i) => {
         if (e.dna_prompt) { dnaTasks.push({ id:`dna_e${i}`, prompt:e.dna_prompt, fileIndex:_dnaIdx++ }); envDnaTaskMap.set(`dna_e${i}`, e.id); }
       });
-      dna?.key_objects?.forEach((o,i) => {
+      (dna?.key_objects || []).slice(0, MAX_OBJ).forEach((o,i) => {
         if (o.dna_prompt) { dnaTasks.push({ id:`dna_o${i}`, prompt:o.dna_prompt, fileIndex:_dnaIdx++ }); objDnaTaskMap.set(`dna_o${i}`, o.id); }
       });
+      if (dnaTasks.length > 10) dnaTasks.length = 10;
 
       let dnaImgPaths = [];
       let dnaMediaIds = [];
@@ -1574,7 +1891,7 @@ function ScriptToVideoPanel() {
       if (dnaTasks.length) {
         if (videoEngine === 'veo') {
           addLog(`[Veo] Đang tạo ${dnaTasks.length} ảnh DNA tham chiếu (nhân vật + bối cảnh + vật thể)...`, 'info');
-          const r = await window.electronAPI.runVeo({ mediaType:'Image', tasks:dnaTasks, aspectRatio:ratio, model:imgMdl, genCount:'1x', quality:'720p', outputFolder:refDir, duration:null });
+          const r = await window.electronAPI.runVeo({ mediaType:'Image', tasks:dnaTasks, aspectRatio:ratio, model:imgMdl, genCount:'1x', quality:imgQuality||'1K', outputFolder:refDir, duration:null });
           const dnaResults = (r?.files||[]).filter(f=>!f.isError&&f.filePath);
           dnaImgPaths = dnaResults.map(f=>f.filePath);
           dnaMediaIds = dnaResults.map(f=>f.mediaId).filter(Boolean);
@@ -1672,19 +1989,16 @@ function ScriptToVideoPanel() {
             ...sceneObjIds.map(id=>objImgMap[id]),
           ].filter(Boolean);
           const task={ id:tid, prompt:applyVeoPolicy(stripProminentPeople(buildVideoPrompt(s))) };
-          const speakChar=sceneCharIds.find(id=>charVoiceMap[id]&&(charMediaMap[id]||charImgMap[id]));
+          const speakChar=sceneCharIds.find(id=>charVoiceMap[id]&&charImgMap[id]);
           if (speakChar) {
             task.voiceId=charVoiceMap[speakChar];
-            if (charMediaMap[speakChar]) task.ingredientMediaIds=[charMediaMap[speakChar]];
-            else task.ingredientImages=[charImgMap[speakChar]];
-          } else if (hasMediaIds&&sceneMediaIds.length>0) {
-            // Cap tối đa 6 — ưu tiên nhân vật trước (chars → env → objects)
-            task.ingredientMediaIds=sceneMediaIds.slice(0,6);
+            task.ingredientImages=[charImgMap[speakChar]];
           } else if (sceneImgPaths.length>0) {
-            task.ingredientImages=sceneImgPaths.slice(0,6);
+            const maxRef=vidMdl==='Omni 1.1 Flash'?7:3;
+            task.ingredientImages=sceneImgPaths.slice(0,maxRef);
           }
           const refLabels=[...sceneCharIds,...(sceneEnvId?[sceneEnvId]:[]),...sceneObjIds];
-          const refCount=speakChar?`1 (${speakChar}+${task.voiceId})`:(task.ingredientMediaIds?.length||task.ingredientImages?.length||0);
+          const refCount=task.ingredientImages?.length||0;
           addLog(`[Veo] Cảnh ${i+1}: ${refLabels.length>0?`${refLabels.join(', ')} → ${refCount} ảnh DNA`:'không tham chiếu → text-to-video'}`, 'info');
           return task;
         });
@@ -1904,6 +2218,30 @@ function ScriptToVideoPanel() {
         </div>
 
         <div className="flex-1 px-4 py-3 space-y-3.5">
+          {/* AI Provider */}
+          <div className="border-t border-slate-800/60 pt-3">
+            <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1.5 block">AI Provider</label>
+            <div className="flex rounded-lg overflow-hidden border border-slate-700/60">
+              {[{id:'gemini',label:'✨ Gemini'},{id:'claude',label:'🤖 Claude'},{id:'groq',label:'⚡ Groq'}].map(m => (
+                <button key={m.id} disabled={running} onClick={() => setAiMode(m.id)}
+                  className={cn('flex-1 py-1.5 text-[10px] font-bold transition-colors',
+                    aiMode === m.id
+                      ? (m.id === 'groq' ? 'bg-green-600 text-white' : m.id === 'claude' ? 'bg-orange-600 text-white' : 'bg-blue-600 text-white')
+                      : 'bg-slate-800/50 text-slate-500 hover:text-slate-300 border-transparent')}>
+                  {m.label}
+                </button>
+              ))}
+            </div>
+            {aiMode === 'claude' && !claudeKey && (
+              <p className="text-[9px] text-orange-400 mt-1">⚠️ Chưa có Claude API Key — vào Settings để thêm</p>
+            )}
+            {aiMode === 'groq' && !groqKeys.length && (
+              <p className="text-[9px] text-green-400 mt-1">⚠️ Chưa có Groq API Key — vào Settings để thêm</p>
+            )}
+            {aiMode === 'groq' && groqKeys.length > 0 && (
+              <p className="text-[9px] text-green-500/60 mt-0.5">💡 Nên chọn Llama 3.1 8B trong Settings để tránh rate limit</p>
+            )}
+          </div>
           {/* Script input */}
           <div>
             <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider">Kịch bản *</label>
@@ -1943,12 +2281,26 @@ function ScriptToVideoPanel() {
           {/* Ratio */}
           <div>
             <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider">Tỉ lệ khung hình</label>
-            <div className="flex gap-1.5 mt-1">
+            <div className="flex gap-1 mt-1 flex-wrap">
               {RATIOS.map(r=>(
                 <button key={r} disabled={running} onClick={()=>setRatio(r)}
-                  className={cn('flex-1 py-1.5 rounded-lg text-[10px] font-bold border transition-all',
+                  className={cn('px-2 py-1.5 rounded-lg text-[10px] font-bold border transition-all',
                     ratio===r?'bg-green-600 border-green-500 text-white':'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
                   {r}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Image Quality */}
+          <div>
+            <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider">Chất lượng ảnh</label>
+            <div className="flex gap-1.5 mt-1">
+              {IMG_QUALITY.map(q=>(
+                <button key={q} disabled={running} onClick={()=>setImgQuality(q)}
+                  className={cn('flex-1 py-1.5 rounded-lg text-[10px] font-bold border transition-all',
+                    imgQuality===q?'bg-cyan-600 border-cyan-500 text-white':'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
+                  {q}
                 </button>
               ))}
             </div>
@@ -2027,6 +2379,20 @@ function ScriptToVideoPanel() {
           </label>
         </div>
 
+        {/* ── Batch Mode (Stock only) ── */}
+        {stockMode && (
+          <div className="px-4 py-2 border-t border-slate-800/60">
+            <button onClick={() => setBatchMode(v => !v)} disabled={running || batchRunning}
+              className={cn('w-full flex items-center justify-between px-3 py-2 rounded-lg text-[10px] font-bold border transition-all',
+                batchMode ? 'bg-purple-600/20 border-purple-500/40 text-purple-300' : 'border-slate-700/60 text-slate-500 hover:text-slate-300 hover:border-slate-600')}>
+              <span>📦 Xử lý hàng loạt (Batch)</span>
+              <span className={cn('text-[8px] px-1.5 py-0.5 rounded-full font-black', batchMode ? 'bg-purple-500/30 text-purple-300' : 'bg-slate-700 text-slate-500')}>
+                {batchMode ? 'BẬT' : 'TẮT'}
+              </span>
+            </button>
+          </div>
+        )}
+
         {/* Start/Stop */}
         <div className="px-4 py-3 border-t border-slate-800/80 space-y-2">
           {error&&(
@@ -2039,7 +2405,7 @@ function ScriptToVideoPanel() {
             <button onClick={handleStart}
               className="w-full bg-gradient-to-r from-green-600 to-teal-600 hover:from-green-500 hover:to-teal-500 text-white font-bold py-2.5 rounded-xl flex items-center justify-center gap-2 transition-all text-xs shadow-lg shadow-green-500/20">
               <Play size={13} fill="currentColor"/>
-              Tạo Video · Veo
+              Tạo Video · {aiMode === 'claude' ? 'Claude' : 'Gemini'}
             </button>
           ):(
             <div className="flex gap-2">
@@ -2059,6 +2425,152 @@ function ScriptToVideoPanel() {
       {/* ── RIGHT MAIN ── */}
       <div className="flex-1 flex flex-col overflow-hidden bg-[#080e1a]">
         {/* Pipeline steps */}
+        {/* ── Batch Mode Panel ─────────────────────────────────────────── */}
+        {batchMode && stockMode && (
+          <div className="flex-1 flex flex-col overflow-hidden">
+            {/* Batch header */}
+            <div className="shrink-0 px-5 pt-4 pb-3 border-b border-slate-800/80 space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs font-bold text-purple-300">📦 Batch — Xử lý hàng loạt</p>
+                  <p className="text-[9px] text-slate-500 mt-0.5">
+                    {batchVideoMode === 'aiveo' ? 'AI+Veo: Whisper → Gemini → Veo T2V (8 luồng/file)' : 'Stock Video: mỗi file audio → 1 thư mục riêng.'}
+                  </p>
+                </div>
+                {batchRunning && (
+                  <span className="text-[9px] font-bold text-purple-400 flex items-center gap-1">
+                    <Loader2 size={10} className="animate-spin"/> {batchProgress.current}/{batchProgress.total}
+                  </span>
+                )}
+              </div>
+
+              {/* Nguồn video selector */}
+              <div>
+                <label className="text-[9px] font-semibold text-slate-500 uppercase mb-1.5 block">Nguồn Video</label>
+                <div className="flex gap-1.5">
+                  <button onClick={() => { setBatchVideoMode('stock'); localStorage.setItem('fluxy_batch_video_mode','stock'); }}
+                    disabled={batchRunning}
+                    className={cn('flex-1 py-1.5 rounded-lg text-[9px] font-bold border transition-all flex items-center justify-center gap-1',
+                      batchVideoMode === 'stock'
+                        ? 'bg-amber-600/20 border-amber-500/50 text-amber-300'
+                        : 'bg-slate-800/60 border-slate-700/50 text-slate-500 hover:text-slate-300 hover:border-slate-600')}>
+                    📦 Stock
+                  </button>
+                  <button onClick={() => { setBatchVideoMode('aiveo'); localStorage.setItem('fluxy_batch_video_mode','aiveo'); }}
+                    disabled={batchRunning}
+                    className={cn('flex-1 py-1.5 rounded-lg text-[9px] font-bold border transition-all flex items-center justify-center gap-1',
+                      batchVideoMode === 'aiveo'
+                        ? 'bg-pink-600/25 border-pink-500/50 text-pink-300'
+                        : 'bg-slate-800/60 border-slate-700/50 text-slate-500 hover:text-slate-300 hover:border-slate-600')}>
+                    🤖 AI+Veo
+                  </button>
+                </div>
+                {batchVideoMode === 'aiveo' && (
+                  <p className="text-[8px] text-pink-400/70 mt-1 leading-relaxed">Whisper → Gemini Story Bible → Veo T2V 8 luồng → ghép audio</p>
+                )}
+              </div>
+
+              {/* File queue */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-[9px] font-semibold text-slate-500 uppercase">Files ({batchFiles.length})</label>
+                  <button onClick={handleBatchPickFiles} disabled={batchRunning}
+                    className="text-[9px] bg-purple-600/30 hover:bg-purple-600/50 border border-purple-500/30 text-purple-300 px-2.5 py-1 rounded-lg transition-colors flex items-center gap-1 disabled:opacity-40">
+                    <Plus size={10}/> Thêm files
+                  </button>
+                </div>
+                {batchFiles.length === 0 ? (
+                  <p className="text-[9px] text-slate-600 italic px-1">Chưa có file nào — bấm &quot;Thêm files&quot;</p>
+                ) : (
+                  <div className="max-h-28 overflow-y-auto custom-scrollbar space-y-1">
+                    {batchFiles.map((f, i) => {
+                      const res = batchResults[i];
+                      return (
+                        <div key={f.path} className={cn('flex items-center gap-2 px-2.5 py-1.5 rounded-lg border text-[9px]',
+                          res?.status === 'done'    ? 'bg-emerald-500/5 border-emerald-500/20' :
+                          res?.status === 'error'   ? 'bg-red-500/5 border-red-500/20' :
+                          res?.status === 'running' ? 'bg-purple-500/10 border-purple-500/30' :
+                          'bg-slate-800/30 border-slate-700/40')}>
+                          <span className="shrink-0">
+                            {res?.status === 'done'    ? '✅' :
+                             res?.status === 'error'   ? '❌' :
+                             res?.status === 'running' ? <Loader2 size={9} className="animate-spin text-purple-400"/> : '⏳'}
+                          </span>
+                          <span className="flex-1 truncate text-slate-300">{f.name}</span>
+                          {res?.status === 'error' && <span className="text-red-400 truncate max-w-20" title={res.error}>{res.error?.slice(0,20)}</span>}
+                          {!batchRunning && (
+                            <button onClick={() => removeBatchFile(f.path)} className="text-slate-600 hover:text-red-400 shrink-0">
+                              <X size={10}/>
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Output folder */}
+              <div>
+                <label className="text-[9px] font-semibold text-slate-500 uppercase mb-1 block">Thư mục lưu kết quả</label>
+                <div className="flex items-center gap-1.5">
+                  <div className="flex-1 bg-slate-800/50 border border-slate-700/60 rounded-lg px-2.5 py-1.5 text-[9px] text-slate-400 truncate">
+                    {batchOutputDir || <span className="text-slate-700">Chưa chọn...</span>}
+                  </div>
+                  <button onClick={async () => { const d = await window.electronAPI?.selectFolder?.(); if (d) setBatchOutputDir(d); }}
+                    disabled={batchRunning}
+                    className="p-1.5 bg-slate-700/60 hover:bg-slate-600 rounded-lg transition-colors disabled:opacity-40">
+                    <FolderOpen size={12} className="text-slate-400"/>
+                  </button>
+                </div>
+                <p className="text-[8px] text-slate-600 mt-1">Mỗi file → thư mục con riêng.</p>
+              </div>
+
+              {/* Batch start/stop */}
+              <div className="flex gap-2">
+                {!batchRunning ? (
+                  <button onClick={handleBatchStart}
+                    disabled={!batchFiles.length || !batchOutputDir}
+                    className={cn('flex-1 py-2 disabled:opacity-40 disabled:cursor-not-allowed text-white text-[10px] font-bold rounded-xl flex items-center justify-center gap-1.5 transition-colors',
+                      batchVideoMode === 'aiveo' ? 'bg-pink-600 hover:bg-pink-500' : 'bg-purple-600 hover:bg-purple-500')}>
+                    <Play size={11} fill="currentColor"/> Chạy Batch ({batchFiles.length} file)
+                  </button>
+                ) : (
+                  <button onClick={() => { batchStopRef.current = true; }}
+                    className="flex-1 py-2 bg-red-600/80 hover:bg-red-600 text-white text-[10px] font-bold rounded-xl flex items-center justify-center gap-1.5 transition-colors">
+                    <Square size={11} fill="currentColor"/> Dừng Batch
+                  </button>
+                )}
+                {!batchRunning && batchFiles.length > 0 && (
+                  <button onClick={() => { setBatchFiles([]); setBatchResults([]); }}
+                    className="px-3 py-2 bg-slate-700/60 hover:bg-slate-700 text-slate-400 text-[9px] rounded-xl transition-colors">
+                    Xóa DS
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Batch log */}
+            <div className="flex-1 overflow-y-auto custom-scrollbar px-5 py-3 font-mono text-[9px] space-y-0.5">
+              {batchLogs.length === 0 && (
+                <p className="text-slate-600 italic">Log sẽ hiển thị khi batch chạy...</p>
+              )}
+              {batchLogs.map((l, i) => (
+                <div key={i} className="flex gap-2">
+                  <span className="text-slate-700 shrink-0">[{l.time}]</span>
+                  <span className={l.type === 'error' ? 'text-red-400' : l.type === 'success' ? 'text-emerald-400' : 'text-slate-400'}>
+                    {l.text}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ── Normal single-file pipeline ──────────────────────────────── */}
+        {(!batchMode || !stockMode) && (
+          <div className="flex flex-col flex-1 overflow-hidden">
+
         <div className="shrink-0 px-5 pt-4 pb-3 border-b border-slate-800/80">
           <div className="flex items-center gap-2 mb-2">
             <p className="text-[9px] font-bold text-slate-600 uppercase tracking-widest">Tiến trình</p>
@@ -2114,6 +2626,8 @@ function ScriptToVideoPanel() {
             </div>
           )}
         </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2126,6 +2640,7 @@ const STEPS_AUDIO = [
   { id: 'transcribe', label: 'Gemini AI',          icon: Brain       },
   { id: 'chunk',      label: 'Chia Timeline',      icon: Clock       },
   { id: 'generate',   label: 'Tạo Prompts',        icon: Sparkles    },
+  { id: 'dna',        label: 'DNA Nhân vật',       icon: Layers      },
   { id: 'video',      label: 'Tạo Video',          icon: Film        },
   { id: 'merge',      label: 'Ghép video',         icon: Scissors    },
   { id: 'remaster',   label: 'Ghép Audio gốc',     icon: Music2      },
@@ -2136,12 +2651,13 @@ const RESULT_TABS_AUDIO = [
   { id: 'analysis',   label: 'Phân tích'  },
   { id: 'chunks',     label: 'Chunks'     },
   { id: 'prompts',    label: 'Prompts'    },
+  { id: 'dna',        label: '🧬 DNA'     },
   { id: 'video',      label: 'Videos'     },
   { id: 'merge',      label: 'Video ghép' },
   { id: 'remaster',   label: '🎵 Video cuối' },
 ];
 
-const VID_MDL_AUDIO = ['Veo 3.1 - Lite [Lower Priority]', 'Veo 3.1 - Lite (Fast)', 'Veo 3.1 - Fast (Balanced)', 'Omni Flash'];
+const VID_MDL_AUDIO = ['Veo 3.1 - Lite [Lower Priority]', 'Omni 1.1 Flash'];
 const SPEECH_ANTI_REPEAT = ' [SPEECH: Read every word exactly as written, once and only once. Never repeat, stutter, loop, or duplicate any word or phrase.]';
 function downloadBlob(content, filename, mime = 'text/plain') {
   const blob = new Blob([content], { type: mime });
@@ -2162,8 +2678,21 @@ function saveAtvSettings(patch) {
   } catch (_) {}
 }
 
+const ATV_GEMINI_MODELS = [
+  { id: 'gemini-2.5-flash',      label: '2.5 Flash' },
+  { id: 'gemini-3-flash-preview',label: '3.0 Flash Preview' },
+  { id: 'gemini-3.1-flash-lite', label: '3.1 Flash Lite' },
+  { id: 'gemini-3.5-flash',      label: '3.5 Flash' },
+];
+
 function AudioToVideoPanel() {
   const _s = loadAtvSettings();
+  const [aiMode,     setAiMode]    = useState('gemini');
+  const [claudeKey]  = useState(loadClaudeKey);
+  const [claudeModel] = useState(loadClaudeModel);
+  const [groqKeys]   = useState(loadGroqKeys);
+  const [groqModel]  = useState(loadGroqModel);
+  const [atvGeminiModel, setAtvGeminiModel] = useState(() => _s.atvGeminiModel || 'gemini-3-flash-preview');
 
   // File
   const [filePath,  setFilePath]  = useState('');
@@ -2194,6 +2723,20 @@ function AudioToVideoPanel() {
   // 'gemini' | 'whisper' | 'manual'
   const [stockTranscribeMode, setStockTranscribeMode] = useState(() => _s.stockTranscribeMode || 'gemini');
   const [stockManualKw, setStockManualKw] = useState(() => _s.stockManualKw || '');
+  const [veoStyle,      setVeoStyle]      = useState(() => _s.veoStyle || 'auto'); // 'auto' or style id
+  // ── Gemini+Veo mode (chế độ riêng, không phải nguồn chuyển ngôn) ──────────
+  const [gsVideoMode,    setGsVideoMode]    = useState(() => _s.gsVideoMode || false);
+  const [gsScript,       setGsScript]       = useState('');   // kịch bản tuỳ chọn (paste hoặc load file)
+  const [gsScriptOpen,   setGsScriptOpen]   = useState(false); // hiện/ẩn textarea kịch bản
+  const [gsCharacters,   setGsCharacters]   = useState([]);    // nhân vật detect từ Gemini
+
+  // Transcript tải lên thủ công (TXT/SRT) — bỏ qua bước Gemini transcription
+  const [manualTranscript, setManualTranscript] = useState('');
+  const [manualTranscriptName, setManualTranscriptName] = useState('');
+
+  // Prompt đồng bộ nhân vật / bối cảnh
+  const [charBgPrompt, setCharBgPrompt] = useState(() => _s.charBgPrompt || '');
+  useEffect(() => { saveAtvSettings({ charBgPrompt }); }, [charBgPrompt]);
 
   // Auto-save prompt file
   const [autoSavePrompt, setAutoSavePrompt] = useState(() => _s.autoSavePrompt !== undefined ? _s.autoSavePrompt : true);
@@ -2217,11 +2760,490 @@ function AudioToVideoPanel() {
   useEffect(() => { saveAtvSettings({ stockProvider });   }, [stockProvider]);
   useEffect(() => { saveAtvSettings({ stockTranscribeMode }); }, [stockTranscribeMode]);
   useEffect(() => { saveAtvSettings({ stockManualKw });       }, [stockManualKw]);
+  useEffect(() => { saveAtvSettings({ veoStyle });          }, [veoStyle]);
+  useEffect(() => { saveAtvSettings({ gsVideoMode });       }, [gsVideoMode]);
+  useEffect(() => { saveAtvSettings({ atvGeminiModel });   }, [atvGeminiModel]);
+
+  // Ingredients mode cho Audio to Video
+  const [a2vIngMode,   setA2vIngMode]   = useState(() => _s.a2vIngMode || false);
+  const [a2vRefDir,    setA2vRefDir]    = useState(() => _s.a2vRefDir  || '');
+  const [a2vImgMdl,    setA2vImgMdl]   = useState(() => _s.a2vImgMdl  || 'Nano Banana Pro');
+  const a2vRefDirRef = useRef('');
+  useEffect(() => { a2vRefDirRef.current = a2vRefDir; }, [a2vRefDir]);
+  useEffect(() => { saveAtvSettings({ a2vIngMode }); }, [a2vIngMode]);
+  useEffect(() => { saveAtvSettings({ a2vRefDir  }); }, [a2vRefDir]);
+  useEffect(() => { saveAtvSettings({ a2vImgMdl  }); }, [a2vImgMdl]);
+  // DNA results state
+  const [a2vDnaImgs,  setA2vDnaImgs]  = useState([]);
+
   // Load cả 2 keys khi mount (không phụ thuộc vào stockProvider)
   useEffect(() => {
     window.electronAPI?.getSetting?.('pexels_api_key',  '').then(v => setPexelsKey(v  || ''));
     window.electronAPI?.getSetting?.('pixabay_api_key', '').then(v => setPixabayKey(v || ''));
   }, []);
+
+  // ── Batch mode ───────────────────────────────────────────────────────────────
+  const [batchMode,       setBatchMode]       = useState(false);
+  const [batchVideoMode,  setBatchVideoMode]  = useState(() => {
+    try { return localStorage.getItem('fluxy_batch_video_mode') || 'stock'; } catch { return 'stock'; }
+  });
+  const [batchFiles,      setBatchFiles]      = useState([]); // [{name, path}]
+  const [batchOutputDir,  setBatchOutputDir]  = useState('');
+  const [batchRunning,    setBatchRunning]    = useState(false);
+  const [batchProgress,   setBatchProgress]   = useState({ current: 0, total: 0 });
+  const [batchResults,    setBatchResults]    = useState([]); // [{name, status, finalPath, error}]
+  const [batchLogs,       setBatchLogs]       = useState([]);
+  const batchStopRef   = useRef(false);
+  const batchFileInput = useRef(null);
+  const addBatchLog = (text, type = 'info') =>
+    setBatchLogs(p => [...p.slice(-300), { time: new Date().toLocaleTimeString(), text, type }]);
+
+  const handleBatchFilePick = async () => {
+    const picked = await window.electronAPI?.selectFolder?.();
+    // Use file dialog instead
+    if (batchFileInput.current) batchFileInput.current.click();
+  };
+  const handleBatchFileChange = (e) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    setBatchFiles(prev => {
+      const existPaths = new Set(prev.map(f => f.name));
+      const newFiles = files
+        .filter(f => !existPaths.has(f.name))
+        .map(f => ({ name: f.name, path: f.path || (window.__electronFilePaths?.[f.name] || '') }));
+      return [...prev, ...newFiles];
+    });
+    if (batchFileInput.current) batchFileInput.current.value = '';
+  };
+  const handleBatchPickFiles = async () => {
+    const result = await window.electronAPI?.selectMultipleFiles?.();
+    if (!result?.length) return;
+    setBatchFiles(prev => {
+      const existPaths = new Set(prev.map(f => f.path));
+      const newFiles = result.filter(f => !existPaths.has(f.path));
+      return [...prev, ...newFiles];
+    });
+  };
+  const removeBatchFile = (path) => setBatchFiles(prev => prev.filter(f => f.path !== path));
+
+  // ── Batch pipeline runner ────────────────────────────────────────────────────
+  const handleBatchStart = async () => {
+    if (!batchFiles.length)   { return; }
+    if (!batchOutputDir)      { addBatchLog('Chọn thư mục lưu kết quả trước!', 'error'); return; }
+    const _batchVideoMode  = batchVideoMode; // 'stock' | 'aiveo'
+    const _isAiVeo         = _batchVideoMode === 'aiveo';
+    const _apiKeys         = loadKeys();
+    // Validation theo mode
+    if (!_isAiVeo && !stockApiKey && stockProvider !== 'both') { addBatchLog('Chưa có Stock API key!', 'error'); return; }
+    if (_isAiVeo && !_apiKeys.length) { addBatchLog('Chưa có Gemini API key! Vào Settings → API Key.', 'error'); return; }
+    const _stockMode       = !_isAiVeo;
+    const _stockProvider   = stockProvider;
+    const _stockApiKey     = stockApiKey;
+    const _stockTxMode     = stockTranscribeMode;
+    const _stockNoGemini   = _stockTxMode === 'manual';
+    const _useLocalWhisper = _stockTxMode === 'whisper';
+    const _sceneDur        = sceneDur === -1 ? 8 : sceneDur;
+    const _stockManualKw   = (stockManualKw || '').trim();
+    // AI+Veo settings
+    const _vidSceneDur     = vidSceneDur;
+    const _vidRatio        = vidRatio;
+    const _vidModel        = vidModel;
+    const _vidQuality      = vidQuality;
+    const _veoStyle        = veoStyle;
+    const _useTransition   = useTransition;
+
+    setBatchRunning(true); batchStopRef.current = false;
+    setBatchLogs([]);
+    setBatchResults(batchFiles.map(f => ({ name: f.name, path: f.path, status: 'pending', finalPath: null, error: null })));
+
+    for (let fi = 0; fi < batchFiles.length; fi++) {
+      if (batchStopRef.current) { addBatchLog('⏹ Đã dừng batch.', 'info'); break; }
+      const fileInfo  = batchFiles[fi];
+      const baseName  = fileInfo.name.replace(/\.[^.]+$/, '');
+      const subDir    = `${batchOutputDir}\\${baseName}`;
+
+      setBatchProgress({ current: fi + 1, total: batchFiles.length });
+      setBatchResults(prev => prev.map((r, i) => i === fi ? { ...r, status: 'running' } : r));
+      addBatchLog(`\n📁 [${fi + 1}/${batchFiles.length}] Bắt đầu: ${fileInfo.name}`, 'info');
+
+      try {
+        // 1. Tạo thư mục con
+        await window.electronAPI.createFolder(subDir);
+
+        // 2. Kiểm tra file
+        addBatchLog(`  Kiểm tra file...`, 'info');
+        const prep = await window.electronAPI.prepareAudio(fileInfo.path);
+        if (!prep?.success) throw new Error(`Lỗi kiểm tra file: ${prep?.error}`);
+        const totalSec  = Math.floor(prep.duration);
+        const autoChunk = _stockTxMode !== 'manual' && sceneDur === -1;
+        const numChunks = autoChunk ? Math.ceil(totalSec / 8) : Math.ceil(totalSec / _sceneDur);
+        addBatchLog(`  ✅ ${totalSec}s → ~${numChunks} cảnh`, 'success');
+
+        // 3. Transcribe
+        let result = null, oa = null, timeChunks;
+        let _batchFullText = '';
+
+        if (_isAiVeo) {
+          // ── AI+Veo: Whisper cục bộ → fallback Gemini nếu không khả dụng ──────
+          addBatchLog(`  🤖 [AI+Veo] Whisper cục bộ...`, 'info');
+          try {
+            result = await transcribeLocalChunked(fileInfo.path, totalSec,
+              (msg) => addBatchLog(`    ${msg}`, 'info'),
+              (done, tot, n, err) => addBatchLog(`    ${err ? '⚠' : '✅'} Đoạn ${done}/${tot}: ${err || n + ' câu'}`, err ? 'error' : 'success'),
+              () => {}, () => {}
+            );
+          } catch (whisperErr) {
+            addBatchLog(`  ⚠️ Whisper không khả dụng (${whisperErr.message.slice(0, 80)}) — chuyển sang Gemini...`, 'warn');
+            if (!apiKeys.length) throw new Error('Whisper thất bại và không có Gemini API key để fallback.');
+            const _gc = Math.ceil(totalSec / 90);
+            addBatchLog(`  🔄 Gemini transcribe: ${_gc} phần...`, 'info');
+            result = await transcribeAudioChunked(
+              apiKeys, totalSec,
+              async (startSec, durationSec) => window.electronAPI.extractAudioChunk({ filePath: fileInfo.path, startSec, durationSec }),
+              (msg) => addBatchLog(`    ⏳ ${msg}`, 'info'),
+              (done, tot, n, err) => addBatchLog(`    ${err ? '⚠' : '✅'} Phần ${done}/${tot}: ${err || n + ' câu'}`, err ? 'error' : 'success'),
+              (msg) => addBatchLog(`    ${msg}`, 'info')
+            );
+            addBatchLog(`  ✅ Gemini transcribe xong — ${result.segments.length} câu`, 'success');
+          }
+          _batchFullText = result.fullText || '';
+          timeChunks = sceneDur === -1
+            ? createNaturalChunks(result.segments, totalSec)
+            : createTimeBasedChunks(result.segments, totalSec, _vidSceneDur);
+          addBatchLog(`  ✅ Whisper xong — ${result.segments.length} câu, ${timeChunks.length} cảnh`, 'success');
+          // Phân tích tổng quát
+          try {
+            oa = await analyzeOverallContent(_apiKeys, _batchFullText, () => {});
+            addBatchLog(`  ✅ Gemini phân tích: ${(oa?.topic || '').slice(0, 60)}`, 'success');
+          } catch (e) {
+            addBatchLog(`  ⚠️ Phân tích tổng quát lỗi (bỏ qua): ${e.message}`, 'warn');
+          }
+          // Inject phong cách veoStyle vào overallContext (giống single mode)
+          const STYLE_KEYWORDS_BATCH = {
+            'Photorealistic': 'Ultra-realistic photography, photorealistic render, 8K resolution, natural skin texture, real-world lighting, hyper-detailed DSLR quality',
+            'Cinematic 4K':   'Cinematic 4K film quality, anamorphic lens, dramatic depth of field, professional color grading, film grain, Hollywood-level production',
+            'Anime / Manga':  'Japanese anime 2D animation, clean sharp line art, cel-shaded flat coloring, expressive anime eyes, vibrant saturated palette',
+            'Pixar 3D':       'Pixar/Disney 3D CGI, smooth subsurface scattering, warm key lighting, polished 3D render, expressive stylized characters',
+            'Studio Ghibli':  'Studio Ghibli 2D hand-drawn animation, soft watercolor backgrounds, warm muted tones, expressive faces, gentle painterly line art',
+            'Dark Fantasy':   'Dark fantasy digital painting, dramatic chiaroscuro, deep gothic shadows, epic fantasy illustration, moody desaturated palette',
+            'Watercolor':     'Traditional watercolor painting, soft wet-on-wet washes, gentle color bleeds, textured paper, loose brushstrokes',
+            'Cyberpunk':      'Cyberpunk art, neon-lit city, futuristic high contrast, synthwave color palette, rain-slicked streets',
+            'Documentary':    'Documentary cinéma vérité, natural handheld camera, authentic real-world lighting, journalistic style',
+          };
+          if (_veoStyle !== 'auto' && STYLE_KEYWORDS_BATCH[_veoStyle]) {
+            addBatchLog(`  🎨 Phong cách: ${_veoStyle}`, 'info');
+            oa = oa ? { ...oa, recommended_visual_style: STYLE_KEYWORDS_BATCH[_veoStyle] }
+                    : { recommended_visual_style: STYLE_KEYWORDS_BATCH[_veoStyle], topic: '', tone: '', context_summary: '' };
+          }
+        } else if (_stockNoGemini) {
+          timeChunks = createTimeBasedChunks([], totalSec, _sceneDur);
+        } else if (_useLocalWhisper) {
+          addBatchLog(`  Whisper cục bộ...`, 'info');
+          try {
+            result = await transcribeLocalChunked(fileInfo.path, totalSec,
+              (msg) => addBatchLog(`    ${msg}`, 'info'),
+              (done, tot, n, err) => addBatchLog(`    ${err ? '⚠' : '✅'} Đoạn ${done}/${tot}: ${err || n + ' câu'}`, err ? 'error' : 'success'),
+              () => {}, () => {}
+            );
+            addBatchLog(`  ✅ Whisper xong — ${result.segments.length} đoạn`, 'success');
+          } catch (whisperErr) {
+            addBatchLog(`  ⚠️ Whisper không khả dụng (${whisperErr.message.slice(0, 80)}) — chuyển sang Gemini...`, 'warn');
+            if (!apiKeys.length) throw new Error('Whisper thất bại và không có Gemini API key để fallback.');
+            const _gc2 = Math.ceil(totalSec / 90);
+            addBatchLog(`  🔄 Gemini transcribe: ${_gc2} phần...`, 'info');
+            result = await transcribeAudioChunked(
+              apiKeys, totalSec,
+              async (startSec, durationSec) => window.electronAPI.extractAudioChunk({ filePath: fileInfo.path, startSec, durationSec }),
+              (msg) => addBatchLog(`    ⏳ ${msg}`, 'info'),
+              (done, tot, n, err) => addBatchLog(`    ${err ? '⚠' : '✅'} Phần ${done}/${tot}: ${err || n + ' câu'}`, err ? 'error' : 'success'),
+              (msg) => addBatchLog(`    ${msg}`, 'info')
+            );
+            addBatchLog(`  ✅ Gemini transcribe xong — ${result.segments.length} đoạn`, 'success');
+          }
+          timeChunks = autoChunk
+            ? createNaturalChunks(result.segments, totalSec)
+            : createTimeBasedChunks(result.segments, totalSec, _sceneDur);
+        } else if (aiMode === 'groq' && groqKeys.length) {
+          addBatchLog(`  Groq Whisper...`, 'info');
+          result = await transcribeGroqChunked(groqKeys, totalSec,
+            async (s, d) => window.electronAPI.extractAudioChunk({ filePath: fileInfo.path, startSec: s, durationSec: d }),
+            (msg) => addBatchLog(`    ${msg}`, 'info'),
+            (done, tot, n, err) => addBatchLog(`    ${err ? '⚠' : '✅'} Phần ${done}/${tot}`, err ? 'error' : 'success')
+          );
+          timeChunks = createTimeBasedChunks(result.segments, totalSec, _sceneDur);
+          addBatchLog(`  ✅ Groq Whisper xong — ${result.segments.length} đoạn`, 'success');
+          try {
+            oa = await analyzeOverallContentGroq(groqKeys, result.fullText, () => {}, groqModel);
+          } catch (_) {}
+        } else {
+          addBatchLog(`  Gemini transcribe...`, 'info');
+          result = await transcribeAudioChunked(_apiKeys, totalSec,
+            async (s, d) => window.electronAPI.extractAudioChunk({ filePath: fileInfo.path, startSec: s, durationSec: d }),
+            (msg) => addBatchLog(`    ${msg}`, 'info'),
+            (done, tot, n, err) => addBatchLog(`    ${err ? '⚠' : '✅'} Đoạn ${done}/${tot}: ${err || n + ' câu'}`, err ? 'error' : 'success'),
+            () => {}
+          );
+          timeChunks = autoChunk
+            ? createNaturalChunks(result.segments, totalSec)
+            : createTimeBasedChunks(result.segments, totalSec, _sceneDur);
+          addBatchLog(`  ✅ Transcribe xong — ${result?.segments?.length || 0} đoạn`, 'success');
+          try {
+            oa = await analyzeOverallContent(_apiKeys, result.fullText, () => {});
+          } catch (_) {}
+        }
+
+        if (batchStopRef.current) throw new Error('Đã dừng.');
+
+        // 4. Stock keywords
+        let batchKw;
+        const _batchFallback = (oa?.topic || 'nature landscape').replace(/[^\p{L}\s]/gu, ' ').split(/\s+/).slice(0, 3).join(' ') || 'nature landscape';
+        if (_stockNoGemini) {
+          const kwLines = _stockManualKw ? _stockManualKw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean) : ['nature landscape'];
+          batchKw = timeChunks.map((_, i) => kwLines[i % kwLines.length]);
+        } else {
+          addBatchLog(`  AI phân tích nội dung → sinh từ khóa stock video...`, 'info');
+          try {
+            if (aiMode === 'groq' && groqKeys.length) {
+              batchKw = await generateStockKeywordsGroq(groqKeys, timeChunks, oa, () => {}, groqModel);
+            } else {
+              batchKw = await generateStockKeywordsAI(_apiKeys, timeChunks, oa, () => {});
+            }
+            batchKw = batchKw.map(kw => kw || _batchFallback);
+          } catch (e) {
+            addBatchLog(`  ⚠️ AI keyword thất bại (${e.message}) → dùng word-freq`, 'warn');
+            const _stops = new Set(['và','của','là','có','trong','với','cho','một','các','này','đó','đã','được','không','để','từ','the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','is','are','was','were','be','have','has','do','does','did','not','so','if','as','up','out','just','very','too','more','no']);
+            batchKw = timeChunks.map(chunk => {
+              const text = (chunk.exactText || '').trim();
+              if (!text || text.length < 8) return _batchFallback;
+              const words = text.toLowerCase().replace(/[^\p{L}\s]/gu, ' ').split(/\s+/).filter(w => w.length > 2 && !_stops.has(w) && !/^\d+$/.test(w));
+              return [...new Set(words)].slice(0, 3).join(' ') || _batchFallback;
+            });
+          }
+        }
+        if (!_isAiVeo) addBatchLog(`  ✅ ${batchKw.length} từ khóa — ví dụ: ${batchKw.slice(0, 2).join(' | ')}`, 'success');
+
+        if (batchStopRef.current) throw new Error('Đã dừng.');
+
+        // ── AI+Veo: Gemini tạo Veo prompts + 8-worker T2V ─────────────────────
+        if (_isAiVeo) {
+          // 4b. Gemini tạo Veo prompt đồng bộ kịch bản
+          addBatchLog(`  🎬 Gemini tạo ${timeChunks.length} Veo prompt (Story Bible)...`, 'info');
+          let generatedScenes_b = [];
+          try {
+            generatedScenes_b = await analyzeScenesContinuity(
+              _apiKeys, timeChunks, _vidSceneDur, oa, _batchFullText,
+              (cur, tot) => addBatchLog(`    Scene ${cur}/${tot}...`, 'info'),
+              (sd, isErr) => { if (isErr) addBatchLog(`    ⚠️ Scene ${sd.sceneNumber} fallback`, 'warn'); }
+            );
+          } catch (e) { throw new Error(`Tạo Veo prompt lỗi: ${e.message}`); }
+          addBatchLog(`  ✅ ${generatedScenes_b.length} Veo prompts xong`, 'success');
+
+          if (batchStopRef.current) throw new Error('Đã dừng.');
+
+          // 5b. 8-worker Veo T2V
+          addBatchLog(`  🚀 Veo T2V — 8 luồng song song (${generatedScenes_b.length} video × ${_vidSceneDur}s)...`, 'info');
+          const VEO_W = 8;
+          const MAX_R = 5;
+          const bVeoQueue = generatedScenes_b.map((s, i) => ({
+            id: `bvid_${fi}_${i}`, origIdx: i, retries: 0, policyFixed: false,
+            prompt: applyVeoPolicy(stripProminentPeople(s.veoVideoPrompt || 'Cinematic establishing shot')),
+          }));
+          let bVeoHead = 0;
+          const bVeoPaths = new Array(generatedScenes_b.length).fill(null);
+          const bClaimedSlots = new Set();
+          let bVeoDone = 0;
+          const bVeoTotal = generatedScenes_b.length;
+
+          const batchVeoWorker = async (wid) => {
+            while (true) {
+              if (batchStopRef.current) break;
+              if (bVeoHead >= bVeoQueue.length) break;
+              const task = bVeoQueue[bVeoHead++];
+              if (bVeoPaths[task.origIdx] || bClaimedSlots.has(task.origIdx)) continue;
+              bClaimedSlots.add(task.origIdx);
+              if (task.retries > 0) await sleep(task.retries * 3000);
+              try {
+                const vr = await window.electronAPI.runVeo({
+                  mediaType: 'Video', tasks: [{ id: task.id, prompt: task.prompt }],
+                  aspectRatio: _vidRatio, model: _vidModel,
+                  genCount: '1x', quality: _vidQuality,
+                  outputFolder: subDir, duration: `${_vidSceneDur}s`,
+                });
+                const files   = vr?.files || [];
+                const success = files.find(f => !f.isError && f.filePath);
+                const failure = files.find(f => f.isError);
+                if (success?.filePath) {
+                  if (!bVeoPaths[task.origIdx]) {
+                    bVeoPaths[task.origIdx] = success.filePath;
+                    bVeoDone++;
+                    addBatchLog(`    ✅ [W${wid}] Cảnh ${task.origIdx + 1}/${bVeoTotal} OK (${bVeoDone}/${bVeoTotal})`, 'success');
+                  } else {
+                    window.electronAPI?.deleteFile?.(success.filePath).catch(() => {});
+                  }
+                } else {
+                  const errMsg = failure?.error || 'unknown';
+                  const isPolicy = isPolicyViolation(errMsg);
+                  if (task.retries < MAX_R) {
+                    const newPrompt = (isPolicy && !task.policyFixed) ? sanitizePrompt(task.prompt) : task.prompt;
+                    bClaimedSlots.delete(task.origIdx);
+                    bVeoQueue.push({ ...task, id: `${task.id}_r${task.retries+1}`, prompt: newPrompt, retries: task.retries+1, policyFixed: isPolicy ? true : task.policyFixed });
+                    addBatchLog(`    ⚠️ [W${wid}] Cảnh ${task.origIdx+1} lỗi → retry ${task.retries+1}/${MAX_R}`, 'warn');
+                  } else {
+                    bVeoDone++;
+                    addBatchLog(`    ❌ [W${wid}] Cảnh ${task.origIdx+1} hết retry`, 'error');
+                  }
+                }
+              } catch (e) {
+                if (task.retries < MAX_R) {
+                  bClaimedSlots.delete(task.origIdx);
+                  bVeoQueue.push({ ...task, id: `${task.id}_e${task.retries+1}`, retries: task.retries+1 });
+                } else { bVeoDone++; }
+              }
+            }
+          };
+
+          await Promise.all(Array.from({ length: VEO_W }, (_, i) => batchVeoWorker(i + 1)));
+
+          const vSucc = bVeoPaths.filter(Boolean).length;
+          addBatchLog(`  ✅ Veo xong — ${vSucc}/${bVeoTotal} video`, vSucc > 0 ? 'success' : 'error');
+          if (!vSucc) throw new Error('Không tạo được video Veo nào.');
+
+          // 6b. Ghép video + audio
+          const bVeoClips = bVeoPaths.filter(Boolean);
+          addBatchLog(`  🎬 Ghép ${bVeoClips.length} clip + audio...`, 'info');
+          let finalPath_b = null;
+          if (bVeoClips.length === 1) {
+            const rmr = await window.electronAPI.replaceAudio({ videoPath: bVeoClips[0], audioPath: fileInfo.path, outputFolder: subDir });
+            if (rmr?.success && rmr?.path) finalPath_b = rmr.path;
+          } else {
+            const outName = `final_aiveo_${baseName}_${Date.now()}`;
+            const car = await window.electronAPI.concatAudio({ clips: bVeoClips, audioPath: fileInfo.path, outputFolder: subDir, outputName: outName });
+            if (car?.success && car?.path) {
+              finalPath_b = car.path;
+            } else {
+              const mr = await window.electronAPI.mergeVideo({ files: bVeoClips, trimStart: 0, trimEnd: 0, transition: _useTransition ? 'Ngẫu nhiên' : 'Không có', outputFolder: subDir, outputName: `merged_${Date.now()}` });
+              if (mr?.success && mr?.path) {
+                const rmr = await window.electronAPI.replaceAudio({ videoPath: mr.path, audioPath: fileInfo.path, outputFolder: subDir });
+                finalPath_b = rmr?.success ? rmr.path : mr.path;
+              }
+            }
+          }
+          if (!finalPath_b) throw new Error('Merge AI+Veo thất bại');
+          addBatchLog(`  ✅ Hoàn tất: ${finalPath_b.split(/[\\/]/).pop()}`, 'success');
+          setBatchResults(prev => prev.map((r, i) => i === fi ? { ...r, status: 'done', finalPath: finalPath_b } : r));
+          addBatchLog(`  ✅ [${fi + 1}/${batchFiles.length}] XONG: ${fileInfo.name}`, 'success');
+          continue; // bỏ qua phần stock bên dưới
+        }
+
+        // 5. Download + trim stock clips
+        addBatchLog(`  Tải ${timeChunks.length} clip song song (4 luồng)...`, 'info');
+        const orderedPaths   = new Array(timeChunks.length).fill(null);
+        const stockClipPaths = [];
+        const usedIds        = new Set();
+        const targetDurBatch = _stockTxMode === 'manual' && sceneDur === -1 ? 8 : _sceneDur;
+
+        let batchDone = 0;
+        const batchQMutex = { idx: 0 };
+
+        const processBatchOne = async (i) => {
+          if (batchStopRef.current) return;
+          const chunk     = timeChunks[i];
+          const targetDur = chunk.timeEnd != null ? (chunk.timeEnd - chunk.timeStart) : targetDurBatch;
+          const kw        = batchKw[i] || 'nature landscape';
+          try {
+            const doSearch = (k) => window.electronAPI.stockVideoSearch({ keyword: k, provider: _stockProvider, apiKey: _stockApiKey, perPage: 10 });
+            let sr = await doSearch(kw);
+            if (!sr?.success || !sr.results?.length) {
+              for (const w of kw.split(' ')) { sr = await doSearch(w); if (sr?.success && sr.results?.length) break; }
+            }
+            if (sr?.success && sr.results?.length) {
+              const sorted = [...sr.results].sort((a, b) => {
+                const aOk = a.duration >= targetDur ? 0 : 1, bOk = b.duration >= targetDur ? 0 : 1;
+                if (aOk !== bOk) return aOk - bOk;
+                return b.duration - a.duration;
+              });
+              const chosen = sorted.filter(v => !usedIds.has(v.id))[0] || sorted[0];
+              usedIds.add(chosen.id);
+              const rawPath  = `${subDir}\\raw_${i}_${Date.now()}.mp4`;
+              const trimPath = `${subDir}\\stock_${String(i).padStart(4, '0')}.mp4`;
+              const dr = await window.electronAPI.stockVideoDownload({ url: chosen.url, destPath: rawPath });
+              if (dr?.success) {
+                stockClipPaths.push(rawPath);
+                const tr = await window.electronAPI.trimLoopVideo({ inputPath: rawPath, duration: targetDur, outputPath: trimPath, targetW: 1280, targetH: 720 });
+                window.electronAPI?.deleteFile?.(rawPath).catch(() => {});
+                if (tr?.success) { orderedPaths[i] = trimPath; stockClipPaths.push(trimPath); addBatchLog(`  ✅ Clip ${i + 1}/${timeChunks.length} OK`, 'success'); }
+              }
+            }
+          } catch (_) {}
+          batchDone++;
+        };
+
+        await Promise.all(Array.from({ length: 4 }, async () => {
+          while (batchQMutex.idx < timeChunks.length) {
+            const i = batchQMutex.idx++;
+            if (i >= timeChunks.length || batchStopRef.current) break;
+            await processBatchOne(i);
+          }
+        }));
+
+        // Fallback: clip null → dùng clip gần nhất
+        for (let i = 0; i < orderedPaths.length; i++) {
+          if (!orderedPaths[i]) {
+            const prev = orderedPaths.slice(0, i).filter(Boolean).pop() || orderedPaths.slice(i + 1).filter(Boolean)[0];
+            if (prev) orderedPaths[i] = prev;
+          }
+        }
+
+        if (batchStopRef.current) throw new Error('Đã dừng.');
+
+        // 6. Merge
+        const clips = orderedPaths.filter(Boolean);
+        addBatchLog(`  Ghép ${clips.length} clip + audio...`, 'info');
+        let finalPath = null;
+        if (clips.length === 0) {
+          throw new Error('Không tải được clip nào');
+        } else if (clips.length === 1) {
+          const rmr = await window.electronAPI.replaceAudio({ videoPath: clips[0], audioPath: fileInfo.path, outputFolder: subDir });
+          if (rmr?.success && rmr?.path) finalPath = rmr.path;
+        } else {
+          const car = await window.electronAPI.concatAudio({ clips, audioPath: fileInfo.path, outputFolder: subDir, outputName: `final_${baseName}_${Date.now()}` });
+          if (car?.success && car?.path) {
+            finalPath = car.path;
+          } else {
+            const mr = await window.electronAPI.mergeVideo({ files: clips, trimStart: 0, trimEnd: 0, transition: 'Không có', outputFolder: subDir, outputName: `merged_${Date.now()}` });
+            if (mr?.success && mr?.path) {
+              const rmr = await window.electronAPI.replaceAudio({ videoPath: mr.path, audioPath: fileInfo.path, outputFolder: subDir });
+              finalPath = rmr?.success ? rmr.path : mr.path;
+            }
+          }
+        }
+
+        if (!finalPath) throw new Error('Merge thất bại');
+        addBatchLog(`  ✅ Hoàn tất: ${finalPath.split(/[\\/]/).pop()}`, 'success');
+
+        // 7. Xóa tất cả clip stock, chỉ giữ final
+        addBatchLog(`  🗑 Dọn dẹp clip stock...`, 'info');
+        const listed = await window.electronAPI?.listFiles?.(subDir);
+        for (const fp of (listed?.files || [])) {
+          const fname = fp.split(/[\\/]/).pop();
+          if ((fname.startsWith('stock_') || fname.startsWith('raw_')) && fname.endsWith('.mp4') && fp !== finalPath) {
+            window.electronAPI?.deleteFile?.(fp).catch(() => {});
+          }
+        }
+
+        setBatchResults(prev => prev.map((r, i) => i === fi ? { ...r, status: 'done', finalPath } : r));
+        addBatchLog(`  ✅ [${fi + 1}/${batchFiles.length}] XONG: ${fileInfo.name}`, 'success');
+
+      } catch (err) {
+        const msg = err.message || 'Lỗi không xác định';
+        setBatchResults(prev => prev.map((r, i) => i === fi ? { ...r, status: 'error', error: msg } : r));
+        addBatchLog(`  ❌ [${fi + 1}/${batchFiles.length}] Lỗi: ${msg}`, 'error');
+      }
+    }
+
+    setBatchRunning(false);
+    addBatchLog(`\n🎉 Batch hoàn tất! ${batchResults.filter(r => r.status === 'done').length}/${batchFiles.length} file thành công.`, 'success');
+  };
 
   // Pipeline
   const [running,    setRunning]   = useState(false);
@@ -2278,8 +3300,8 @@ function AudioToVideoPanel() {
       }
       addLog(clean, data.type === 'error' ? 'error' : data.type === 'success' ? 'success' : 'info');
     };
-    window.electronAPI?.onVeoLog?.(handler);
-    return () => window.electronAPI?.removeAllListeners?.('veo-log');
+    const _w = window.electronAPI?.onVeoLog?.(handler);
+    return () => { if (_w) window.electronAPI?.removeListener?.('veo-log', _w); };
   }, [running, addLog]);
 
   const markDone = (id) => { setDone(s => [...s, id]); setActive(null); };
@@ -2293,7 +3315,7 @@ function AudioToVideoPanel() {
   const handleSceneDurChange = (d) => {
     setSceneDur(d);
     if ([4,6,8,10].includes(d)) setVidSceneDur(d);
-    if (d === 10) setVidModel('Omni Flash');
+    if (d === 10) setVidModel('Omni 1.1 Flash');
   };
 
   // Đổi mode stock/Veo, đồng thời reset sceneDur nếu cần
@@ -2309,6 +3331,7 @@ function AudioToVideoPanel() {
     setVideoPaths([]); setMergedPath(''); setFinalPath('');
     setDone([]); setActive(null); setErrStep(null); setError('');
     setLogs([]); setGenProgress({ current: 0, total: 0 });
+    setA2vDnaImgs([]);
   };
 
   const handleStop   = () => { stopRef.current = true; pauseRef.current = false; setPaused(false); };
@@ -2318,9 +3341,55 @@ function AudioToVideoPanel() {
 
   const vidDurs = [4, 6, 8, 10];
 
+  // Parse TXT/SRT/VTT tải lên thành transcript segments với timestamp ước lượng
+  const parseManualTranscript = (rawText, totalDurationSec) => {
+    const text = rawText.trim();
+    let segments = [];
+    let fullText = '';
+
+    // Thử parse SRT format: "1\n00:00:01,000 --> 00:00:04,000\nText"
+    const srtPattern = /\d+\n(\d{2}:\d{2}:\d{2}[,.]?\d*)\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]?\d*)\n([\s\S]*?)(?=\n\n|\n\d+\n|$)/g;
+    const srtMatches = [...text.matchAll(srtPattern)];
+    if (srtMatches.length > 0) {
+      const toSec = t => {
+        const [h, m, s] = t.replace(',', '.').split(':');
+        return parseFloat(h)*3600 + parseFloat(m)*60 + parseFloat(s);
+      };
+      segments = srtMatches.map(m => ({
+        start: toSec(m[1]),
+        end:   toSec(m[2]),
+        text:  m[3].replace(/\n/g, ' ').trim()
+      })).filter(s => s.text);
+      fullText = segments.map(s => s.text).join(' ');
+    } else {
+      // Plain text: chia theo đoạn/câu, ước lượng timestamp tuyến tính theo số từ
+      const sentences = text
+        .split(/(?<=[.!?。！？\n])\s+|\n{2,}/)
+        .map(s => s.replace(/\n/g, ' ').trim())
+        .filter(s => s.length > 5);
+      fullText = sentences.join(' ');
+      const totalWords = sentences.reduce((acc, s) => acc + s.split(/\s+/).length, 0);
+      let elapsed = 0;
+      segments = sentences.map(s => {
+        const words     = s.split(/\s+/).length;
+        const duration  = totalDurationSec * (words / Math.max(totalWords, 1));
+        const start     = parseFloat(elapsed.toFixed(2));
+        elapsed        += duration;
+        return { start, end: parseFloat(elapsed.toFixed(2)), text: s };
+      });
+    }
+
+    return { fullText, segments };
+  };
+
   const handleStart = async () => {
     // Capture tất cả settings tại thời điểm bấm Start — tránh stale closure
+    const _manualTranscript = manualTranscript.trim();
     const apiKeys         = loadKeys();
+    const _atvGeminiModel = atvGeminiModel;
+    // Áp dụng model đã chọn cho toàn bộ pipeline Gemini
+    setGeminiPromptModel(_atvGeminiModel);
+    setAudioToVideoLLMModel(_atvGeminiModel);
     const _sceneDur       = sceneDur;
     const _videoEngine    = videoEngine;
     const _vidSceneDur    = vidSceneDur;
@@ -2329,18 +3398,26 @@ function AudioToVideoPanel() {
     const _vidQuality     = vidQuality;
     const _vidDir         = vidDir;
     const _makeVideo      = makeVideo;
-    const _stockMode      = stockMode;
+    const _a2vIngMode     = a2vIngMode && !stockMode && !gsVideoMode; // Ingredients mode
+    const _a2vRefDir      = a2vRefDir;
+    const _a2vImgMdl      = a2vImgMdl;
+    const _gsMode         = gsVideoMode; // Whisper→Gemini T2V Veo (không dùng stock)
+    const _stockMode_eff  = stockMode && !_gsMode; // stock chỉ khi không phải GS mode
+    const _stockMode      = _stockMode_eff;
     const _stockProvider  = stockProvider;
     const _stockApiKey    = stockApiKey;
-    const _stockTxMode    = stockMode ? stockTranscribeMode : 'gemini'; // chỉ áp dụng khi stock
-    const _stockNoGemini  = _stockTxMode === 'manual';   // backward compat: skip all AI
-    const _useLocalWhisper= _stockTxMode === 'whisper';  // Whisper cục bộ
+    const _stockTxMode    = _stockMode_eff ? stockTranscribeMode : 'gemini';
+    const _stockNoGemini  = _stockTxMode === 'manual';
+    const _useLocalWhisper= _stockTxMode === 'whisper';
     const _stockManualKw  = (stockManualKw || '').trim();
 
     if (!filePath)           { setError('Vui lòng chọn file audio hoặc video.'); return; }
     // Không cần Gemini key khi: manual skip hoặc Whisper cục bộ (stock mode)
-    if (!apiKeys.length && !_stockNoGemini && !_useLocalWhisper) { setError('Chưa có API Key Gemini. Vào Creator → nhập key.'); return; }
+    if (aiMode === 'gemini' && !apiKeys.length && !_stockNoGemini && !_useLocalWhisper) { setError('Chưa có API Key Gemini. Vào Settings → API Key.'); return; }
+    if (aiMode === 'claude' && !claudeKey && !_stockNoGemini && !_useLocalWhisper)          { setError('Chưa có Claude API Key. Vào Settings → API Key → Claude.'); return; }
+    if (aiMode === 'groq'   && !groqKeys.length && !_stockNoGemini && !_useLocalWhisper)   { setError('Chưa có Groq API Key. Vào Settings → API Key → Groq.'); return; }
     if (_makeVideo && !_vidDir) { setError('Vui lòng chọn thư mục lưu video.'); return; }
+    if (_a2vIngMode && _makeVideo && !_a2vRefDir) { setError('Chế độ Ingredients: vui lòng chọn thư mục lưu ảnh DNA nhân vật.'); return; }
     if (_makeVideo && _stockMode) {
       const hasKey = _stockProvider === 'both'
         ? (pexelsKey || pixabayKey)
@@ -2353,6 +3430,7 @@ function AudioToVideoPanel() {
     setTranscript(null); setOverallAnalysis(null); setChunks([]); setScenes([]);
     setVideoPaths([]); setMergedPath(''); setFinalPath('');
     setGenProgress({ current: 0, total: 0 });
+    setA2vDnaImgs([]);
     stopRef.current = false; pauseRef.current = false; setPaused(false);
 
     try {
@@ -2376,16 +3454,85 @@ function AudioToVideoPanel() {
       let result = null;
       let oa     = null;
       let timeChunks;
+      let _gsFullText = ''; // full transcript text cho _gsMode continuity
 
-      if (_stockNoGemini) {
+      if (_gsMode) {
+        // ── [AI+Veo] Whisper cục bộ → Gemini tạo Veo prompt (T2V thuần) ──────
+        setActive('extract');
+        addLog(`🤖 [AI+Veo] Whisper cục bộ: phân tích lời thoại...`, 'info');
+        markDone('extract');
+
+        setActive('transcribe'); setActiveTab('transcript');
+        try {
+          result = await transcribeLocalChunked(
+            filePath, totalSec,
+            (msg) => addLog(`  ⏳ ${msg}`, 'info'),
+            (done, total, segCount, errMsg) => {
+              if (errMsg) addLog(`  ⚠️ Đoạn ${done}/${total}: ${errMsg}`, 'error');
+              else        addLog(`  ✅ Đoạn ${done}/${total}: ${segCount} câu`, 'success');
+            },
+            (msg) => addLog(msg, 'info'),
+            (msg) => addLog(msg, 'info')
+          );
+          addLog(`✅ [AI+Veo] Whisper xong — ${result.segments.length} câu`, 'success');
+        } catch (whisperErr) {
+          addLog(`⚠️ Whisper không khả dụng (${whisperErr.message.slice(0,80)}) — tự động chuyển sang Gemini...`, 'warn');
+          if (!apiKeys.length) throw new Error('Whisper thất bại và không có Gemini API key để fallback. Vào Settings thêm key.');
+          const _totalChunksGem = Math.ceil(totalSec / 90);
+          addLog(`🔄 Gemini transcribe: ${_totalChunksGem} phần (90s/phần) · ${Math.min(apiKeys.length, 8)} key song song...`, 'info');
+          result = await transcribeAudioChunked(
+            apiKeys, totalSec,
+            async (startSec, durationSec) =>
+              window.electronAPI.extractAudioChunk({ filePath, startSec, durationSec }),
+            (msg) => addLog(`  ⏳ ${msg}`, 'info'),
+            (done, total, segCount, errMsg) => {
+              if (errMsg) addLog(`  ⚠️ Phần ${done}/${total}: ${errMsg}`, 'error');
+              else        addLog(`  ✅ Phần ${done}/${total}: ${segCount} câu`, 'success');
+            },
+            (msg) => addLog(msg, 'info')
+          );
+          addLog(`✅ [AI+Veo] Gemini transcribe xong — ${result.segments.length} câu`, 'success');
+        }
+        if (stopRef.current) throw new Error('Đã dừng.');
+        setTranscript(result);
+        _gsFullText = result.fullText || '';
+        addLog(`✅ [AI+Veo] Transcribe xong — ${result.segments.length} câu, ${_gsFullText.split(' ').length} từ`, 'success');
+
+        // Phân tích tổng quát nội dung bằng Gemini
+        addLog('🤖 [AI+Veo] Gemini phân tích nội dung...', 'info');
+        try {
+          oa = await analyzeOverallContent(
+            apiKeys, result.fullText,
+            ({ fromIdx, toIdx }) => addLog(`🔄 Key ${fromIdx + 1}→${toIdx + 1}`, 'info')
+          );
+          setOverallAnalysis(oa);
+          addLog(`✅ [AI+Veo] Phân tích xong — ${oa.topic || ''}`, 'success');
+        } catch (e) {
+          addLog(`⚠️ Phân tích tổng quát lỗi (bỏ qua): ${e.message}`, 'error');
+        }
+        markDone('transcribe');
+        if (stopRef.current) throw new Error('Đã dừng.');
+
+        // Chia chunks tự nhiên theo nhịp lời thoại
+        setActive('chunk'); setActiveTab('chunks');
+        timeChunks = _autoChunk
+          ? createNaturalChunks(result.segments, totalSec)
+          : createTimeBasedChunks(result.segments, totalSec, _sceneDur);
+        setChunks(timeChunks);
+        addLog(`✅ [AI+Veo] ${timeChunks.length} cảnh${_autoChunk ? ' tự nhiên' : ''} — tiếp theo: Gemini tạo Veo prompt`, 'success');
+        markDone('chunk');
+        if (stopRef.current) throw new Error('Đã dừng.');
+
+      } else if (_stockNoGemini) {
         // ── [Manual] Bỏ qua extract/transcribe/chunk — dùng từ khóa tay ───────
         setActive('extract'); markDone('extract');
         setActive('transcribe'); markDone('transcribe');
         setActive('chunk'); setActiveTab('chunks');
-        const _dur4Chunk = (_autoChunk || _sceneDur <= 0) ? 8 : _sceneDur;
+        // Dùng _sceneDur để chia chunks; clip cuối sẽ tự tính thời gian còn lại khi tải
+        const _dur4Chunk = (_sceneDur <= 0) ? 8 : _sceneDur;
         timeChunks = createTimeBasedChunks([], totalSec, _dur4Chunk);
         setChunks(timeChunks);
-        addLog(`✅ ${timeChunks.length} cảnh × ${_dur4Chunk}s — chế độ từ khóa thủ công`, 'success');
+        addLog(`✅ ${timeChunks.length} cảnh × ${_dur4Chunk}s (clip cuối tự khớp audio ${totalSec}s) — từ khóa thủ công`, 'success');
         markDone('chunk');
 
       } else if (_useLocalWhisper) {
@@ -2396,21 +3543,41 @@ function AudioToVideoPanel() {
         markDone('extract');
 
         setActive('transcribe'); setActiveTab('transcript');
-        result = await transcribeLocalChunked(
-          filePath,   // main process tự extract PCM → không cần extractChunkFn nữa
-          totalSec,
-          (msg) => addLog(`  ⏳ ${msg}`, 'info'),
-          (done, total, segCount, errMsg) => {
-            if (errMsg) addLog(`  ⚠️ Đoạn ${done}/${total}: ${errMsg}`, 'error');
-            else        addLog(`  ✅ Đoạn ${done}/${total}: ${segCount} câu`, 'success');
-          },
-          (msg) => addLog(msg, 'info'),
-          (msg) => addLog(msg, 'info')   // model download progress
-        );
+        try {
+          result = await transcribeLocalChunked(
+            filePath,
+            totalSec,
+            (msg) => addLog(`  ⏳ ${msg}`, 'info'),
+            (done, total, segCount, errMsg) => {
+              if (errMsg) addLog(`  ⚠️ Đoạn ${done}/${total}: ${errMsg}`, 'error');
+              else        addLog(`  ✅ Đoạn ${done}/${total}: ${segCount} câu`, 'success');
+            },
+            (msg) => addLog(msg, 'info'),
+            (msg) => addLog(msg, 'info')
+          );
+          addLog(`✅ Whisper xong — ${result.segments.length} đoạn`, 'success');
+        } catch (whisperErr) {
+          addLog(`⚠️ Whisper không khả dụng (${whisperErr.message.slice(0,80)}) — tự động chuyển sang Gemini...`, 'warn');
+          if (!apiKeys.length) throw new Error('Whisper thất bại và không có Gemini API key để fallback. Vào Settings thêm key.');
+          const _fallbackChunks = Math.ceil(totalSec / 90);
+          addLog(`🔄 Gemini transcribe fallback: ${_fallbackChunks} phần...`, 'info');
+          result = await transcribeAudioChunked(
+            apiKeys, totalSec,
+            async (startSec, durationSec) =>
+              window.electronAPI.extractAudioChunk({ filePath, startSec, durationSec }),
+            (msg) => addLog(`  ⏳ ${msg}`, 'info'),
+            (done, total, segCount, errMsg) => {
+              if (errMsg) addLog(`  ⚠️ Phần ${done}/${total}: ${errMsg}`, 'error');
+              else        addLog(`  ✅ Phần ${done}/${total}: ${segCount} câu`, 'success');
+            },
+            (msg) => addLog(msg, 'info')
+          );
+          addLog(`✅ Gemini transcribe xong — ${result.segments.length} đoạn`, 'success');
+        }
         if (stopRef.current) throw new Error('Đã dừng.');
 
         setTranscript(result);
-        addLog(`✅ Whisper xong — ${result.segments.length} đoạn, ${(result.fullText || '').split(' ').length} từ`, 'success');
+        addLog(`✅ Transcribe xong — ${result.segments.length} đoạn, ${(result.fullText || '').split(' ').length} từ`, 'success');
         markDone('transcribe');
         if (stopRef.current) throw new Error('Đã dừng.');
 
@@ -2428,8 +3595,67 @@ function AudioToVideoPanel() {
         markDone('chunk');
         if (stopRef.current) throw new Error('Đã dừng.');
 
+      } else if (aiMode === 'groq') {
+        // ── [Groq Whisper] Full pipeline: Transcribe + Analyze + Prompts qua Groq ─
+        setActive('extract');
+        const _totalChunksGroq = Math.ceil(totalSec / 180);
+        addLog(`⚡ Groq Whisper: chia audio thành ${_totalChunksGroq} phần (3 phút/phần)...`, 'info');
+        markDone('extract');
+
+        setActive('transcribe'); setActiveTab('transcript');
+        addLog(`⚡ Groq Whisper — ${_totalChunksGroq} phần · ${Math.min(groqKeys.length, 4)} key song song...`, 'info');
+
+        result = await transcribeGroqChunked(
+          groqKeys,
+          totalSec,
+          async (startSec, durationSec) =>
+            window.electronAPI.extractAudioChunk({ filePath, startSec, durationSec }),
+          (msg) => addLog(`  ${msg}`, 'info'),
+          (done, total, segCount, errMsg) => {
+            if (errMsg) addLog(`  ⚠️ Phần ${done}/${total}: ${errMsg}`, 'error');
+            else        addLog(`  ✅ Phần ${done}/${total}: ${segCount} câu thoại`, 'success');
+          }
+        );
+        if (stopRef.current) throw new Error('Đã dừng.');
+
+        setTranscript(result);
+        addLog(`✅ Groq Whisper xong — ${result.segments.length} đoạn, ${(result.fullText || '').split(' ').length} từ`, 'success');
+
+        addLog('⚡ Groq — Đang phân tích tổng quát nội dung...', 'info');
+        try {
+          oa = await analyzeOverallContentGroq(
+            groqKeys, result.fullText,
+            ({ fromIdx, toIdx }) => addLog(`🔄 Groq Key ${fromIdx + 1}→${toIdx + 1}`, 'info'),
+            groqModel
+          );
+          setOverallAnalysis(oa);
+          addLog(`✅ Phân tích xong — ${oa.topic || ''}`, 'success');
+        } catch (e) {
+          addLog(`⚠️ Phân tích tổng quát lỗi (bỏ qua): ${e.message}`, 'error');
+        }
+        markDone('transcribe');
+        if (stopRef.current) throw new Error('Đã dừng.');
+
+        setActive('chunk'); setActiveTab('chunks');
+        addLog(`Chia ${totalSec}s thành ${Math.ceil(totalSec / _sceneDur)} chunks (${_sceneDur}s/chunk)...`, 'info');
+        timeChunks = createTimeBasedChunks(result.segments, totalSec, _sceneDur);
+        setChunks(timeChunks);
+        addLog(`✅ Chia xong ${timeChunks.length} chunks với timestamp chính xác`, 'success');
+        markDone('chunk');
+        if (stopRef.current) throw new Error('Đã dừng.');
+
       } else {
         // ── [Gemini] Transcribe qua Gemini API ───────────────────────────────
+        if (_manualTranscript) {
+          // ── [SKIP] Dùng transcript tải lên — không gọi Gemini transcription ──
+          markDone('extract');
+          setActive('transcribe'); setActiveTab('transcript');
+          addLog(`📄 Dùng transcript tải lên (${manualTranscriptName || 'text'}) — bỏ qua phân tích âm thanh`, 'success');
+          result = parseManualTranscript(_manualTranscript, totalSec);
+          setTranscript(result);
+          addLog(`✅ Transcript từ file — ${result.segments.length} đoạn, ${(result.fullText || '').split(' ').length} từ`, 'success');
+          markDone('transcribe');
+        } else {
         setActive('extract');
         const CHUNK_SECS_LOG  = 90;
         const _totalChunks90  = Math.ceil(totalSec / CHUNK_SECS_LOG);
@@ -2450,7 +3676,9 @@ function AudioToVideoPanel() {
             if (errMsg) addLog(`  ⚠️ Phần ${done}/${total}: ${errMsg}`, 'error');
             else        addLog(`  ✅ Phần ${done}/${total}: ${segCount} câu thoại`, 'success');
           },
-          (msg) => addLog(msg, 'info')
+          (msg) => addLog(msg, 'info'),
+          1,
+          _atvGeminiModel
         );
         if (stopRef.current) throw new Error('Đã dừng.');
 
@@ -2458,20 +3686,23 @@ function AudioToVideoPanel() {
           throw new Error('Không nhận được kết quả transcription từ Gemini. Kiểm tra API Key và thử lại.');
         setTranscript(result);
         addLog(`✅ Transcript xong — ${result.segments.length} đoạn, ${(result.fullText || '').split(' ').length} từ`, 'success');
+        markDone('transcribe');
+        } // end else (Gemini transcription)
 
         addLog('Đang phân tích tổng quát nội dung...', 'info');
         try {
-          oa = await analyzeOverallContent(
-            apiKeys,
-            result.fullText,
-            ({ fromIdx, toIdx }) => addLog(`🔄 Chuyển key ${fromIdx + 1}→${toIdx + 1}`, 'info')
-          );
+          oa = aiMode === 'claude'
+            ? await analyzeOverallContentClaude({ apiKey: claudeKey, model: claudeModel, transcript: result.fullText })
+            : await analyzeOverallContent(
+                apiKeys,
+                result.fullText,
+                ({ fromIdx, toIdx }) => addLog(`🔄 Chuyển key ${fromIdx + 1}→${toIdx + 1}`, 'info')
+              );
           setOverallAnalysis(oa);
           addLog(`✅ Phân tích xong — ${oa.topic || ''}`, 'success');
         } catch (e) {
           addLog(`⚠️ Phân tích tổng quát lỗi (bỏ qua): ${e.message}`, 'error');
         }
-        markDone('transcribe');
         if (stopRef.current) throw new Error('Đã dừng.');
 
         setActive('chunk'); setActiveTab('chunks');
@@ -2491,27 +3722,114 @@ function AudioToVideoPanel() {
       // ── 4. Tạo Veo Prompts / Trích từ khóa (Stock) ───────────────────────
       let generatedScenes = [];
       let stockKeywords   = [];
+
       if (!_stockMode) {
         setActive('generate'); setActiveTab('prompts');
-        addLog(`Bắt đầu tạo ${timeChunks.length} Veo Prompts (Gemini)...`, 'info');
+        const _providerLabel = aiMode === 'groq' ? '⚡ Groq' : aiMode === 'claude' ? '🤖 Claude' : 'Gemini';
+        addLog(`Bắt đầu tạo ${timeChunks.length} Veo Prompts (${_providerLabel})...`, 'info');
+
+        // ── Inject phong cách do user chọn vào overallContext ────────────────
+        const STYLE_KEYWORDS_ATV = {
+          'Photorealistic':  'Ultra-realistic photography, photorealistic render, 8K resolution, natural skin texture, real-world lighting, hyper-detailed DSLR quality',
+          'Cinematic 4K':    'Cinematic 4K film quality, anamorphic lens, dramatic depth of field, professional color grading, film grain, Hollywood-level production',
+          'Anime / Manga':   'Japanese anime 2D animation, clean sharp line art, cel-shaded flat coloring, expressive anime eyes, vibrant saturated palette',
+          'Pixar 3D':        'Pixar/Disney 3D CGI, smooth subsurface scattering, warm key lighting, polished 3D render, expressive stylized characters',
+          'Studio Ghibli':   'Studio Ghibli 2D hand-drawn animation, soft watercolor backgrounds, warm muted tones, expressive faces, gentle painterly line art',
+          'Dark Fantasy':    'Dark fantasy digital painting, dramatic chiaroscuro, deep gothic shadows, epic fantasy illustration, moody desaturated palette',
+          'Watercolor':      'Traditional watercolor painting, soft wet-on-wet washes, gentle color bleeds, textured paper, loose brushstrokes',
+          'Cyberpunk':       'Cyberpunk art, neon-lit city, futuristic high contrast, synthwave color palette, rain-slicked streets',
+          'Documentary':     'Documentary cinéma vérité, natural handheld camera, authentic real-world lighting, journalistic style',
+        };
+        const _capturedStyle = veoStyle;
+        if (_capturedStyle !== 'auto' && STYLE_KEYWORDS_ATV[_capturedStyle]) {
+          addLog(`🎨 Phong cách: ${_capturedStyle}`, 'info');
+          oa = oa ? { ...oa, recommended_visual_style: STYLE_KEYWORDS_ATV[_capturedStyle] } : { recommended_visual_style: STYLE_KEYWORDS_ATV[_capturedStyle], topic: '', tone: '', context_summary: '' };
+        }
+
+        // Inject prompt đồng bộ nhân vật / bối cảnh
+        // Nếu user chưa nhập → AI tự phân tích transcript và sinh description
+        let _charBgPrompt = charBgPrompt.trim();
+        if (!_charBgPrompt && result?.fullText && apiKeys.length) {
+          addLog(`🎭 AI đang phân tích nhân vật & bối cảnh từ audio...`, 'info');
+          try {
+            const { GoogleGenAI: _GAI } = await import('@google/genai');
+            const _ai = new _GAI({ apiKey: apiKeys[0] });
+            const _resp = await _ai.models.generateContent({
+              model: _atvGeminiModel,
+              contents: [{ role: 'user', parts: [{ text: `Analyze this audio transcript and extract character & background descriptions for consistent Veo video generation.
+
+TRANSCRIPT:
+${(result.fullText || '').slice(0, 5000)}
+
+${oa ? `TOPIC: ${oa.topic || ''}\nSUMMARY: ${oa.context_summary || ''}` : ''}
+
+Write a single concise English description (2-4 sentences) covering:
+1. Main character(s): physical appearance, clothing, distinctive features (use generic roles, NO real names)
+2. Primary background/setting: location, atmosphere, time of day, visual environment
+
+Format: "[Character description]. Background: [setting description]."
+Return ONLY the description, no explanation.` }] }],
+              config: { maxOutputTokens: 200, thinkingConfig: { thinkingBudget: 0 }, temperature: 0.3 },
+            });
+            const autoDesc = (_resp?.text || '').trim();
+            if (autoDesc && autoDesc.length > 20) {
+              _charBgPrompt = autoDesc;
+              setCharBgPrompt(autoDesc); // hiển thị lên UI để user thấy
+              addLog(`✅ AI sinh đồng bộ nhân vật/bối cảnh: "${autoDesc.slice(0, 100)}..."`, 'success');
+            }
+          } catch (e) {
+            addLog(`⚠️ Tự động sinh nhân vật/bối cảnh thất bại: ${e.message}`, 'warn');
+          }
+        }
+        if (_charBgPrompt) {
+          addLog(`🎭 Đồng bộ nhân vật/bối cảnh: "${_charBgPrompt.slice(0, 80)}..."`, 'info');
+          oa = oa
+            ? { ...oa, character_background_sync: _charBgPrompt }
+            : { character_background_sync: _charBgPrompt, topic: '', tone: '', context_summary: '' };
+        }
         setGenProgress({ current: 0, total: timeChunks.length });
 
-        const _gs = await analyzeScenes(
-          apiKeys,
-          timeChunks,
-          _sceneDur,
-          oa,
-          (current, total, keyInfo) => {
-            setGenProgress({ current, total });
-            if (keyInfo) addLog(`Scene ${current}/${total} — ${keyInfo}`, 'info');
-            else addLog(`Tạo prompt Scene ${current}/${total}...`, 'info');
-          },
-          (sceneData, isError) => {
-            setScenes(prev => [...prev, sceneData]);
-            if (isError) addLog(`⚠️ Scene ${sceneData.sceneNumber} dùng fallback: ${sceneData.error}`, 'error');
-            else addLog(`✅ Scene ${sceneData.sceneNumber} xong`, 'success');
-          }
-        );
+        // ── Chọn engine phân tích scene theo mode ──────────────────────────
+        const _onSceneProgress = (current, total, keyInfo) => {
+          setGenProgress({ current, total });
+          const info = keyInfo ? ` — ${keyInfo}` : '';
+          addLog(`Tạo prompt Scene ${current}/${total}${info}...`, 'info');
+        };
+        const _onSceneReady = (sceneData, isError) => {
+          setScenes(prev => [...prev, sceneData]);
+          if (isError) addLog(`⚠️ Scene ${sceneData.sceneNumber} dùng fallback: ${sceneData.error || ''}`, 'error');
+          else         addLog(`✅ Scene ${sceneData.sceneNumber} xong`, 'success');
+        };
+
+        let _gs;
+        if (_gsMode) {
+          // ── AI+Veo: analyzeScenesContinuity — giữ mạch truyện toàn bộ audio ──
+          addLog(`🎬 [AI+Veo] Gemini tạo Veo prompt đồng bộ kịch bản (${timeChunks.length} cảnh)...`, 'info');
+          _gs = await analyzeScenesContinuity(
+            apiKeys, timeChunks, _sceneDur, oa, _gsFullText,
+            _onSceneProgress, _onSceneReady
+          );
+        } else if (aiMode === 'groq') {
+          _gs = await analyzeScenesToGroq({
+            apiKeys: groqKeys, model: groqModel,
+            chunks: timeChunks, targetDuration: _sceneDur, overallContext: oa,
+            onSceneProgress: (current, total) => { setGenProgress({ current, total }); addLog(`Scene ${current}/${total}...`, 'info'); },
+            onSceneReady: (sceneData, isError) => { setScenes(prev => [...prev, sceneData]); if (isError) addLog(`Scene ${sceneData.sceneNumber} fallback`, 'error'); else addLog(`Scene ${sceneData.sceneNumber} xong`, 'success'); },
+            onSwitch: ({ fromIdx, toIdx }) => addLog(`Groq Key ${fromIdx+1} -> Key ${toIdx+1}`, 'info'),
+          });
+        } else if (aiMode === 'claude') {
+          _gs = await analyzeScenesClaude({
+            apiKey: claudeKey, model: claudeModel,
+            chunks: timeChunks, targetDuration: _sceneDur, overallContext: oa,
+            onSceneProgress: (current, total) => { setGenProgress({ current, total }); addLog(`Scene ${current}/${total}...`, 'info'); },
+            onSceneReady: (sceneData, isError) => { setScenes(prev => [...prev, sceneData]); if (isError) addLog(`⚠️ Scene ${sceneData.sceneNumber} fallback`, 'error'); else addLog(`✅ Scene ${sceneData.sceneNumber} xong`, 'success'); },
+          });
+        } else {
+          _gs = await analyzeScenes(
+            apiKeys, timeChunks, _sceneDur, oa,
+            _onSceneProgress, _onSceneReady
+          );
+        }
 
         generatedScenes = _gs;
         setScenes(generatedScenes);
@@ -2519,20 +3837,6 @@ function AudioToVideoPanel() {
         addLog(`🎉 Hoàn tất ${generatedScenes.length} prompts${failCount ? ` (${failCount} lỗi)` : ''}`, 'success');
         markDone('generate');
 
-        // ── Tự động lưu file prompt vào thư mục ────────────────────────────
-        if (autoSavePromptRef.current && promptDirRef.current) {
-          try {
-            const ts   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-            const base = fileName.replace(/\.[^.]+$/, '');
-            const txtPath = `${promptDirRef.current}\\veo_prompts_${base}_${ts}.txt`;
-            const content = exportToTxt(generatedScenes);
-            const wr = await window.electronAPI.saveTextFile({ content, filePath: txtPath });
-            if (wr?.success) addLog(`💾 Đã lưu prompt tự động → ${txtPath}`, 'success');
-            else             addLog(`⚠️ Lưu prompt tự động thất bại: ${wr?.error || 'lỗi không xác định'}`, 'error');
-          } catch (e) {
-            addLog(`⚠️ Lưu prompt tự động thất bại: ${e.message}`, 'error');
-          }
-        }
       } else if (_stockNoGemini) {
         // ── [Manual] Dùng từ khóa tay ────────────────────────────────────────
         setActive('generate');
@@ -2543,29 +3847,185 @@ function AudioToVideoPanel() {
         addLog(`✅ [Stock] ${timeChunks.length} cảnh — từ khóa: ${[...new Set(stockKeywords)].slice(0, 4).join(' | ')}`, 'success');
         markDone('generate');
       } else if (_useLocalWhisper || _stockMode) {
-        // ── [Whisper / Gemini stock] Trích từ khóa từ transcript (word freq) ──
+        // ── [Whisper / Gemini / Groq stock] AI sinh từ khóa hình ảnh từ transcript ──
         setActive('generate');
-        addLog('[Stock] Trích từ khóa từ transcript...', 'info');
-        const _topic3 = (oa?.topic || '').replace(/[^\p{L}\s]/gu, ' ').split(/\s+/).filter(Boolean).slice(0, 3).join(' ') || 'nature landscape';
-        const _stops  = new Set(['và','của','là','có','trong','với','cho','một','các','này','đó','đã','được','không','để','từ','hay','như','khi','thì','mà','về','ra','vào','lên','xuống','đến','lại','nên','vì','bởi','nhưng','hoặc','cũng','đây','những','mọi','tất','cả','ai','gì','nào','ấy','rất','quá','hơn','nhất','hết','ngay','chỉ','lúc','sau','trước','luôn','theo','bên','qua','dù','tuy','nếu','đang','sẽ','bị','mới','vẫn','cùng','giữa','the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','is','are','was','were','be','been','have','has','had','do','does','did','will','would','could','should','may','might','must','this','that','these','those','i','you','he','she','it','we','they','not','so','if','as','up','out','into','over','also','just','very','too','more','most','no','my','your','his','her','our','their']);
-        stockKeywords = timeChunks.map(chunk => {
-          const text = (chunk.exactText || '').trim();
-          if (!text || text.startsWith('[Không') || text.length < 8) return _topic3;
-          const words = text.toLowerCase().replace(/[^\p{L}\s]/gu, ' ').split(/\s+/).filter(w => w.length > 2 && !_stops.has(w) && !/^\d+$/.test(w));
-          const kw = [...new Set(words)].slice(0, 3).join(' ');
-          return kw || _topic3;
-        });
-        addLog(`✅ [Stock] ${stockKeywords.length} từ khóa — ví dụ: ${stockKeywords.slice(0, 3).join(' | ')}`, 'success');
+        addLog('[Stock] AI phân tích nội dung → sinh từ khóa stock video...', 'info');
+        const _fallbackTopic = (oa?.topic || 'nature landscape').replace(/[^\p{L}\s]/gu, ' ').split(/\s+/).slice(0, 3).join(' ') || 'nature landscape';
+        try {
+          if (aiMode === 'groq' && groqKeys.length) {
+            stockKeywords = await generateStockKeywordsGroq(groqKeys, timeChunks, oa, () => {}, groqModel);
+          } else {
+            stockKeywords = await generateStockKeywordsAI(apiKeys, timeChunks, oa, () => {});
+          }
+          // Fallback cho chunk nào trả về rỗng
+          stockKeywords = stockKeywords.map(kw => kw || _fallbackTopic);
+          addLog(`✅ [Stock] AI sinh ${stockKeywords.length} từ khóa — ví dụ: ${stockKeywords.slice(0, 3).join(' | ')}`, 'success');
+        } catch (e) {
+          addLog(`⚠️ [Stock] AI keyword thất bại (${e.message}) → dùng word-freq`, 'warn');
+          // Fallback: word-frequency cũ
+          const _stops = new Set(['và','của','là','có','trong','với','cho','một','các','này','đó','đã','được','không','để','từ','hay','như','khi','thì','mà','về','ra','vào','lên','xuống','đến','lại','nên','vì','bởi','nhưng','hoặc','cũng','những','the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','is','are','was','were','be','have','has','do','does','did','not','so','if','as','up','out','into','over','just','very','too','more','no','my','your','his','her']);
+          stockKeywords = timeChunks.map(chunk => {
+            const text = (chunk.exactText || '').trim();
+            if (!text || text.length < 8) return _fallbackTopic;
+            const words = text.toLowerCase().replace(/[^\p{L}\s]/gu, ' ').split(/\s+/).filter(w => w.length > 2 && !_stops.has(w) && !/^\d+$/.test(w));
+            return [...new Set(words)].slice(0, 3).join(' ') || _fallbackTopic;
+          });
+        }
         markDone('generate');
       }
 
       if (stopRef.current) throw new Error('Đã dừng.');
+
+      // ── 4.5. [Ingredients Mode] Tự động tạo DNA nhân vật ──────────────────
+      // charDnaMap: charName → { filePath, mediaId }
+      const a2vCharDnaMap = {};  // shared vào bước tạo video
+      if (_a2vIngMode && _makeVideo && generatedScenes.length > 0) {
+        setActive('dna'); setActiveTab('dna');
+        addLog('🧬 [Ingredients] Phân tích nhân vật từ câu chuyện...', 'info');
+
+        // Dùng Gemini để detect tối đa 5 nhân vật chính từ overallContext + transcript
+        let detectedChars = [];
+        try {
+          const fullTx = (result?.fullText || timeChunks.map(c => c.exactText || '').join(' ')).slice(0, 6000);
+          const charDetectPrompt = `You are analyzing an audio/video transcript to identify the main characters for consistent visual DNA reference images.
+
+OVERALL CONTEXT:
+${oa ? `Topic: ${oa.topic || ''}\nTone: ${oa.tone || ''}\nSummary: ${oa.context_summary || ''}` : ''}
+${charBgPrompt.trim() ? `USER CHARACTER NOTES: ${charBgPrompt.trim()}` : ''}
+
+TRANSCRIPT:
+${fullTx}
+
+SCENE PROMPTS SAMPLE (first 5):
+${generatedScenes.slice(0, 5).map((s, i) => `Scene ${i + 1}: ${(s.veoVideoPrompt || '').slice(0, 200)}`).join('\n')}
+
+Identify up to 5 MAIN CHARACTERS (humans, animals, or key recurring objects).
+For each character provide a detailed ENGLISH visual description suitable for Veo image generation.
+Use generic role names — NO real person names.
+
+Return ONLY valid JSON array (no markdown, no explanation):
+[{"id":"char_0","name":"the hero","description":"Young Vietnamese man, mid-20s, short black hair, slim build, wearing a white linen shirt and dark jeans, calm expression, sharp jaw"}]`;
+
+          const { GoogleGenAI: _GDNA } = await import('@google/genai');
+          // Rotate keys để tránh quota exhausted
+          let _dnaKeyIdx = 0;
+          let _respDna = null;
+          while (_dnaKeyIdx < apiKeys.length) {
+            try {
+              const _aiDna = new _GDNA({ apiKey: apiKeys[_dnaKeyIdx] });
+              _respDna = await _aiDna.models.generateContent({
+                model: _atvGeminiModel,
+                contents: [{ role: 'user', parts: [{ text: charDetectPrompt }] }],
+                config: { maxOutputTokens: 800, thinkingConfig: { thinkingBudget: 0 }, temperature: 0.3 },
+              });
+              break;
+            } catch (ke) {
+              _dnaKeyIdx++;
+              if (_dnaKeyIdx >= apiKeys.length) throw ke;
+            }
+          }
+          const raw = (_respDna?.text || '').trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+          const arrMatch = raw.match(/\[[\s\S]*\]/);
+          if (arrMatch) {
+            const parsed = JSON.parse(arrMatch[0]);
+            if (Array.isArray(parsed)) detectedChars = parsed.filter(c => c.id && c.description).slice(0, 5);
+          }
+          addLog(`✅ Phát hiện ${detectedChars.length} nhân vật: ${detectedChars.map(c => c.name).join(', ')}`, 'success');
+        } catch (e) {
+          addLog(`⚠️ Phát hiện nhân vật lỗi: ${e.message}`, 'warn');
+        }
+
+        // Fallback: nếu AI không detect được → dùng key_entities từ overallAnalysis
+        if (detectedChars.length === 0 && oa?.key_entities?.length) {
+          addLog('⚡ Fallback: dùng key_entities từ phân tích tổng quát làm nhân vật DNA...', 'info');
+          detectedChars = oa.key_entities.slice(0, 3).map((name, i) => ({
+            id: `char_${i}`,
+            name: name.trim() || 'character',
+            description: `${name}, ${oa.tone || 'cinematic'} style character, consistent appearance across all scenes`,
+          }));
+        }
+
+        // Fallback cuối: nếu vẫn trống → tạo 1 nhân vật generic từ topic
+        if (detectedChars.length === 0) {
+          addLog('⚡ Fallback: tạo nhân vật generic từ chủ đề...', 'info');
+          detectedChars = [{
+            id: 'char_0',
+            name: 'the main character',
+            description: `Main character of this ${oa?.genre || ''} story about "${(oa?.topic || 'the story').slice(0, 60)}". ${oa?.tone || 'Cinematic'} style, consistent appearance.`,
+          }];
+        }
+
+        if (detectedChars.length > 0 && !stopRef.current) {
+          addLog(`🖼️ [Ingredients] Tạo ${detectedChars.length} ảnh DNA nhân vật bằng Gemini Imagen (không cần extension)...`, 'info');
+          const stylePart = (oa?.recommended_visual_style) ? `${oa.recommended_visual_style}. ` : 'Photorealistic, 4K, high detail. ';
+          try {
+            const dnaImgPaths = [];
+            const dnaTasks = detectedChars.map((ch, i) => ({
+              id: `a2v_dna_c${i}`,
+              prompt: `${stylePart}Character reference sheet. Portrait and full body views of the same character. Plain white studio background. CHARACTER: ${ch.name}, ${ch.description}. Consistent appearance. Photorealistic, cinematic quality. Safe for all audiences.`,
+              fileIndex: i + 1,
+            }));
+            addLog(`🖼️ Gửi ${dnaTasks.length} task ảnh DNA lên Nano Banana Pro...`, 'info');
+            const dnaResult = await window.electronAPI.runVeo({
+              mediaType: 'Image', tasks: dnaTasks,
+              aspectRatio: '16:9', model: _a2vImgMdl,
+              genCount: '1x', quality: '720p',
+              outputFolder: _a2vRefDir, duration: null,
+            });
+            const dnaFiles = (dnaResult?.files || []).filter(f => !f.isError && f.filePath);
+            const dnaErrors = (dnaResult?.files || []).filter(f => f.isError);
+            if (dnaErrors.length) addLog(`⚠️ ${dnaErrors.length} ảnh DNA lỗi: ${dnaErrors.map(f => f.error || '').join(' | ').slice(0, 120)}`, 'warn');
+            dnaFiles.forEach(f => {
+              const idxStr = (f.id || '').replace('a2v_dna_c', '');
+              const idx = parseInt(idxStr);
+              if (!isNaN(idx) && detectedChars[idx]) {
+                const ch = detectedChars[idx];
+                a2vCharDnaMap[ch.id] = { filePath: f.filePath, mediaId: null, name: ch.name }; // luôn upload lại để lấy media UUID cho Ingredients
+                addLog(`  🧬 DNA "${ch.name}": ${f.filePath.split(/[\\/]/).pop()}${f.mediaId ? ' ✅ mediaId' : ''}`, 'info');
+              }
+            });
+            dnaFiles.forEach(f => dnaImgPaths.push(f.filePath));
+
+            setA2vDnaImgs([...dnaImgPaths]);
+            addLog(`✅ [Ingredients] ${dnaImgPaths.length}/${detectedChars.length} ảnh DNA xong → ${Object.keys(a2vCharDnaMap).length} nhân vật có tham chiếu`, 'success');
+
+            // ── Upload những ảnh chưa có mediaId → lấy UUID 1 lần, dùng cho tất cả cảnh ──
+            const needUpload = Object.entries(a2vCharDnaMap).filter(([, v]) => v.filePath && !v.mediaId);
+            if (needUpload.length > 0) {
+              await window.electronAPI.clearUploadCache?.();
+              addLog(`📤 Upload ${needUpload.length} ảnh DNA lên project lấy UUID (1 lần duy nhất)...`, 'info');
+              for (const [charId, v] of needUpload) {
+                if (stopRef.current) break;
+                try {
+                  const upRes = await window.electronAPI.uploadDnaImage({ imgPath: v.filePath, taskId: charId });
+                  if (upRes?.ok && upRes.mediaId) {
+                    a2vCharDnaMap[charId].mediaId = upRes.mediaId;
+                    addLog(`  ✅ Upload "${v.name}" → UUID: ${upRes.mediaId.slice(0, 16)}...`, 'success');
+                  } else {
+                    addLog(`  ⚠️ Upload "${v.name}" thất bại — dùng file path (cần Extension active)`, 'warn');
+                  }
+                } catch (eu) {
+                  addLog(`  ⚠️ Upload "${v.name}" lỗi: ${eu.message}`, 'warn');
+                }
+              }
+              const withUUID = Object.values(a2vCharDnaMap).filter(v => v.mediaId).length;
+              addLog(`📤 Upload xong: ${withUUID}/${Object.keys(a2vCharDnaMap).length} nhân vật có UUID → video sẽ dùng ingredientMediaIds`, 'info');
+            }
+          } catch (e) {
+            addLog(`❌ [Ingredients] Tạo DNA lỗi: ${e.message}`, 'error');
+          }
+        }
+        markDone('dna');
+        if (stopRef.current) throw new Error('Đã dừng.');
+      }
 
       // ── 5. Tạo Video ──────────────────────────────────────────────────────
       if (!_makeVideo) { markDone('video'); markDone('merge'); return; }
 
       setActive('video'); setActiveTab('video');
       const vPaths = [];
+      // Khai báo ở scope rộng để phần merge (bước 6) có thể truy cập
+      let orderedStockPaths = [];
 
       if (_stockMode) {
         // ── Stock Video flow ─────────────────────────────────────────────────
@@ -2575,229 +4035,452 @@ function AudioToVideoPanel() {
 
         if (stopRef.current) throw new Error('Đã dừng.');
 
-        const orderedStockPaths = new Array(timeChunks.length).fill(null);
-        // Track video IDs đã dùng → tránh clip giống nhau liền kề
-        const usedVideoIds = new Set();
+        orderedStockPaths = new Array(timeChunks.length).fill(null);
+        // Tải lịch sử video đã dùng từ localStorage để không tải lại
+        const STOCK_USED_KEY = 'fluxy_stock_used_ids';
+        const _loadUsed = () => { try { return JSON.parse(localStorage.getItem(STOCK_USED_KEY) || '[]'); } catch { return []; } };
+        const _saveUsed = (ids) => { try { localStorage.setItem(STOCK_USED_KEY, JSON.stringify([...ids].slice(-2000))); } catch {} };
+        const usedVideoIds = new Set(_loadUsed());
 
-        // Helper: search với fallback keyword nếu keyword gốc không có kết quả
-        // Thứ tự thử: (1) keyword gốc → (2) từng từ đơn dài nhất → (3) null
+        // Helper: search với fallback keyword
         const stockSearchWithFallback = async (keyword) => {
           const doSearch = (kw) => window.electronAPI.stockVideoSearch({
             keyword: kw, provider: _stockProvider, apiKey: _stockApiKey, perPage: 15,
           });
-          // 1. Thử keyword gốc
           let sr = await doSearch(keyword);
           if (sr?.success && sr.results?.length) return { results: sr.results, usedKw: keyword };
-
-          // 2. Thử từng từ đơn (dài > 3 ký tự, loại bỏ giới từ phổ biến)
           const stopWords = new Set(['with','from','that','this','have','just','what','when','then','they','them','will','into','over','your','their','about','been','were','would','could','should']);
           const words = keyword.split(/\s+/)
             .filter(w => w.length > 3 && !stopWords.has(w.toLowerCase()))
-            .sort((a, b) => b.length - a.length)
-            .slice(0, 3); // tối đa 3 từ thử
+            .sort((a, b) => b.length - a.length).slice(0, 3);
           for (const word of words) {
-            await sleep(300); // tránh rate limit
             sr = await doSearch(word);
             if (sr?.success && sr.results?.length) return { results: sr.results, usedKw: word };
           }
-          return null; // tất cả đều fail
+          return null;
         };
 
-        for (let i = 0; i < timeChunks.length; i++) {
+        // ── PARALLEL DOWNLOAD với concurrency 4 ──────────────────────────────
+        const CONCURRENCY = 4;
+        let doneCount = 0;
+        addLog(`[Stock] Tải ${timeChunks.length} clip song song (${CONCURRENCY} luồng)...`, 'info');
+
+        // Hàng đợi index chờ xử lý
+        const queue = Array.from({ length: timeChunks.length }, (_, i) => i);
+        const queueMutex = { idx: 0 };
+
+        const processOne = async (i) => {
+          if (stopRef.current) return;
           await checkPause();
-          if (stopRef.current) throw new Error('Đã dừng.');
 
           const keyword   = stockKeywords[i];
-          // Dùng float chính xác — KHÔNG Math.round → tránh drift tích lũy trên 400+ chunk
-          const targetDur = _autoChunk
-            ? Math.max(0.5, timeChunks[i].timeEnd - timeChunks[i].timeStart)
-            : _sceneDur;
-          addLog(`[Stock] ${i + 1}/${timeChunks.length}: "${keyword}" (${targetDur.toFixed(2)}s)...`, 'info');
+          const chunk     = timeChunks[i];
+          const isLast    = i === timeChunks.length - 1;
+          // Luôn dùng duration thực của chunk; clip cuối lấy thời gian còn lại để khớp audio
+          const targetDur = isLast
+            ? Math.max(1, totalSec - chunk.timeStart)
+            : Math.max(1, chunk.timeEnd - chunk.timeStart);
 
           try {
-            // Search với fallback tự động
             const searchResult = await stockSearchWithFallback(keyword);
-
             if (!searchResult) {
-              // Tất cả keyword đều fail → dùng lại clip gần nhất đã tải (không bỏ trống)
-              const prevPath = orderedStockPaths.slice(0, i).filter(Boolean).pop();
-              if (prevPath) {
-                orderedStockPaths[i] = prevPath;
-                addLog(`⚠️ [Stock] Chunk ${i + 1}: không tìm thấy → dùng lại clip trước`, 'info');
-              } else {
-                addLog(`⚠️ [Stock] Chunk ${i + 1}: không tìm thấy clip cho "${keyword}"`, 'error');
-              }
+              addLog(`⚠️ [Stock] Clip ${i + 1}: không tìm thấy "${keyword}"`, 'warn');
             } else {
               const { results, usedKw } = searchResult;
-              if (usedKw !== keyword) {
-                addLog(`  → fallback keyword: "${usedKw}"`, 'info');
-              }
-
-              // Lọc chỉ lấy video LANDSCAPE (width > height) — loại bỏ 9:16 portrait
-              const landscapeOnly = results.filter(v =>
-                v.width && v.height ? v.width > v.height : true // nếu thiếu dimensions thì giữ lại
-              );
-              // Nếu không có clip landscape nào thì fallback toàn bộ (tránh kết quả rỗng)
+              const landscapeOnly = results.filter(v => v.width && v.height ? v.width > v.height : true);
               const filtered = landscapeOnly.length > 0 ? landscapeOnly : results;
-              if (landscapeOnly.length < results.length) {
-                addLog(`  → Đã lọc ${results.length - landscapeOnly.length} clip portrait, còn ${landscapeOnly.length} landscape`, 'info');
-              }
-
-              // Sort: ưu tiên clip >= targetDur, rồi dài nhất
               const sorted = [...filtered].sort((a, b) => {
                 const aOk = a.duration >= targetDur ? 0 : 1;
                 const bOk = b.duration >= targetDur ? 0 : 1;
                 if (aOk !== bOk) return aOk - bOk;
                 return b.duration - a.duration;
               });
-
-              // Ưu tiên clip chưa dùng → tránh lặp lại khi xem liên tiếp
-              const uniqueSorted = sorted.filter(v => !usedVideoIds.has(v.id));
-              const chosen = uniqueSorted.length > 0 ? uniqueSorted[0] : sorted[0];
-              if (uniqueSorted.length === 0) {
-                addLog(`  → hết clip mới, dùng lại clip cũ nhất trong kết quả`, 'info');
-              }
-              usedVideoIds.add(chosen.id);
-
-              // Download
-              const rawPath = `${_vidDir}\\stock_raw_${i}_${Date.now()}.mp4`;
-              const dr = await window.electronAPI.stockVideoDownload({ url: chosen.url, destPath: rawPath });
-              if (!dr?.success) {
-                addLog(`⚠️ [Stock] Chunk ${i + 1}: tải thất bại — ${dr?.error}`, 'error');
-                // Tải thất bại → cũng dùng lại clip trước
-                const prevPath = orderedStockPaths.slice(0, i).filter(Boolean).pop();
-                if (prevPath) orderedStockPaths[i] = prevPath;
+              // Ưu tiên video chưa dùng (kể cả lịch sử các lần chạy trước)
+              const uniqueSorted = sorted.filter(v => !usedVideoIds.has(String(v.id)));
+              if (uniqueSorted.length === 0)
+                addLog(`⚠️ [Stock] Clip ${i + 1}: tất cả ${sorted.length} kết quả đã dùng trước đó → tìm từ khóa khác`, 'warn');
+              const chosen = uniqueSorted.length > 0 ? uniqueSorted[0] : null;
+              if (!chosen) {
+                addLog(`⚠️ [Stock] Clip ${i + 1}: bỏ qua — không còn video mới cho "${keyword}"`, 'warn');
               } else {
-                // Trim / loop to exact scene duration — chuẩn hóa 1280×720 để concat copy nhanh
+                usedVideoIds.add(String(chosen.id));
+                _saveUsed(usedVideoIds); // lưu ngay sau khi chọn
+
+                const rawPath  = `${_vidDir}\\stock_raw_${i}_${Date.now()}.mp4`;
                 const trimPath = `${_vidDir}\\stock_${String(i).padStart(4, '0')}.mp4`;
-                const tr = await window.electronAPI.trimLoopVideo({
-                  inputPath: rawPath, duration: targetDur, outputPath: trimPath,
-                  targetW: 1280, targetH: 720,   // ← chuẩn hóa resolution 16:9 HD
-                });
-                if (tr?.success) {
-                  orderedStockPaths[i] = trimPath;
-                  setVideoPaths(prev => [...prev, trimPath]);
-                  addLog(`✅ [Stock] Clip ${i + 1} OK: "${usedKw}"`, 'success');
+
+                const dr = await window.electronAPI.stockVideoDownload({ url: chosen.url, destPath: rawPath });
+                if (!dr?.success) {
+                  addLog(`⚠️ [Stock] Clip ${i + 1} tải thất bại: ${dr?.error}`, 'error');
+                  window.electronAPI?.deleteFile?.(rawPath).catch(() => {});
                 } else {
-                  addLog(`⚠️ [Stock] Trim thất bại ${i + 1}: ${tr?.error}`, 'error');
-                  const prevPath = orderedStockPaths.slice(0, i).filter(Boolean).pop();
-                  if (prevPath) orderedStockPaths[i] = prevPath;
+                  const tr = await window.electronAPI.trimLoopVideo({
+                    inputPath: rawPath, duration: targetDur, outputPath: trimPath, targetW: 1280, targetH: 720,
+                  });
+                  window.electronAPI?.deleteFile?.(rawPath).catch(() => {});
+                  if (tr?.success) {
+                    orderedStockPaths[i] = trimPath;
+                    setVideoPaths(prev => [...prev, trimPath]);
+                    addLog(`✅ [Stock] Clip ${i + 1}/${timeChunks.length} OK · "${usedKw}" (ID: ${chosen.id})`, 'success');
+                  } else {
+                    addLog(`⚠️ [Stock] Trim ${i + 1} thất bại: ${tr?.error}`, 'error');
+                    window.electronAPI?.deleteFile?.(trimPath).catch(() => {});
+                  }
                 }
               }
             }
           } catch (e) {
-            addLog(`⚠️ [Stock] Chunk ${i + 1} lỗi: ${e.message}`, 'error');
-            // Exception → cũng thử dùng lại clip trước
-            const prevPath = orderedStockPaths.slice(0, i).filter(Boolean).pop();
-            if (prevPath) orderedStockPaths[i] = prevPath;
+            addLog(`⚠️ [Stock] Clip ${i + 1} lỗi: ${e.message}`, 'error');
           }
+          doneCount++;
+          setGenProgress({ current: doneCount, total: timeChunks.length });
+        };
 
-          if (i < timeChunks.length - 1) await sleep(350);
-          setGenProgress({ current: i + 1, total: timeChunks.length });
+        // Worker pool: CONCURRENCY workers cùng chạy
+        await Promise.all(
+          Array.from({ length: CONCURRENCY }, async () => {
+            while (queueMutex.idx < queue.length) {
+              const i = queueMutex.idx++;
+              if (i >= queue.length) break;
+              await processOne(i);
+            }
+          })
+        );
+
+        // Fallback: clip nào null → dùng clip gần nhất
+        for (let i = 0; i < orderedStockPaths.length; i++) {
+          if (!orderedStockPaths[i]) {
+            const prev = orderedStockPaths.slice(0, i).filter(Boolean).pop()
+                      || orderedStockPaths.slice(i + 1).filter(Boolean)[0];
+            if (prev) { orderedStockPaths[i] = prev; addLog(`ℹ️ [Stock] Clip ${i + 1}: dùng lại clip gần nhất`, 'info'); }
+          }
         }
 
         orderedStockPaths.filter(Boolean).forEach(p => vPaths.push(p));
         if (!vPaths.length) throw new Error('Không tải được clip nào từ Stock Video. Kiểm tra API key và kết nối.');
-        addLog(`✅ [Stock] Tải xong ${vPaths.length}/${timeChunks.length} clip`, 'success');
+        addLog(`✅ [Stock] Tải xong ${orderedStockPaths.filter(Boolean).length}/${timeChunks.length} clip`, 'success');
 
       } else {
-        // ── Veo flow ─────────────────────────────────────────────────────────
-        addLog(`[Veo] Bắt đầu tạo ${generatedScenes.length} video T2V...`, 'info');
-        const MAX_A2V_FIRST  = 5;   // vòng đầu: 5 lần, bỏ qua nếu vẫn lỗi
-        const MAX_A2V_GLOBAL = 20;  // global retry: 20 lần
+        // ── Veo flow — 8 luồng song song, tải xong video nào chạy ngay video mới ──
+        // Build ingredients data từ a2vCharDnaMap (nếu Ingredients mode)
+        const _dnaEntries = Object.entries(a2vCharDnaMap);
+        const _hasDna     = _a2vIngMode && _dnaEntries.length > 0;
+
+        if (_a2vIngMode && !_hasDna) {
+          addLog('⚠️ [Ingredients] Không có ảnh DNA nào thành công → tự động chuyển sang T2V thường. Kiểm tra Extension đang mở tab Google Labs.', 'warn');
+        }
+
+        // Build charImgMap / charMediaMap từ a2vCharDnaMap (giống URL to Video)
+        const _a2vCharImgMap   = {};
+        const _a2vCharMediaMap = {};
+        _dnaEntries.forEach(([id, v]) => {
+          if (v.filePath) _a2vCharImgMap[id]   = v.filePath;
+          if (v.mediaId)  _a2vCharMediaMap[id]  = v.mediaId;
+        });
+        const _globalMediaIds = Object.values(_a2vCharMediaMap).filter(Boolean);
+        const _globalImgPaths = Object.values(_a2vCharImgMap).filter(Boolean);
+
+        // Smart DNA selector — chỉ lấy nhân vật xuất hiện trong prompt, tối đa 3
+        const _selectDNA = (promptText) => {
+          const MAX = 3;
+          const promptLow = (promptText || '').toLowerCase();
+          const picked = [];
+          const seen = new Set();
+          const tryAdd = (id) => {
+            if (seen.has(id) || picked.length >= MAX) return;
+            const mediaId = _a2vCharMediaMap[id];
+            const imgPath = _a2vCharImgMap[id];
+            if (!mediaId && !imgPath) return;
+            seen.add(id);
+            picked.push({ id, mediaId, imgPath });
+          };
+          // Chỉ lấy nhân vật được nhắc tên trong prompt
+          _dnaEntries.forEach(([id, v]) => {
+            const nameLow = (v.name || '').toLowerCase();
+            const words = nameLow.split(/\s+/).filter(w => w.length > 2);
+            if (words.some(w => promptLow.includes(w))) tryAdd(id);
+          });
+
+          const withMedia = picked.filter(e => e.mediaId);
+          const withPath  = picked.filter(e => !e.mediaId && e.imgPath);
+          return withMedia.length > 0
+            ? { mediaIds: withMedia.map(e => e.mediaId), imgPaths: [], labels: withMedia.map(e => e.id) }
+            : { mediaIds: [], imgPaths: withPath.map(e => e.imgPath), labels: withPath.map(e => e.id) };
+        };
+
+        const _ingLabel = _hasDna ? ' [Ingredients]' : ' T2V';
+        addLog(`[Veo] Bắt đầu tạo ${generatedScenes.length} video${_ingLabel} — DNA pool: ${_globalImgPaths.length} ảnh / ${_globalMediaIds.length} UUID...`, 'info');
+        const MAX_RETRY_PER = 5;
 
         {
-          // Áp dụng VEO policy + strip tên người nổi tiếng vào tất cả prompt
-          const allTasks_a2v = generatedScenes.map((s, i) => ({
-            id: `vid_${i}`,
-            prompt: applyVeoPolicy(stripProminentPeople(s.veoVideoPrompt || 'Cinematic establishing shot, smooth camera movement')),
-          }));
-          let pendingTasks = dedupTasksByPrompt(allTasks_a2v, addLog);
-          const a2vTaskMap = new Map();
-          allTasks_a2v.forEach((t, i) => a2vTaskMap.set(t.id, i));
-          const orderedA2VPaths = new Array(generatedScenes.length).fill(null);
-          const a2vPolicySet = new Set();
+          // Chuẩn bị tất cả task với retry count
+          const allTasks_a2v = generatedScenes.map((s, i) => {
+            const baseTask = {
+              id:          `vid_${i}`,
+              origIdx:     i,
+              prompt:      applyVeoPolicy(stripProminentPeople(s.veoVideoPrompt || 'Cinematic establishing shot, smooth camera movement')),
+              retries:     0,
+              policyFixed: false,
+            };
+            // Ingredients: smart selector giống URL to Video
+            if (_hasDna) {
+              const dna = _selectDNA(baseTask.prompt);
+              if (dna.mediaIds.length > 0) {
+                baseTask.ingredientMediaIds = dna.mediaIds;
+                addLog(`[Veo] Cảnh ${i + 1}: 🖼️ [${dna.labels.join(', ')}] → ${dna.mediaIds.length} DNA UUID`, 'info');
+              } else if (dna.imgPaths.length > 0) {
+                baseTask.ingredientImages = dna.imgPaths;
+                addLog(`[Veo] Cảnh ${i + 1}: 🖼️ [${dna.labels.join(', ')}] → ${dna.imgPaths.length} DNA ảnh`, 'info');
+              } else {
+                addLog(`[Veo] Cảnh ${i + 1}: ⚠️ không có DNA phù hợp → T2V`, 'info');
+              }
+            }
+            return baseTask;
+          });
 
-          // ── Helper: 1 vòng retry ─────────────────────────────────────────────
-          const runA2VPass = async (passLabel, maxRetry) => {
-            const filterPass = makeSubmitGuard();
-            for (let attempt = 1; attempt <= maxRetry && pendingTasks.length > 0; attempt++) {
+          // Dedup: task trùng prompt → map sang cùng slot
+          const dedupedTasks = dedupTasksByPrompt(allTasks_a2v.map(t => ({ id: t.id, prompt: t.prompt })), addLog);
+          const dedupIds = new Set(dedupedTasks.map(t => t.id));
+          const activeInitial = allTasks_a2v.filter(t => dedupIds.has(t.id));
+
+          const orderedA2VPaths = new Array(generatedScenes.length).fill(null);
+          let doneCount = 0;
+          const total = generatedScenes.length;
+          setGenProgress({ current: 0, total });
+
+          if (_hasDna) {
+            // ── Ingredients mode: gửi TẤT CẢ tasks 1 lần → engine xử lý nội bộ (giống VeoStudio) ──
+            addLog(`🚀 [Veo Ingredients] Gửi ${activeInitial.length} tasks → engine (3 workers nội bộ)...`, 'info');
+            let pendingTasks = activeInitial.map(t => ({
+              id: t.id, origIdx: t.origIdx, prompt: t.prompt,
+              ingredientMediaIds: t.ingredientMediaIds,
+              ingredientImages:   t.ingredientImages,
+              retries: 0, policyFixed: false,
+            }));
+
+            for (let attempt = 1; attempt <= MAX_RETRY_PER && pendingTasks.length > 0; attempt++) {
+              if (stopRef.current) break;
               await checkPause();
-              if (stopRef.current) throw new Error('Đã dừng.');
-              if (attempt > 1) { addLog(`${passLabel}[Veo] Thử lại lần ${attempt}/${maxRetry}: ${pendingTasks.length} video...`, 'info'); await sleep(10000); }
-              const safeTasks = filterPass(pendingTasks, addLog);
-              if (!safeTasks.length) break;
+              if (attempt > 1) {
+                addLog(`🔄 [Veo Ingredients] Retry lần ${attempt}: ${pendingTasks.length} task chưa xong...`, 'info');
+                await sleep(10000);
+              }
+
+              const idToOrigIdx = new Map(pendingTasks.map(t => [t.id, t.origIdx]));
+              const veoTasks = pendingTasks.map(t => {
+                const vt = { id: t.id, prompt: t.prompt, fileIndex: t.origIdx + 1 };
+                if (t.ingredientMediaIds?.length) vt.ingredientMediaIds = t.ingredientMediaIds;
+                if (t.ingredientImages?.length)   vt.ingredientImages   = t.ingredientImages;
+                return vt;
+              });
+
               const vr = await window.electronAPI.runVeo({
-                mediaType: 'Video', tasks: safeTasks,
+                mediaType: 'Video', tasks: veoTasks,
                 aspectRatio: _vidRatio, model: _vidModel,
                 genCount: '1x', quality: _vidQuality,
                 outputFolder: _vidDir, duration: `${_vidSceneDur}s`,
               });
+
               const files = vr?.files || [];
-              const succeeded   = files.filter(f => !f.isError && f.filePath);
-              const failedFiles = files.filter(f => f.isError);
-              const failedIds   = new Set(failedFiles.map(f => f.id));
-              succeeded.forEach(f => {
-                const idx = a2vTaskMap.get(f.id) ?? 0;
-                orderedA2VPaths[idx] = f.filePath;
-              });
-              if (succeeded.length) addLog(`✅ ${passLabel}[Veo] Lần ${attempt}: ${succeeded.length}/${safeTasks.length} OK`, 'success');
-              // Detect policy violation
-              for (const ff of failedFiles) {
-                if (isPolicyViolation(ff.error)) {
-                  a2vPolicySet.add(ff.id);
-                  addLog(`🚫 [Chính sách Veo] Vi phạm: "${(ff.error || '').slice(0, 80)}" → đổi prompt`, 'error');
+              const stillFailing = [];
+
+              for (const f of files) {
+                const origIdx = idToOrigIdx.get(f.id);
+                if (origIdx === undefined) continue;
+                if (!f.isError && f.filePath && !orderedA2VPaths[origIdx]) {
+                  orderedA2VPaths[origIdx] = f.filePath;
+                  doneCount++;
+                  setGenProgress({ current: doneCount, total });
+                  addLog(`✅ [Veo] Cảnh ${origIdx + 1}/${total} xong (${doneCount}/${total} done)`, 'success');
+                } else if (f.isError && !orderedA2VPaths[origIdx]) {
+                  const origTask = pendingTasks.find(t => t.id === f.id);
+                  if (!origTask) continue;
+                  const errMsg = String(f.error || 'unknown');
+                  const isPolicy = isPolicyViolation(errMsg);
+                  addLog(`⚠️ [Veo] Cảnh ${origIdx + 1} lỗi (lần ${attempt}): ${errMsg.slice(0, 80)}`, 'warn');
+                  if (attempt < MAX_RETRY_PER) {
+                    let nextPrompt = origTask.prompt;
+                    let policyFixed = origTask.policyFixed;
+                    if (isPolicy && !origTask.policyFixed) {
+                      // Lần 1: sanitize từ khoá
+                      nextPrompt = sanitizePrompt(origTask.prompt);
+                      policyFixed = true;
+                      addLog(`🔧 [Veo] Cảnh ${origIdx + 1}: sanitize prompt vi phạm chính sách`, 'info');
+                    } else if (isPolicy && attempt === 2) {
+                      // Lần 2: AI rewrite toàn bộ
+                      try {
+                        const _ingAiCfg = { aiMode, apiKeys, claudeKey, claudeModel, groqKeys, groqModel, geminiModel: _atvGeminiModel };
+                        addLog(`🤖 [Veo] Cảnh ${origIdx + 1}: AI rewrite prompt vi phạm...`, 'info');
+                        nextPrompt = await rewritePromptForVeo(origTask.prompt, errMsg, _ingAiCfg);
+                        addLog(`✅ [Veo] Cảnh ${origIdx + 1}: prompt đã được AI rewrite`, 'success');
+                      } catch (_) {
+                        nextPrompt = sanitizePrompt(origTask.prompt);
+                      }
+                    }
+                    stillFailing.push({
+                      ...origTask,
+                      id:          `${origTask.id}_r${attempt}`,
+                      prompt:      nextPrompt,
+                      policyFixed,
+                      retries:     attempt,
+                    });
+                  } else {
+                    doneCount++;
+                    setGenProgress({ current: doneCount, total });
+                    addLog(`❌ [Veo] Cảnh ${origIdx + 1} hết ${MAX_RETRY_PER} lần retry → bỏ qua`, 'error');
+                  }
                 }
               }
-              pendingTasks = safeTasks.filter(t => failedIds.has(t.id)).map(t => {
-                const ni = `${t.id}_r${attempt}`;
-                a2vTaskMap.set(ni, a2vTaskMap.get(t.id));
-                if (a2vPolicySet.has(t.id)) {
-                  a2vPolicySet.delete(t.id); a2vPolicySet.add(ni);
-                  const cp = sanitizePrompt(t.prompt);
-                  addLog(`🔧 Prompt làm sạch: "${cp.slice(0, 70)}..."`, 'info');
-                  return { ...t, id: ni, prompt: cp };
+              pendingTasks = stillFailing;
+            }
+          } else {
+            // ── T2V mode: 8 workers song song ──
+            const VEO_WORKERS = 8;
+            const queue = [...activeInitial];
+            let qHead = 0;
+            const claimedSlots = new Set();
+
+            const runWorker = async (workerId) => {
+              while (true) {
+                if (stopRef.current) break;
+                await checkPause();
+                if (qHead >= queue.length) break;
+                const task = queue[qHead++];
+                if (orderedA2VPaths[task.origIdx] || claimedSlots.has(task.origIdx)) continue;
+                claimedSlots.add(task.origIdx);
+                if (task.retries > 0) await sleep(task.retries * 3000);
+                try {
+                  const _veoTask = { id: task.id, prompt: task.prompt };
+                  if (task.ingredientMediaIds?.length) _veoTask.ingredientMediaIds = task.ingredientMediaIds;
+                  if (task.ingredientImages?.length)   _veoTask.ingredientImages   = task.ingredientImages;
+                  const vr = await window.electronAPI.runVeo({
+                    mediaType: 'Video',
+                    tasks: [_veoTask],
+                    aspectRatio: _vidRatio, model: _vidModel,
+                    genCount: '1x', quality: _vidQuality,
+                    outputFolder: _vidDir, duration: `${_vidSceneDur}s`,
+                  });
+                  const files   = vr?.files || [];
+                  const success = files.find(f => !f.isError && f.filePath);
+                  const failure = files.find(f => f.isError);
+                  if (success?.filePath) {
+                    if (!orderedA2VPaths[task.origIdx]) {
+                      orderedA2VPaths[task.origIdx] = success.filePath;
+                      doneCount++;
+                      setGenProgress({ current: doneCount, total });
+                      addLog(`✅ [Veo W${workerId}] Cảnh ${task.origIdx + 1}/${total} xong (${doneCount}/${total} done)`, 'success');
+                    } else {
+                      window.electronAPI?.deleteFile?.(success.filePath).catch(() => {});
+                    }
+                  } else {
+                    const errMsg = failure?.error || 'unknown error';
+                    const isPolicy = isPolicyViolation(errMsg);
+                    if (task.retries < MAX_RETRY_PER) {
+                      let newPrompt = task.prompt;
+                      if (isPolicy && !task.policyFixed) {
+                        newPrompt = sanitizePrompt(task.prompt);
+                        addLog(`🚫 [W${workerId}] Cảnh ${task.origIdx + 1} vi phạm → làm sạch prompt, retry ${task.retries + 1}/${MAX_RETRY_PER}`, 'warn');
+                      } else {
+                        addLog(`⚠️ [W${workerId}] Cảnh ${task.origIdx + 1} lỗi → retry ${task.retries + 1}/${MAX_RETRY_PER}: ${errMsg.slice(0, 60)}`, 'warn');
+                      }
+                      claimedSlots.delete(task.origIdx);
+                      queue.push({ ...task, id: `${task.id}_r${task.retries + 1}`, prompt: newPrompt, retries: task.retries + 1, policyFixed: isPolicy ? true : task.policyFixed });
+                    } else {
+                      doneCount++;
+                      setGenProgress({ current: doneCount, total });
+                      addLog(`❌ [W${workerId}] Cảnh ${task.origIdx + 1} hết ${MAX_RETRY_PER} lần retry → bỏ qua`, 'error');
+                    }
+                  }
+                } catch (e) {
+                  if (task.retries < MAX_RETRY_PER) {
+                    claimedSlots.delete(task.origIdx);
+                    queue.push({ ...task, id: `${task.id}_e${task.retries + 1}`, retries: task.retries + 1 });
+                    addLog(`⚠️ [W${workerId}] Cảnh ${task.origIdx + 1} exception → retry: ${e.message.slice(0, 60)}`, 'warn');
+                  } else {
+                    doneCount++;
+                    setGenProgress({ current: doneCount, total });
+                    addLog(`❌ [W${workerId}] Cảnh ${task.origIdx + 1} exception hết retry: ${e.message.slice(0, 60)}`, 'error');
+                  }
                 }
-                return { ...t, id: ni };
-              });
-              if (pendingTasks.length && attempt < maxRetry) addLog(`⚠️ ${passLabel} ${pendingTasks.length} video lỗi → chờ 10s...`, 'error');
-            }
-          };
+              }
+            };
 
-          // Vòng chính — 5 lần, bỏ qua nếu vẫn lỗi
-          addLog(`📋 Tạo ${pendingTasks.length} video — thử ${MAX_A2V_FIRST} lần/task`, 'info');
-          await runA2VPass('', MAX_A2V_FIRST);
-          if (pendingTasks.length > 0) addLog(`⏭️ ${pendingTasks.length} video vẫn lỗi → bỏ qua, tiếp tục`, 'warn');
-
-          // Global retry sau khi TẤT CẢ xong
-          if (pendingTasks.length > 0) {
-            addLog(`\n🔄 ════ GLOBAL RETRY ════ ${pendingTasks.length} video lỗi → retry ${MAX_A2V_GLOBAL} lần...`, 'info');
-            await sleep(3000);
-            const MAX_GP = 20;
-            for (let gPass = 1; gPass <= MAX_GP && pendingTasks.length > 0; gPass++) {
-              if (stopRef.current) throw new Error('Đã dừng.');
-              addLog(`🔄 [Global Retry ${gPass}/${MAX_GP}] ${pendingTasks.length} video → thử ${MAX_A2V_GLOBAL} lần...`, 'info');
-              await sleep(5000);
-              pendingTasks = pendingTasks.map(t => {
-                const ni = `${t.id}_g${gPass}`;
-                a2vTaskMap.set(ni, a2vTaskMap.get(t.id));
-                return { ...t, id: ni };
-              });
-              await runA2VPass(`[Global ${gPass}/${MAX_GP}]`, MAX_A2V_GLOBAL);
-              if (pendingTasks.length === 0) addLog(`✅ [Global Retry] Tất cả hoàn thành ở vòng ${gPass}!`, 'success');
-              else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`, 'error');
-            }
-          }
-          // Policy Repair — sửa đổi prompt vi phạm cho đến khi ra kết quả
-          if (pendingTasks.length > 0) {
-            addLog(`❌ ${pendingTasks.length} video vẫn lỗi — chạy Policy Repair...`, 'error');
-            const rpMap = new Map(pendingTasks.map(t => [t.id, a2vTaskMap.get(t.id)]));
-            await runPolicyRepairLoop(pendingTasks, rpMap, orderedA2VPaths,
-              async (task) => window.electronAPI.runVeo({ mediaType:'Video', tasks:[task], aspectRatio:_vidRatio, model:_vidModel, genCount:'1x', quality:_vidQuality, outputFolder:_vidDir, duration:`${_vidSceneDur}s` }),
-              addLog, stopRef);
+            addLog(`🚀 [Veo] Chạy ${VEO_WORKERS} workers song song — ${queue.length} video trong queue...`, 'info');
+            await Promise.all(
+              Array.from({ length: VEO_WORKERS }, (_, i) => runWorker(i + 1))
+            );
           }
 
-          orderedA2VPaths.filter(Boolean).forEach(p => { vPaths.push(p); setVideoPaths(prev => [...prev, p]); });
+          const successCount = orderedA2VPaths.filter(Boolean).length;
+          addLog(`✅ [Veo] ${_hasDna ? 'Batch Ingredients' : 'Worker pool T2V'} xong — ${successCount}/${total} video thành công`, successCount > 0 ? 'success' : 'error');
+
+          // ── Stock fallback: video nào vẫn null sau tất cả retry → tìm stock thay thế ──
+          const nullIndices = orderedA2VPaths
+            .map((p, i) => p ? null : i)
+            .filter(i => i !== null);
+
+          if (nullIndices.length > 0 && _stockProvider && _stockApiKey) {
+            addLog(`📦 [Veo→Stock] ${nullIndices.length} video lỗi → tự động tìm stock thay thế (${_vidSceneDur}s)...`, 'info');
+            for (const idx of nullIndices) {
+              if (stopRef.current) break;
+              const scene    = generatedScenes[idx];
+              const rawKw    = (scene?.veoVideoPrompt || scene?.dialogue || 'cinematic scene')
+                .replace(/safe for all audiences.*$/i, '')
+                .replace(/family.friendly.*$/i, '')
+                .replace(/aspect ratio.*$/i, '')
+                .replace(/cinematic shot.*$/i, '')
+                .replace(/[^a-zA-Z\s]/g, ' ')
+                .split(/\s+/).filter(w => w.length > 3).slice(0, 3).join(' ') || 'nature landscape';
+              try {
+                // Tìm stock
+                const doSearch = (kw) => window.electronAPI.stockVideoSearch({
+                  keyword: kw, provider: _stockProvider, apiKey: _stockApiKey, perPage: 10
+                });
+                let sr = await doSearch(rawKw);
+                if (!sr?.success || !sr.results?.length) {
+                  // Thử từng từ riêng lẻ
+                  for (const w of rawKw.split(' ')) {
+                    sr = await doSearch(w);
+                    if (sr?.success && sr.results?.length) break;
+                  }
+                }
+                if (!sr?.success || !sr.results?.length) {
+                  addLog(`  ⚠️ [Stock] Cảnh ${idx + 1}: không tìm được stock`, 'warn');
+                  continue;
+                }
+                // Chọn clip có duration ≥ _vidSceneDur, ưu tiên gần nhất
+                const sorted = [...sr.results].sort((a, b) => {
+                  const aOk = a.duration >= _vidSceneDur ? 0 : 1;
+                  const bOk = b.duration >= _vidSceneDur ? 0 : 1;
+                  if (aOk !== bOk) return aOk - bOk;
+                  return Math.abs(a.duration - _vidSceneDur) - Math.abs(b.duration - _vidSceneDur);
+                });
+                const chosen  = sorted[0];
+                const rawPath = `${_vidDir}\\a2v_fb_raw_${idx}_${Date.now()}.mp4`;
+                const outPath = `${_vidDir}\\a2v_fb_${String(idx).padStart(4,'0')}.mp4`;
+                const dr = await window.electronAPI.stockVideoDownload({ url: chosen.url, destPath: rawPath });
+                if (!dr?.success) { addLog(`  ⚠️ [Stock] Cảnh ${idx + 1}: tải stock thất bại`, 'warn'); continue; }
+                const tr = await window.electronAPI.trimLoopVideo({
+                  inputPath: rawPath, duration: _vidSceneDur,
+                  outputPath: outPath, targetW: 1280, targetH: 720
+                });
+                window.electronAPI?.deleteFile?.(rawPath).catch(() => {});
+                if (tr?.success) {
+                  orderedA2VPaths[idx] = outPath;
+                  addLog(`✅ [Stock] Cảnh ${idx + 1}: stock thay thế OK "${rawKw}" (${_vidSceneDur}s)`, 'success');
+                }
+              } catch (e) {
+                addLog(`  ⚠️ [Stock] Cảnh ${idx + 1} lỗi: ${e.message}`, 'error');
+              }
+            }
+            const recovered = nullIndices.filter(i => orderedA2VPaths[i]).length;
+            if (recovered > 0) addLog(`✅ [Stock] Đã cứu ${recovered}/${nullIndices.length} cảnh bằng stock video`, 'success');
+          } else if (nullIndices.length > 0) {
+            addLog(`⚠️ ${nullIndices.length} cảnh lỗi — chưa cấu hình Stock API key để tự động thay thế`, 'warn');
+          }
+
+          // Đẩy vào vPaths theo thứ tự đúng (setVideoPaths đã được gọi realtime ở trên)
+          orderedA2VPaths.filter(Boolean).forEach(p => { vPaths.push(p); });
         }
 
         if (!vPaths.length) throw new Error('Không tạo được video nào.');
@@ -2810,9 +4493,9 @@ function AudioToVideoPanel() {
       // ── 6 + 7. Ghép clip stock + chèn audio gốc (FFmpeg local, 1 bước) ──────
       setActive('merge'); setActiveTab('merge');
 
-      // Lấy danh sách clip đã trim theo thứ tự
-      const stockClips = orderedStockPaths.filter(Boolean);
-      addLog(`🎬 Ghép ${stockClips.length} clip stock bằng FFmpeg...`, 'info');
+      // Lấy danh sách clip: Stock mode → orderedStockPaths, Veo mode → vPaths
+      const stockClips = _stockMode ? orderedStockPaths.filter(Boolean) : [...vPaths];
+      addLog(`🎬 Ghép ${stockClips.length} clip ${_stockMode ? 'stock' : 'Veo'} bằng FFmpeg...`, 'info');
 
       if (stockClips.length === 0) {
         addLog('⚠️ Không có clip nào để ghép', 'error');
@@ -3082,6 +4765,36 @@ function AudioToVideoPanel() {
       </div>
     );
 
+    if (activeTab === 'dna') return (
+      <div className="h-full flex flex-col">
+        <p className="text-[9px] font-bold text-slate-500 uppercase tracking-wider mb-2 shrink-0">
+          🧬 {a2vDnaImgs.length} Ảnh DNA nhân vật đã tạo
+          {running && activeStep === 'dna' && <span className="ml-2 text-purple-400 font-normal">Đang tạo...</span>}
+        </p>
+        <div className="flex-1 overflow-y-auto custom-scrollbar">
+          {a2vDnaImgs.length === 0 && running && activeStep === 'dna' && (
+            <div className="flex items-center justify-center h-20 gap-2 text-slate-600">
+              <Loader2 size={14} className="animate-spin text-purple-500"/>
+              <span className="text-xs">Đang tạo ảnh DNA nhân vật...</span>
+            </div>
+          )}
+          <div className="grid grid-cols-3 gap-1.5">
+            {a2vDnaImgs.map((p, i) => (
+              <div key={p} className="bg-slate-800/80 rounded-lg overflow-hidden">
+                <div className="aspect-square">
+                  <img src={toFileUrl(p)} alt={`DNA ${i+1}`} className="w-full h-full object-cover"/>
+                </div>
+                <div className="px-1.5 py-1 text-[8px] text-purple-300 truncate">DNA {i + 1}</div>
+              </div>
+            ))}
+          </div>
+          {a2vDnaImgs.length === 0 && !running && (
+            <p className="text-xs text-slate-600">Chưa có ảnh DNA</p>
+          )}
+        </div>
+      </div>
+    );
+
     if (activeTab === 'video') return (
       <div className="h-full flex flex-col">
         <p className="text-xs font-bold text-slate-400 mb-2 shrink-0">{videoPaths.length} Video đã tạo</p>
@@ -3180,6 +4893,7 @@ function AudioToVideoPanel() {
     if (t.id === 'analysis')   return !!overallAnalysis || (running && activeStep === 'transcribe');
     if (t.id === 'chunks')     return chunks.length > 0;
     if (t.id === 'prompts')    return scenes.length > 0 || (running && activeStep === 'generate');
+    if (t.id === 'dna')        return a2vDnaImgs.length > 0 || (running && activeStep === 'dna');
     if (t.id === 'video')      return videoPaths.length > 0 || (running && activeStep === 'video');
     if (t.id === 'merge')      return !!mergedPath || (running && activeStep === 'merge');
     if (t.id === 'remaster')   return !!finalPath  || (running && activeStep === 'remaster');
@@ -3203,7 +4917,58 @@ function AudioToVideoPanel() {
           </p>
         </div>
 
+        {/* ── Batch Mode Toggle ── */}
+        <div className="px-4 py-2 border-b border-slate-800/60">
+          <button onClick={() => setBatchMode(v => !v)} disabled={running || batchRunning}
+            className={cn('w-full flex items-center justify-between px-3 py-2 rounded-lg text-[10px] font-bold border transition-all',
+              batchMode ? 'bg-purple-600/20 border-purple-500/40 text-purple-300' : 'border-slate-700/60 text-slate-500 hover:text-slate-300 hover:border-slate-600')}>
+            <span>📦 Xử lý hàng loạt (Batch)</span>
+            <span className={cn('text-[8px] px-1.5 py-0.5 rounded-full font-black', batchMode ? 'bg-purple-500/30 text-purple-300' : 'bg-slate-700 text-slate-500')}>
+              {batchMode ? 'BẬT' : 'TẮT'}
+            </span>
+          </button>
+        </div>
+
         <div className="flex-1 px-4 py-3 space-y-4">
+          {/* AI Provider */}
+          <div className="border-t border-slate-800/60 pt-3">
+            <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1.5 block">AI Provider</label>
+            <div className="flex rounded-lg overflow-hidden border border-slate-700/60">
+              {[{id:'gemini',label:'✨ Gemini'},{id:'claude',label:'🤖 Claude'},{id:'groq',label:'⚡ Groq'}].map(m => (
+                <button key={m.id} disabled={running} onClick={() => setAiMode(m.id)}
+                  className={cn('flex-1 py-1.5 text-[10px] font-bold transition-colors',
+                    aiMode === m.id
+                      ? (m.id === 'groq' ? 'bg-green-600 text-white' : m.id === 'claude' ? 'bg-orange-600 text-white' : 'bg-blue-600 text-white')
+                      : 'bg-slate-800/50 text-slate-500 hover:text-slate-300 border-transparent')}>
+                  {m.label}
+                </button>
+              ))}
+            </div>
+            {aiMode === 'claude' && !claudeKey && (
+              <p className="text-[9px] text-orange-400 mt-1">⚠️ Chưa có Claude API Key — vào Settings để thêm</p>
+            )}
+            {aiMode === 'groq' && !groqKeys.length && (
+              <p className="text-[9px] text-green-400 mt-1">⚠️ Chưa có Groq API Key — vào Settings để thêm</p>
+            )}
+            {aiMode === 'groq' && groqKeys.length > 0 && (
+              <p className="text-[9px] text-green-500/60 mt-0.5">💡 Nên chọn Llama 3.1 8B trong Settings để tránh rate limit</p>
+            )}
+            {aiMode === 'claude' && (
+              <p className="text-[9px] text-slate-600 mt-0.5">Transcription vẫn dùng Gemini (xử lý audio)</p>
+            )}
+            {aiMode === 'groq' && (
+              <p className="text-[9px] text-green-500/70 mt-0.5">⚡ Groq xử lý TOÀN BỘ: Whisper + phân tích + prompts</p>
+            )}
+            {aiMode === 'gemini' && (
+              <div className="mt-1.5">
+                <label className="text-[9px] text-slate-600 mb-1 block">Model Gemini (phân tích + prompts)</label>
+                <select value={atvGeminiModel} onChange={e => setAtvGeminiModel(e.target.value)} disabled={running}
+                  className="w-full bg-slate-800/60 border border-slate-700/60 rounded-lg px-2 py-1 text-[10px] text-slate-300">
+                  {ATV_GEMINI_MODELS.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+                </select>
+              </div>
+            )}
+          </div>
 
           {/* File picker */}
           <div>
@@ -3229,6 +4994,50 @@ function AudioToVideoPanel() {
               )}
             </div>
             <p className="text-[8px] text-slate-700 mt-1">Hỗ trợ: mp3, wav, m4a, ogg, webm, mp4, mov</p>
+          </div>
+
+          {/* Transcript upload — bỏ qua Gemini transcription, tiết kiệm ~50 API calls */}
+          <div>
+            <p className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1">
+              Transcript SRT <span className="text-emerald-600 normal-case font-normal">— bỏ qua phân tích âm thanh</span>
+            </p>
+            <div
+              onClick={() => {
+                const input = document.createElement('input');
+                input.type = 'file'; input.accept = '.srt,.vtt,.txt';
+                input.onchange = async e => {
+                  const f = e.target.files?.[0];
+                  if (!f) return;
+                  const text = await f.text();
+                  setManualTranscript(text);
+                  setManualTranscriptName(f.name);
+                };
+                input.click();
+              }}
+              className={cn(
+                'flex items-center gap-2 px-3 py-2 rounded-xl border cursor-pointer transition-all',
+                manualTranscript
+                  ? 'bg-emerald-500/10 border-emerald-500/30 hover:border-emerald-400/50'
+                  : 'bg-slate-800/40 border-slate-700/60 hover:border-slate-600 border-dashed'
+              )}
+            >
+              <FileText size={13} className={manualTranscript ? 'text-emerald-400' : 'text-slate-600'} />
+              <span className={cn('text-[10px] truncate flex-1', manualTranscript ? 'text-emerald-300' : 'text-slate-700')}>
+                {manualTranscriptName || 'Tải lên file TXT / SRT (tùy chọn)'}
+              </span>
+              {manualTranscript && (
+                <button onClick={e => { e.stopPropagation(); setManualTranscript(''); setManualTranscriptName(''); }}
+                  className="p-0.5 hover:text-red-400 text-slate-600 transition-colors">
+                  <X size={10}/>
+                </button>
+              )}
+            </div>
+            {manualTranscript && (
+              <p className="text-[8px] text-emerald-600 mt-1">✅ Sẽ dùng text này làm transcript — tiết kiệm ~{Math.ceil((filePath ? 1 : 50))} API calls transcription</p>
+            )}
+            {!manualTranscript && (
+              <p className="text-[8px] text-slate-700 mt-1">Dùng file <span className="text-yellow-600 font-semibold">.SRT</span> để timestamp chính xác — cảnh video khớp đúng audio</p>
+            )}
           </div>
 
           {/* Scene duration */}
@@ -3259,6 +5068,61 @@ function AudioToVideoPanel() {
             </p>
           </div>
 
+          {/* Prompt đồng bộ nhân vật / bối cảnh */}
+          {(!stockMode || gsVideoMode) && (
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider">
+                  🎭 Đồng bộ nhân vật / bối cảnh
+                </label>
+                {charBgPrompt.trim() && (
+                  <button onClick={() => setCharBgPrompt('')} disabled={running}
+                    className="text-[8px] text-slate-600 hover:text-red-400 transition-colors">Xóa</button>
+                )}
+              </div>
+              <textarea
+                value={charBgPrompt}
+                onChange={e => setCharBgPrompt(e.target.value)}
+                disabled={running}
+                rows={3}
+                placeholder="Để trống → AI tự phân tích nhân vật & bối cảnh từ audio. Hoặc nhập tay: A young Vietnamese woman, early 20s, long black hair, red áo dài. Background: Hanoi old quarter streets."
+                className="w-full bg-slate-800/50 border border-slate-700/60 rounded-lg px-2 py-1.5 text-[9px] text-slate-300 placeholder-slate-600 focus:outline-none focus:border-purple-500/40 resize-none"
+              />
+              <p className="text-[8px] text-slate-600 mt-1">
+                {charBgPrompt.trim()
+                  ? <span className="text-purple-400">✅ Dùng mô tả này — AI sẽ giữ nhất quán mọi cảnh</span>
+                  : '🤖 Tự động: AI sẽ phân tích audio và tự sinh mô tả khi chạy'}
+              </p>
+            </div>
+          )}
+
+          {/* Phong cách hình ảnh Veo (Veo AI + AI+Veo) */}
+          {(!stockMode || gsVideoMode) && (
+            <div>
+              <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1.5 block">
+                Phong cách hình ảnh
+              </label>
+              <select value={veoStyle} onChange={e => setVeoStyle(e.target.value)} disabled={running}
+                className="w-full bg-slate-800/50 border border-slate-700/60 rounded-lg px-2 py-1.5 text-[10px] text-slate-300 focus:outline-none focus:border-blue-500/40">
+                <option value="auto">🤖 Tự động (AI phân tích)</option>
+                <option value="Photorealistic">📷 Photorealistic — Ảnh thực tế siêu chi tiết</option>
+                <option value="Cinematic 4K">🎬 Cinematic 4K — Phim điện ảnh chuyên nghiệp</option>
+                <option value="Anime / Manga">🎨 Anime / Manga — Hoạt hình Nhật Bản</option>
+                <option value="Pixar 3D">🧸 Pixar 3D — Hoạt hình 3D Disney-Pixar</option>
+                <option value="Studio Ghibli">🌿 Studio Ghibli — Màu nước, Miyazaki</option>
+                <option value="Dark Fantasy">🌑 Dark Fantasy — Tối, gothic, huyền bí</option>
+                <option value="Watercolor">🖌️ Watercolor — Màu nước nghệ thuật</option>
+                <option value="Cyberpunk">⚡ Cyberpunk — Neon, tương lai, tối</option>
+                <option value="Documentary">📽️ Documentary — Phóng sự, tự nhiên</option>
+              </select>
+              {veoStyle !== 'auto' && (
+                <p className="text-[8px] text-blue-400 mt-1">
+                  🎨 Mọi prompt sẽ ép phong cách: <strong>{veoStyle}</strong>
+                </p>
+              )}
+            </div>
+          )}
+
           {/* Info */}
           {duration > 0 && (
             <div className="bg-blue-500/5 border border-blue-500/20 rounded-xl px-3 py-2.5 space-y-1">
@@ -3279,20 +5143,6 @@ function AudioToVideoPanel() {
             </div>
           )}
 
-          {/* ── Tự động lưu prompt ── */}
-          <div className="border-t border-slate-800/60 pt-3 space-y-2">
-            <div className="flex items-center justify-between">
-              <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider">Tự động lưu prompt</label>
-              <button onClick={() => setAutoSavePrompt(v => !v)} disabled={running}
-                className={cn('w-9 h-5 rounded-full transition-all relative', autoSavePrompt ? 'bg-emerald-600' : 'bg-slate-700')}>
-                <span className={cn('absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all', autoSavePrompt ? 'left-4' : 'left-0.5')}/>
-              </button>
-            </div>
-            {autoSavePrompt && (
-              <FolderRow label="Thư mục lưu prompt" value={promptDir} onChange={setPromptDir} />
-            )}
-          </div>
-
           {/* ── Video Generation Settings ── */}
           <div className="border-t border-slate-800/60 pt-3 space-y-3">
             <div className="flex items-center justify-between">
@@ -3305,32 +5155,90 @@ function AudioToVideoPanel() {
 
             {makeVideo && (
               <>
-                {/* ── Nguồn video: Veo vs Stock ── */}
+                {/* ── Nguồn video: Veo / Stock / Gemini+Veo ── */}
                 <div>
                   <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1.5 block">Nguồn video</label>
-                  <div className="flex gap-1.5">
-                    <button disabled={running} onClick={() => handleSetStockMode(false)}
+                  <div className="flex gap-1">
+                    <button disabled={running} onClick={() => { handleSetStockMode(false); setGsVideoMode(false); }}
                       className={cn('flex-1 py-2 rounded-lg text-[10px] font-bold border transition-all',
-                        !stockMode ? 'bg-violet-600 border-violet-500 text-white' : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
+                        !stockMode && !gsVideoMode ? 'bg-violet-600 border-violet-500 text-white' : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
                       🎬 Veo AI
                     </button>
-                    <button disabled={running} onClick={() => handleSetStockMode(true)}
+                    <button disabled={running} onClick={() => { handleSetStockMode(true); setGsVideoMode(false); }}
                       className={cn('flex-1 py-2 rounded-lg text-[10px] font-bold border transition-all',
-                        stockMode ? 'bg-emerald-700 border-emerald-600 text-white' : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
+                        stockMode && !gsVideoMode ? 'bg-emerald-700 border-emerald-600 text-white' : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
                       📦 Stock
                     </button>
+                    <button disabled={running} onClick={() => { setGsVideoMode(true); handleSetStockMode(true); }}
+                      className={cn('flex-1 py-2 rounded-lg text-[10px] font-bold border transition-all leading-tight flex flex-col items-center gap-0.5',
+                        gsVideoMode ? 'bg-pink-700 border-pink-600 text-white' : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
+                      <span>🤖 AI</span>
+                      <span className={cn('text-[7px]', gsVideoMode ? 'text-pink-200' : 'text-slate-700')}>+Veo</span>
+                    </button>
                   </div>
+                  {gsVideoMode && (
+                    <p className="text-[8px] text-pink-400/80 mt-1">Whisper → Gemini kịch bản → Veo ingredient → Stock dự phòng</p>
+                  )}
                 </div>
 
-                {/* ── Veo-specific settings ── */}
+                {/* ── AI+Veo settings (dùng cùng Veo settings bên dưới) ── */}
+                {gsVideoMode && (
+                  <div className="text-[8px] text-pink-300/70 bg-pink-900/10 border border-pink-700/20 rounded-lg px-2.5 py-2 leading-relaxed">
+                    🤖 <strong>Whisper</strong> phân tích lời thoại → <strong>Gemini</strong> đọc văn bản + sinh Veo prompt → <strong>Veo T2V</strong> render từng cảnh
+                  </div>
+                )}
+
+                {/* ── Ingredients Mode toggle (chỉ khi Veo AI hoặc AI+Veo) ── */}
                 {!stockMode && (
+                  <div className="bg-purple-900/10 border border-purple-700/25 rounded-xl px-3 py-2.5 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-[9px] font-semibold text-purple-400 uppercase tracking-wider">🧬 Ingredients Mode</label>
+                      <button onClick={() => setA2vIngMode(v => !v)} disabled={running}
+                        className={cn('w-9 h-5 rounded-full transition-all relative', a2vIngMode ? 'bg-purple-600' : 'bg-slate-700')}>
+                        <span className={cn('absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all', a2vIngMode ? 'left-4' : 'left-0.5')}/>
+                      </button>
+                    </div>
+                    {a2vIngMode && (
+                      <div className="space-y-2">
+                        <p className="text-[8px] text-purple-300/80 leading-relaxed">
+                          Tự động detect tối đa 5 nhân vật → tạo ảnh DNA → render video Ingredients (đồng bộ ngoại hình xuyên suốt)
+                        </p>
+                        <div>
+                          <label className="text-[9px] text-slate-600 mb-1 block">Model tạo ảnh DNA</label>
+                          <select value={a2vImgMdl} onChange={e => setA2vImgMdl(e.target.value)} disabled={running}
+                            className="w-full bg-slate-800/50 border border-purple-700/40 rounded-lg px-2 py-1.5 text-[10px] text-purple-300 focus:outline-none">
+                            {IMG_MDL.map(m => <option key={m}>{m}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-[9px] text-slate-600 mb-1 block">Thư mục lưu ảnh DNA *</label>
+                          <div className="flex gap-1">
+                            <input value={a2vRefDir} onChange={e => setA2vRefDir(e.target.value)} disabled={running}
+                              placeholder="Chọn thư mục..." readOnly
+                              className="flex-1 bg-slate-800/50 border border-purple-700/40 rounded-lg px-2 py-1.5 text-[9px] text-slate-300 focus:outline-none" />
+                            <button disabled={running} onClick={async () => {
+                              const r = await window.electronAPI?.selectFolder?.();
+                              if (r) setA2vRefDir(r);
+                            }} className="px-2 py-1.5 bg-slate-800 border border-slate-700/60 rounded-lg text-[9px] text-slate-400 hover:text-slate-200">📁</button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    {!a2vIngMode && (
+                      <p className="text-[8px] text-slate-600">Bật để dùng DNA nhân vật thay vì Text-to-Video thuần.</p>
+                    )}
+                  </div>
+                )}
+
+                {/* ── Veo-specific settings (Veo AI + AI+Veo đều dùng) ── */}
+                {(!stockMode || gsVideoMode) && (
                   <>
                     {/* Duration */}
                     <div>
                       <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1 block">Thời lượng mỗi video</label>
                       <div className="flex gap-1.5">
                         {vidDurs.map(d => (
-                          <button key={d} disabled={running} onClick={() => { setVidSceneDur(d); if (d === 10) setVidModel('Omni Flash'); }}
+                          <button key={d} disabled={running} onClick={() => { setVidSceneDur(d); if (d === 10) setVidModel('Omni 1.1 Flash'); }}
                             className={cn('flex-1 py-1.5 rounded-lg text-[10px] font-bold border transition-all flex flex-col items-center leading-none gap-0.5',
                               vidSceneDur === d ? 'bg-violet-600 border-violet-500 text-white' : 'border-slate-700/60 text-slate-600 hover:border-slate-600')}>
                             <span>{d}s</span>
@@ -3361,13 +5269,13 @@ function AudioToVideoPanel() {
                           <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1 block">
                             Model Veo{vidSceneDur === 10 && <span className="ml-1.5 text-amber-400 normal-case">⚡ 10s chỉ dùng Omni Flash</span>}
                           </label>
-                          <select value={vidSceneDur === 10 ? 'Omni Flash' : vidModel}
+                          <select value={vidSceneDur === 10 ? 'Omni 1.1 Flash' : vidModel}
                             onChange={e => { if (vidSceneDur !== 10) setVidModel(e.target.value); }}
                             disabled={running || vidSceneDur === 10}
                             className={cn('w-full bg-slate-800/50 border rounded-lg px-2 py-1.5 text-[10px] focus:outline-none',
                               vidSceneDur === 10 ? 'border-amber-500/50 text-amber-300 cursor-not-allowed opacity-80' : 'border-slate-700/60 text-slate-300')}>
                             {vidSceneDur === 10
-                              ? <option>Omni Flash</option>
+                              ? <option value="Omni 1.1 Flash">Omni 1.1 Flash</option>
                               : VID_MDL_AUDIO.map(m => <option key={m}>{m}</option>)
                             }
                           </select>
@@ -3392,8 +5300,8 @@ function AudioToVideoPanel() {
                   </>
                 )}
 
-                {/* ── Stock-specific settings ── */}
-                {stockMode && (
+                {/* ── Stock-specific settings (chỉ hiện khi Stock thuần, không phải GS mode) ── */}
+                {stockMode && !gsVideoMode && (
                   <div className="space-y-2">
                     <div>
                       <label className="text-[9px] font-semibold text-slate-600 uppercase tracking-wider mb-1.5 block">Nguồn stock</label>
@@ -3475,6 +5383,13 @@ function AudioToVideoPanel() {
                             className="w-full bg-slate-800/50 border border-slate-700/60 rounded-lg px-2 py-1.5 text-[10px] text-slate-300 placeholder-slate-600 focus:outline-none focus:border-emerald-500/50 resize-none" />
                         </div>
                       )}
+                      {/* Nút xóa lịch sử video đã dùng */}
+                      <button
+                        onClick={() => { localStorage.removeItem('fluxy_stock_used_ids'); addLog('🗑️ Đã xóa lịch sử video stock đã dùng — lần tới sẽ tìm video mới hoàn toàn', 'info'); }}
+                        disabled={running}
+                        className="w-full text-[9px] text-slate-500 hover:text-red-400 border border-slate-700/40 hover:border-red-500/40 rounded-lg py-1 transition-colors mt-1">
+                        Xóa lịch sử video stock đã dùng
+                      </button>
                     </div>
                   </div>
                 )}
@@ -3534,11 +5449,285 @@ function AudioToVideoPanel() {
       {/* ── RIGHT MAIN ───────────────────────────────────────────────────── */}
       <div className="flex-1 flex flex-col overflow-hidden bg-[#080e1a]">
 
+        {/* ── Batch Mode Panel ── */}
+        {batchMode && (
+          <div className="flex-1 flex flex-col overflow-hidden">
+            {/* Batch header */}
+            <div className="shrink-0 px-5 pt-4 pb-3 border-b border-slate-800/80 space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs font-bold text-purple-300">📦 Batch — Xử lý hàng loạt</p>
+                  <p className="text-[9px] text-slate-500 mt-0.5">
+                    {batchVideoMode === 'aiveo' ? 'AI+Veo: Whisper → Gemini → Veo T2V (8 luồng/file)' : 'Stock Video: mỗi file audio → 1 thư mục riêng.'}
+                  </p>
+                </div>
+                {batchRunning && (
+                  <span className="text-[9px] font-bold text-purple-400 flex items-center gap-1">
+                    <Loader2 size={10} className="animate-spin"/> {batchProgress.current}/{batchProgress.total}
+                  </span>
+                )}
+              </div>
+
+              {/* Nguồn video selector */}
+              <div>
+                <label className="text-[9px] font-semibold text-slate-500 uppercase mb-1.5 block">Nguồn Video</label>
+                <div className="flex gap-1.5">
+                  <button onClick={() => { setBatchVideoMode('stock'); localStorage.setItem('fluxy_batch_video_mode','stock'); }}
+                    disabled={batchRunning}
+                    className={cn('flex-1 py-1.5 rounded-lg text-[9px] font-bold border transition-all flex items-center justify-center gap-1',
+                      batchVideoMode === 'stock'
+                        ? 'bg-amber-600/20 border-amber-500/50 text-amber-300'
+                        : 'bg-slate-800/60 border-slate-700/50 text-slate-500 hover:text-slate-300 hover:border-slate-600')}>
+                    📦 Stock
+                  </button>
+                  <button onClick={() => { setBatchVideoMode('aiveo'); localStorage.setItem('fluxy_batch_video_mode','aiveo'); }}
+                    disabled={batchRunning}
+                    className={cn('flex-1 py-1.5 rounded-lg text-[9px] font-bold border transition-all flex items-center justify-center gap-1',
+                      batchVideoMode === 'aiveo'
+                        ? 'bg-pink-600/25 border-pink-500/50 text-pink-300'
+                        : 'bg-slate-800/60 border-slate-700/50 text-slate-500 hover:text-slate-300 hover:border-slate-600')}>
+                    🤖 AI+Veo
+                  </button>
+                </div>
+                {batchVideoMode === 'aiveo' && (
+                  <p className="text-[8px] text-pink-400/70 mt-1 leading-relaxed">Whisper → Gemini Story Bible → Veo T2V 8 luồng → ghép audio</p>
+                )}
+              </div>
+
+              {/* ── Thiết lập batch (AI+Veo) ── */}
+              {batchVideoMode === 'aiveo' && (
+                <div className="bg-slate-800/40 border border-slate-700/40 rounded-xl px-3 py-2.5 space-y-2.5">
+                  <p className="text-[9px] font-semibold text-slate-400 uppercase tracking-wider">⚙️ Thiết lập video</p>
+
+                  {/* Thời lượng cảnh audio + video */}
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <p className="text-[8px] text-slate-500 mb-1">Mỗi cảnh audio</p>
+                      <div className="flex gap-1">
+                        {[-1,4,6,8,10].map(d => (
+                          <button key={d} disabled={batchRunning} onClick={() => setSceneDur(d)}
+                            className={cn('flex-1 py-1 rounded text-[8px] font-bold border transition-all',
+                              sceneDur === d ? 'bg-blue-600 border-blue-500 text-white' : 'border-slate-700/60 text-slate-600 hover:text-slate-400')}>
+                            {d === -1 ? 'Auto' : `${d}s`}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <p className="text-[8px] text-slate-500 mb-1">Mỗi clip Veo</p>
+                      <div className="flex gap-1">
+                        {[4,6,8,10].map(d => (
+                          <button key={d} disabled={batchRunning} onClick={() => { setVidSceneDur(d); if (d === 10) setVidModel('Omni 1.1 Flash'); }}
+                            className={cn('flex-1 py-1 rounded text-[8px] font-bold border transition-all',
+                              vidSceneDur === d ? 'bg-violet-600 border-violet-500 text-white' : 'border-slate-700/60 text-slate-600 hover:text-slate-400')}>
+                            {d}s
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Tỉ lệ */}
+                  <div>
+                    <p className="text-[8px] text-slate-500 mb-1">Tỉ lệ khung hình</p>
+                    <div className="flex gap-1">
+                      {['9:16','16:9','1:1'].map(r => (
+                        <button key={r} disabled={batchRunning} onClick={() => setVidRatio(r)}
+                          className={cn('flex-1 py-1 rounded text-[8px] font-bold border transition-all',
+                            vidRatio === r ? 'bg-violet-600 border-violet-500 text-white' : 'border-slate-700/60 text-slate-600 hover:text-slate-400')}>
+                          {r}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Model Veo */}
+                  <div>
+                    <p className="text-[8px] text-slate-500 mb-1">Model Veo</p>
+                    <select value={vidSceneDur === 10 ? 'Omni 1.1 Flash' : vidModel}
+                      onChange={e => { if (vidSceneDur !== 10) setVidModel(e.target.value); }}
+                      disabled={batchRunning || vidSceneDur === 10}
+                      className="w-full bg-slate-900/60 border border-slate-700/60 rounded-lg px-2 py-1 text-[9px] text-slate-300 focus:outline-none">
+                      {vidSceneDur === 10
+                        ? <option value="Omni 1.1 Flash">Omni 1.1 Flash</option>
+                        : ['Veo 3.1 - Lite [Lower Priority]', 'Omni 1.1 Flash'].map(m => <option key={m}>{m}</option>)
+                      }
+                    </select>
+                  </div>
+
+                  {/* Chất lượng + Phong cách */}
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <p className="text-[8px] text-slate-500 mb-1">Chất lượng</p>
+                      <select value={vidQuality} onChange={e => setVidQuality(e.target.value)} disabled={batchRunning}
+                        className="w-full bg-slate-900/60 border border-slate-700/60 rounded-lg px-2 py-1 text-[9px] text-slate-300 focus:outline-none">
+                        {['480p','720p — Nhanh','1080p','4K — Chậm'].map(q => <option key={q}>{q}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <p className="text-[8px] text-slate-500 mb-1">Phong cách</p>
+                      <select value={veoStyle} onChange={e => setVeoStyle(e.target.value)} disabled={batchRunning}
+                        className="w-full bg-slate-900/60 border border-slate-700/60 rounded-lg px-2 py-1 text-[9px] text-slate-300 focus:outline-none">
+                        <option value="auto">🤖 Tự động</option>
+                        <option value="Photorealistic">📷 Photorealistic</option>
+                        <option value="Cinematic 4K">🎬 Cinematic 4K</option>
+                        <option value="Anime / Manga">🎌 Anime / Manga</option>
+                        <option value="Pixar 3D">🧸 Pixar 3D</option>
+                        <option value="Studio Ghibli">🌸 Studio Ghibli</option>
+                        <option value="Dark Fantasy">🌑 Dark Fantasy</option>
+                        <option value="Watercolor">🎨 Watercolor</option>
+                        <option value="Cyberpunk">🤖 Cyberpunk</option>
+                        <option value="Documentary">📽️ Documentary</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Chuyển cảnh */}
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input type="checkbox" checked={useTransition} onChange={e => setUseTransition(e.target.checked)} disabled={batchRunning}
+                      className="w-3 h-3 rounded accent-violet-500"/>
+                    <span className="text-[9px] text-slate-400">Chuyển cảnh ngẫu nhiên khi ghép video</span>
+                  </label>
+                </div>
+              )}
+
+              {/* ── Thiết lập batch (Stock) ── */}
+              {batchVideoMode === 'stock' && (
+                <div className="bg-slate-800/40 border border-slate-700/40 rounded-xl px-3 py-2.5 space-y-2">
+                  <p className="text-[9px] font-semibold text-slate-400 uppercase tracking-wider">⚙️ Thiết lập</p>
+                  <div>
+                    <p className="text-[8px] text-slate-500 mb-1">Thời lượng mỗi cảnh</p>
+                    <div className="flex gap-1">
+                      {[-1,4,6,8,10].map(d => (
+                        <button key={d} disabled={batchRunning} onClick={() => setSceneDur(d)}
+                          className={cn('flex-1 py-1 rounded text-[8px] font-bold border transition-all',
+                            sceneDur === d ? 'bg-amber-600 border-amber-500 text-white' : 'border-slate-700/60 text-slate-600 hover:text-slate-400')}>
+                          {d === -1 ? 'Auto' : `${d}s`}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <p className="text-[8px] text-slate-500 mb-1">Nguồn clip stock</p>
+                    <div className="flex gap-1">
+                      {['pexels','pixabay','both'].map(p => (
+                        <button key={p} disabled={batchRunning} onClick={() => setStockProvider(p)}
+                          className={cn('flex-1 py-1 rounded text-[8px] font-bold border transition-all capitalize',
+                            stockProvider === p ? 'bg-amber-600 border-amber-500 text-white' : 'border-slate-700/60 text-slate-600 hover:text-slate-400')}>
+                          {p}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* File queue */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-[9px] font-semibold text-slate-500 uppercase">Files audio ({batchFiles.length})</label>
+                  <button onClick={handleBatchPickFiles} disabled={batchRunning}
+                    className="text-[9px] bg-purple-600/30 hover:bg-purple-600/50 border border-purple-500/30 text-purple-300 px-2.5 py-1 rounded-lg transition-colors flex items-center gap-1 disabled:opacity-40">
+                    <Plus size={10}/> Thêm files
+                  </button>
+                </div>
+                {batchFiles.length === 0 ? (
+                  <p className="text-[9px] text-slate-600 italic px-1">Chưa có file nào — bấm &quot;Thêm files&quot;</p>
+                ) : (
+                  <div className="max-h-28 overflow-y-auto custom-scrollbar space-y-1">
+                    {batchFiles.map((f, i) => {
+                      const res = batchResults[i];
+                      return (
+                        <div key={f.path} className={cn('flex items-center gap-2 px-2.5 py-1.5 rounded-lg border text-[9px]',
+                          res?.status === 'done'    ? 'bg-emerald-500/5 border-emerald-500/20' :
+                          res?.status === 'error'   ? 'bg-red-500/5 border-red-500/20' :
+                          res?.status === 'running' ? 'bg-purple-500/10 border-purple-500/30' :
+                          'bg-slate-800/30 border-slate-700/40')}>
+                          <span className="shrink-0">
+                            {res?.status === 'done'    ? '✅' :
+                             res?.status === 'error'   ? '❌' :
+                             res?.status === 'running' ? <Loader2 size={9} className="animate-spin text-purple-400"/> : '⏳'}
+                          </span>
+                          <span className="flex-1 truncate text-slate-300">{f.name}</span>
+                          {res?.status === 'error' && <span className="text-red-400 truncate max-w-20" title={res.error}>{res.error?.slice(0,20)}</span>}
+                          {!batchRunning && (
+                            <button onClick={() => removeBatchFile(f.path)} className="text-slate-600 hover:text-red-400 shrink-0">
+                              <X size={10}/>
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Output folder */}
+              <div>
+                <label className="text-[9px] font-semibold text-slate-500 uppercase mb-1 block">Thư mục lưu kết quả</label>
+                <div className="flex items-center gap-1.5">
+                  <div className="flex-1 bg-slate-800/50 border border-slate-700/60 rounded-lg px-2.5 py-1.5 text-[9px] text-slate-400 truncate">
+                    {batchOutputDir || <span className="text-slate-700">Chưa chọn...</span>}
+                  </div>
+                  <button onClick={async () => { const d = await window.electronAPI?.selectFolder?.(); if (d) setBatchOutputDir(d); }}
+                    disabled={batchRunning}
+                    className="p-1.5 bg-slate-700/60 hover:bg-slate-600 rounded-lg transition-colors disabled:opacity-40">
+                    <FolderOpen size={12} className="text-slate-400"/>
+                  </button>
+                </div>
+                <p className="text-[8px] text-slate-600 mt-1">Mỗi file → thư mục con riêng.</p>
+              </div>
+
+              {/* Batch start/stop */}
+              <div className="flex gap-2">
+                {!batchRunning ? (
+                  <button onClick={handleBatchStart}
+                    disabled={!batchFiles.length || !batchOutputDir}
+                    className={cn('flex-1 py-2 disabled:opacity-40 disabled:cursor-not-allowed text-white text-[10px] font-bold rounded-xl flex items-center justify-center gap-1.5 transition-colors',
+                      batchVideoMode === 'aiveo' ? 'bg-pink-600 hover:bg-pink-500' : 'bg-purple-600 hover:bg-purple-500')}>
+                    <Play size={11} fill="currentColor"/> Chạy Batch ({batchFiles.length} file)
+                  </button>
+                ) : (
+                  <button onClick={() => { batchStopRef.current = true; }}
+                    className="flex-1 py-2 bg-red-600/80 hover:bg-red-600 text-white text-[10px] font-bold rounded-xl flex items-center justify-center gap-1.5 transition-colors">
+                    <Square size={11} fill="currentColor"/> Dừng Batch
+                  </button>
+                )}
+                {!batchRunning && batchFiles.length > 0 && (
+                  <button onClick={() => { setBatchFiles([]); setBatchResults([]); }}
+                    className="px-3 py-2 bg-slate-700/60 hover:bg-slate-700 text-slate-400 text-[9px] rounded-xl transition-colors">
+                    Xóa DS
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Batch log */}
+            <div className="flex-1 overflow-y-auto custom-scrollbar px-5 py-3 font-mono text-[9px] space-y-0.5">
+              {batchLogs.length === 0 && (
+                <p className="text-slate-600 italic">Log sẽ hiển thị khi batch chạy...</p>
+              )}
+              {batchLogs.map((l, i) => (
+                <div key={i} className="flex gap-2">
+                  <span className="text-slate-700 shrink-0">[{l.time}]</span>
+                  <span className={l.type === 'error' ? 'text-red-400' : l.type === 'success' ? 'text-emerald-400' : 'text-slate-400'}>
+                    {l.text}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ── Normal pipeline ── */}
+        {!batchMode && (
+        <div className="flex flex-col flex-1 overflow-hidden">
+
         {/* Pipeline steps */}
         <div className="shrink-0 px-5 pt-4 pb-3 border-b border-slate-800/80">
           <p className="text-[9px] font-bold text-slate-600 uppercase tracking-widest mb-2">Tiến trình xử lý</p>
-          <div className="grid grid-cols-7 gap-1.5">
-            {STEPS_AUDIO.map(s => {
+          <div className={cn('grid gap-1.5', a2vIngMode && makeVideo && !stockMode ? 'grid-cols-9' : 'grid-cols-8')}>
+            {STEPS_AUDIO.filter(s => s.id !== 'dna' || (a2vIngMode && makeVideo && !stockMode)).map(s => {
               const isStock = makeVideo && stockMode;
               const step = isStock && s.id === 'generate' ? { ...s, label: 'Từ khóa', icon: Zap }
                          : isStock && s.id === 'video'    ? { ...s, label: 'Tải Clip', icon: Download }
@@ -3559,6 +5748,7 @@ function AudioToVideoPanel() {
                   {t.label}
                   {t.id === 'chunks'  && chunks.length > 0       && <span className="ml-1 text-[8px] bg-blue-500/20 text-blue-400 px-1.5 py-0.5 rounded-full">{chunks.length}</span>}
                   {t.id === 'prompts' && scenes.length > 0       && <span className="ml-1 text-[8px] bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded-full">{scenes.length}</span>}
+                  {t.id === 'dna'     && a2vDnaImgs.length > 0   && <span className="ml-1 text-[8px] bg-purple-500/20 text-purple-400 px-1.5 py-0.5 rounded-full">{a2vDnaImgs.length}</span>}
                   {t.id === 'video'   && videoPaths.length > 0   && <span className="ml-1 text-[8px] bg-violet-500/20 text-violet-400 px-1.5 py-0.5 rounded-full">{videoPaths.length}</span>}
                 </button>
               ))}
@@ -3596,6 +5786,8 @@ function AudioToVideoPanel() {
             </div>
           )}
         </div>
+        </div>
+        )}
       </div>
     </div>
   );
@@ -3828,6 +6020,124 @@ function subWrapSRTLines(srtText, wordsPerLine = 0, maxCpl = 42) {
   return result.join('\n\n') + '\n';
 }
 
+async function smartTranslateSRT(srtContent, tLang, apiKeys, logFn, model = 'gemini-2.5-flash', mode = 'normal') {
+  const langObj = SUBTITLE_LANGUAGES.find(l => l.code === tLang);
+  const langName = langObj?.name || tLang;
+  const countryMap = { vi:'Việt Nam', en:'Anh/Mỹ', zh:'Trung Quốc', ja:'Nhật Bản', ko:'Hàn Quốc', th:'Thái Lan', id:'Indonesia', ms:'Malaysia', fr:'Pháp', de:'Đức', es:'Tây Ban Nha', pt:'Bồ Đào Nha', it:'Ý', ru:'Nga', ar:'Ả Rập', hi:'Ấn Độ' };
+  const country = countryMap[tLang] || langName;
+
+  const callGemini = async (prompt, label) => {
+    return retryWithKeyRotation(async (apiKey) => {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      });
+      if (!res.ok) { const err = await res.json().catch(() => ({})); const e = new Error(err?.error?.message || `HTTP ${res.status}`); e.status = res.status; throw e; }
+      const data = await res.json();
+      return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    }, apiKeys, { onSwitch: (idx) => logFn(`🔄 [${label}] Chuyển sang API key #${idx + 1}...`) });
+  };
+
+  const parseSRTEntries = (srt) => {
+    return srt.trim().split(/\n\n+/).map(block => {
+      const lines = block.trim().split('\n');
+      const tlIdx = lines.findIndex(l => /^\d{1,2}:\d{2}:\d{2}[,.]\d{2,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{2,3}/.test(l.trim()));
+      if (tlIdx < 0) return null;
+      return { timeLine: lines[tlIdx].trim(), text: lines.slice(tlIdx + 1).join('\n').trim() };
+    }).filter(Boolean);
+  };
+
+  const extractTranslatedTexts = (raw, expectedCount) => {
+    const cleaned = raw.replace(/^```[a-z]*\r?\n?/i, '').replace(/\r?\n?```$/i, '').trim();
+    const entries = parseSRTEntries(cleaned);
+    if (entries.length === expectedCount) return entries.map(e => e.text);
+    const textLines = cleaned.split('\n').filter(l => l.trim() && !/^\d+$/.test(l.trim()) && !/-->/.test(l));
+    if (textLines.length >= expectedCount) return textLines.slice(0, expectedCount);
+    return entries.map(e => e.text);
+  };
+
+  const srcEntries = parseSRTEntries(srtContent);
+  if (!srcEntries.length) throw new Error('Không đọc được SRT gốc');
+
+  logFn('🔍 [1/2] Đang phân tích ngữ cảnh & thuật ngữ chuyên môn...');
+  let contextGuide = null;
+  const sampleText = srcEntries.slice(0, 60).map(e => e.text).join('\n');
+  const contextPrompt = `Phân tích nội dung video phụ đề dưới đây. Trả về JSON (chỉ JSON, không giải thích thêm):\n\n{\n  "domain": "lĩnh vực tổng quát",\n  "topic": "chủ đề cụ thể",\n  "tone": "phong cách",\n  "audience": "đối tượng khán giả",\n  "keyTerms": [{ "original": "...", "best_translation_${tLang}": "...", "avoid": "..." }],\n  "styleGuide": "3-5 quy tắc dịch quan trọng nhất cho ${country}"\n}\n\nNỘI DUNG PHỤ ĐỀ:\n${sampleText.substring(0, 4000)}`;
+  try {
+    const contextRaw = await callGemini(contextPrompt, 'Phân tích');
+    const jsonMatch = contextRaw.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      contextGuide = JSON.parse(jsonMatch[0]);
+      logFn(`✅ Nhận diện: ${contextGuide.domain} — "${contextGuide.topic}" (${contextGuide.tone})`);
+      if (contextGuide.keyTerms?.length) logFn(`📚 ${contextGuide.keyTerms.length} thuật ngữ chuyên biệt đã được chuẩn hóa`);
+    }
+  } catch (e) { logFn(`⚠️ Bỏ qua phân tích ngữ cảnh (${e.message.substring(0, 50)}), vẫn tiếp tục dịch...`); }
+
+  let contextHeader = '';
+  if (contextGuide) {
+    const termLines = (contextGuide.keyTerms || []).slice(0, 10)
+      .map(t => `"${t.original}"→"${t[`best_translation_${tLang}`] || t.best_translation || ''}"`)
+      .join(', ');
+    contextHeader = `[Ngữ cảnh: ${contextGuide.domain} · ${contextGuide.topic} · ${contextGuide.tone}]\n[Thuật ngữ: ${termLines}]\n[Phong cách: ${contextGuide.styleGuide}]\n\n`;
+  }
+
+  const CHUNK_SIZE = 30;
+  const chunks = [];
+  for (let i = 0; i < srcEntries.length; i += CHUNK_SIZE) chunks.push(srcEntries.slice(i, i + CHUNK_SIZE));
+  const totalChunks = chunks.length;
+  logFn(`🌐 [2/2] Dịch sang ${langName} — ${totalChunks} phần · ${srcEntries.length} dòng tổng...`);
+
+  const translatedTexts = new Array(srcEntries.length).fill(null);
+
+  for (let ci = 0; ci < totalChunks; ci++) {
+    const chunk = chunks[ci];
+    const startIdx = ci * CHUNK_SIZE;
+    logFn(`  📄 Phần ${ci+1}/${totalChunks}: dòng ${startIdx+1}–${startIdx+chunk.length}...`);
+
+    // Parse duration (giây) từ timeLine "HH:MM:SS,mmm --> HH:MM:SS,mmm"
+    const parseDurSec = (timeLine) => {
+      const m = timeLine.match(/(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)/);
+      if (!m) return 0;
+      const toMs = (h,min,s,ms) => (+h*3600 + +min*60 + +s)*1000 + +ms;
+      return (toMs(m[5],m[6],m[7],m[8]) - toMs(m[1],m[2],m[3],m[4])) / 1000;
+    };
+
+    const chunkSRT = chunk.map((e, i) => {
+      if (mode === 'dubbing') {
+        const durSec = parseDurSec(e.timeLine);
+        const maxWords = Math.max(3, Math.round(durSec * 2.2)); // 2.2 từ/giây đọc tự nhiên
+        return `${i+1}\n${e.timeLine} [${durSec.toFixed(1)}s≤${maxWords}từ]\n${e.text}`;
+      }
+      return `${i+1}\n${e.timeLine}\n${e.text}`;
+    }).join('\n\n');
+
+    const dubbingExtra = mode === 'dubbing'
+      ? `\n⚠️ CHẾ ĐỘ LỒNG TIẾNG: Mỗi entry có nhãn [Xs≤Ntừ] = thời lượng và số từ tối đa.\n   Dịch CÔ ĐỌNG, súc tích — KHÔNG dịch dài hơn gốc, KHÔNG thêm giải thích.\n   Ưu tiên nghĩa chính, bỏ bớt thành phần phụ nếu cần để vừa thời lượng.\n`
+      : '';
+    const chunkPrompt = `${contextHeader}NHIỆM VỤ: Dịch ${chunk.length} entry phụ đề SRT sau sang ${langName} (${country}).\n${dubbingExtra}\nQUY TẮC BẮT BUỘC:\n1. GIỮ NGUYÊN định dạng SRT: số thứ tự 1–${chunk.length}, timestamps, dòng trống giữa entry\n2. CHỈ dịch phần text — KHÔNG chạm vào timestamps hay số thứ tự (bỏ nhãn [Xs≤Ntừ] khỏi output)\n3. Dịch tự nhiên như người ${country} nói — KHÔNG máy móc\n4. Kết thúc mỗi entry bằng dấu câu phù hợp\n5. Trả về ĐÚNG ${chunk.length} entry — không thêm/bớt, không giải thích\n\nSRT CẦN DỊCH:\n${chunkSRT}`;
+
+    try {
+      const raw = await callGemini(chunkPrompt, `Phần ${ci+1}`);
+      const texts = extractTranslatedTexts(raw, chunk.length);
+      for (let j = 0; j < chunk.length; j++) {
+        translatedTexts[startIdx + j] = texts[j] || chunk[j].text;
+      }
+      logFn(`  ✅ Phần ${ci+1}/${totalChunks}: ${texts.length}/${chunk.length} dòng dịch xong`);
+    } catch (e) {
+      logFn(`  ⚠️ Phần ${ci+1} lỗi (${e.message.slice(0,50)}) → giữ text gốc cho ${chunk.length} dòng`);
+      for (let j = 0; j < chunk.length; j++) translatedTexts[startIdx + j] = chunk[j].text;
+    }
+
+    if (ci < totalChunks - 1) await new Promise(r => setTimeout(r, 300));
+  }
+
+  const finalSRT = srcEntries.map((e, i) =>
+    `${i+1}\n${e.timeLine}\n${translatedTexts[i] ?? e.text}`
+  ).join('\n\n') + '\n';
+
+  return finalSRT;
+}
+
 function SubtitlePanel() {
   const [logs, setLogs] = useState([]);
   const [logOpen, setLogOpen] = useState(false);
@@ -3842,6 +6152,8 @@ function SubtitlePanel() {
   const [originalSegments, setOriginalSegments] = useState([]);
   const [originalSRT, setOriginalSRT] = useState('');       // normalized (for display)
   const [rawOriginalSRT, setRawOriginalSRT] = useState(''); // raw (for translation input)
+  const [transcribeEngine, setTranscribeEngine] = useState('gemini'); // 'gemini' | 'whisper'
+  const [enableTranslate, setEnableTranslate] = useState(true); // dịch hay giữ nguyên SRT gốc
   const [targetLang, setTargetLang] = useState('vi');
   const [isTranslating, setIsTranslating] = useState(false);
   const [translatedSRT, setTranslatedSRT] = useState('');
@@ -3852,9 +6164,14 @@ function SubtitlePanel() {
   const [isBurning, setIsBurning] = useState(false);
   const [burnedVideoPath, setBurnedVideoPath] = useState('');
   const [dubEnabled, setDubEnabled] = useState(false);
-  const [dubEngine, setDubEngine] = useState('gemini'); // 'gemini' | 'edge'
+  const [dubEngine, setDubEngine] = useState('edge'); // 'edge' | 'vieneu'
   const [dubVoice, setDubVoice] = useState('Aoede');
   const [dubGenderFilter, setDubGenderFilter] = useState('all');
+  const [vnDubVoice, setVnDubVoice] = useState('');
+  const [vnDubVoices, setVnDubVoices] = useState([]); // tuple [desc, id]
+  const [vnDubVoicesLoaded, setVnDubVoicesLoaded] = useState(false);
+  const [vnDubPreviewing, setVnDubPreviewing] = useState(''); // id đang preview
+  const [vnDubPreviewUrl, setVnDubPreviewUrl] = useState('');
   const [isDubbing, setIsDubbing] = useState(false);
   const [dubbedVideoPath, setDubbedVideoPath] = useState('');
   const [dubProgress, setDubProgress] = useState({ done: 0, total: 0, text: '' });
@@ -3876,12 +6193,19 @@ function SubtitlePanel() {
       window.electronAPI.onGeminiSRTLog((text) => addSubLog(text));
     }
     if (window.electronAPI?.onTTSSRTProgress) {
-      window.electronAPI.onTTSSRTProgress((data) => setDubProgress(data));
+      window.electronAPI.onTTSSRTProgress((data) => {
+        setDubProgress(data);
+        if (data.text) addSubLog(`🎙️ ${data.text}`);
+      });
+    }
+    if (window.electronAPI?.onReviewFilmLog) {
+      window.electronAPI.onReviewFilmLog((d) => addLog(d?.msg || d, d?.type || 'info'));
     }
     return () => {
       window.electronAPI?.removeAllListeners?.('gemini-srt-progress');
       window.electronAPI?.removeAllListeners?.('gemini-srt-log');
       window.electronAPI?.removeAllListeners?.('tts-srt-progress');
+      window.electronAPI?.removeAllListeners?.('review-film-log');
     };
   }, []);
 
@@ -3891,10 +6215,26 @@ function SubtitlePanel() {
         if (data && data.length > 0) setEdgeDubVoices(data);
       }).catch(() => {});
     }
+    if (dubEngine === 'vieneu' && !vnDubVoicesLoaded) {
+      (async () => {
+        try {
+          const status = await window.electronAPI?.vieNeuCheckStatus?.();
+          if (!status?.installed) return;
+          const r = await window.electronAPI?.vieNeuGetVoices?.();
+          // voices là mảng tuple [desc, id] từ Python list_preset_voices()
+          if (r?.voices?.length) {
+            setVnDubVoices(r.voices);
+            setVnDubVoicesLoaded(true);
+            const firstId = Array.isArray(r.voices[0]) ? r.voices[0][1] : '';
+            setVnDubVoice(v => v || firstId);
+          }
+        } catch (_) {}
+      })();
+    }
   }, [dubEngine]);
 
   const addSubLog = (text, type = 'info') => {
-    setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text, type }]);
+    setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text, type }]);
     if (type === 'error') setLogOpen(true);
   };
 
@@ -3916,166 +6256,68 @@ function SubtitlePanel() {
     if (!subVideoFile) return alert('Vui lòng chọn video!');
     setIsTranscribing(true);
     setOriginalSRT(''); setRawOriginalSRT(''); setOriginalSegments([]); setTranslatedSRT('');
-    addSubLog('🎙️ Bắt đầu bóc tách SRT — quét toàn bộ video theo từng phần...');
+    const useWhisper = transcribeEngine === 'whisper';
+    addSubLog(`🎙️ Bắt đầu bóc tách SRT — ${useWhisper ? '🤖 Whisper cục bộ' : '✨ Gemini AI'} — quét toàn bộ video...`);
     try {
-      const apiKeys = JSON.parse(localStorage.getItem('fluxy_gemini_api_keys') || '[]');
-      if (!apiKeys.length) { addSubLog('❌ Chưa có API Key Gemini. Vui lòng thêm key trong Cài đặt.', 'error'); setIsTranscribing(false); return; }
-
-      // ── Bước 1: Đọc thông tin video (duration) ──
+      // ── Đọc thông tin video ──
       addSubLog('📏 Đọc thông tin video...');
       const metaRes = await window.electronAPI.prepareAudio(subVideoFile);
       if (!metaRes.success || !metaRes.duration) { addSubLog(`❌ Không đọc được thông tin video: ${metaRes.error || 'duration = 0'}`, 'error'); setIsTranscribing(false); return; }
       const totalDuration = metaRes.duration;
-      const CHUNK_SECS = 60;
-      const totalChunks = Math.ceil(totalDuration / CHUNK_SECS);
       const durMin = Math.floor(totalDuration / 60);
       const durSec = Math.floor(totalDuration % 60);
-      addSubLog(`📹 Thời lượng: ${durMin}p${durSec}s → chia thành ${totalChunks} phần (${CHUNK_SECS}s/phần)`);
 
-      // ── Bước 2: Transcribe từng chunk — quét 100% video ──
-      const result = await transcribeAudioChunked(
-        apiKeys,
-        totalDuration,
-        async (startSec, durationSec) => {
-          // Trích xuất chunk audio từ main process
-          return window.electronAPI.extractAudioChunk({ filePath: subVideoFile, startSec, durationSec });
-        },
-        (msg) => addSubLog(`  ⏳ ${msg}`),
-        (done, total, segCount, errMsg) => {
-          if (errMsg) addSubLog(`  ⚠️ Phần ${done}/${total}: ${errMsg}`, 'warn');
-          else        addSubLog(`  ✅ Phần ${done}/${total}: ${segCount} câu thoại`);
-        },
-        (msg) => addSubLog(msg)
-      );
+      let result;
+
+      if (useWhisper) {
+        // ── Whisper cục bộ ─────────────────────────────────────────────────────
+        const totalChunks = Math.ceil(totalDuration / 30);
+        addSubLog(`📹 Thời lượng: ${durMin}p${durSec}s → ${totalChunks} phần (30s/phần) — Whisper cục bộ`);
+        result = await transcribeLocalChunked(
+          subVideoFile,
+          totalDuration,
+          (msg) => addSubLog(`  ⏳ ${msg}`),
+          (done, total, segCount, errMsg) => {
+            if (errMsg) addSubLog(`  ⚠️ Đoạn ${done}/${total}: ${errMsg}`, 'error');
+            else        addSubLog(`  ✅ Đoạn ${done}/${total}: ${segCount} câu`);
+          },
+          (msg) => addSubLog(msg),
+          (msg) => addSubLog(msg)
+        );
+      } else {
+        // ── Gemini AI ──────────────────────────────────────────────────────────
+        const apiKeys = JSON.parse(localStorage.getItem('fluxy_gemini_api_keys') || '[]');
+        if (!apiKeys.length) { addSubLog('❌ Chưa có API Key Gemini. Vui lòng thêm key trong Cài đặt.', 'error'); setIsTranscribing(false); return; }
+        const totalChunks = Math.ceil(totalDuration / 60);
+        addSubLog(`📹 Thời lượng: ${durMin}p${durSec}s → ${totalChunks} phần (60s/phần) — Gemini AI`);
+        result = await transcribeAudioChunked(
+          apiKeys, totalDuration,
+          async (startSec, durationSec) => window.electronAPI.extractAudioChunk({ filePath: subVideoFile, startSec, durationSec }),
+          (msg) => addSubLog(`  ⏳ ${msg}`),
+          (done, total, segCount, errMsg) => {
+            if (errMsg) addSubLog(`  ⚠️ Phần ${done}/${total}: ${errMsg}`, 'warn');
+            else        addSubLog(`  ✅ Phần ${done}/${total}: ${segCount} câu thoại`);
+          },
+          (msg) => addSubLog(msg)
+        );
+      }
 
       if (!result || !result.segments?.length) {
         addSubLog('❌ Không tìm thấy câu thoại nào trong video.', 'error');
         setIsTranscribing(false); return;
       }
 
-      // ── Bước 3: Xây dựng SRT từ toàn bộ segments đã quét ──
       const srtRaw     = subSegmentsToSRT(result.segments);
       const srtDisplay = subNormalizeSRT(srtRaw, 42, subStyle.wordsPerLine);
       setOriginalSegments(result.segments);
-      setRawOriginalSRT(srtRaw);    // bản gốc đúng timestamp → dùng để dịch & ép phụ đề
-      setOriginalSRT(srtDisplay);   // bản normalize cho hiển thị
+      setRawOriginalSRT(srtRaw);
+      setOriginalSRT(srtDisplay);
       setSubPreviewTab('original');
-      addSubLog(`✅ Hoàn tất! ${result.segments.length} câu thoại từ ${totalChunks} phần — sẵn sàng dịch.`, 'success');
+      addSubLog(`✅ Hoàn tất! ${result.segments.length} câu thoại — sẵn sàng ${enableTranslate ? 'dịch' : 'ép phụ đề'}.`, 'success');
     } catch (e) {
       addSubLog(`❌ Lỗi: ${e.message}`, 'error');
     }
     setIsTranscribing(false);
-  };
-
-  const smartTranslateSRT = async (srtContent, tLang, apiKeys, logFn) => {
-    const langObj = SUBTITLE_LANGUAGES.find(l => l.code === tLang);
-    const langName = langObj?.name || tLang;
-    const countryMap = { vi:'Việt Nam', en:'Anh/Mỹ', zh:'Trung Quốc', ja:'Nhật Bản', ko:'Hàn Quốc', th:'Thái Lan', id:'Indonesia', ms:'Malaysia', fr:'Pháp', de:'Đức', es:'Tây Ban Nha', pt:'Bồ Đào Nha', it:'Ý', ru:'Nga', ar:'Ả Rập', hi:'Ấn Độ' };
-    const country = countryMap[tLang] || langName;
-
-    const callGemini = async (prompt, label) => {
-      return retryWithKeyRotation(async (apiKey) => {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-        });
-        if (!res.ok) { const err = await res.json().catch(() => ({})); const e = new Error(err?.error?.message || `HTTP ${res.status}`); e.status = res.status; throw e; }
-        const data = await res.json();
-        return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      }, apiKeys, { onSwitch: (idx) => logFn(`🔄 [${label}] Chuyển sang API key #${idx + 1}...`) });
-    };
-
-    // Parse SRT thành mảng entries — timestamps lấy từ bản GỐC, không bao giờ từ Gemini
-    const parseSRTEntries = (srt) => {
-      return srt.trim().split(/\n\n+/).map(block => {
-        const lines = block.trim().split('\n');
-        const tlIdx = lines.findIndex(l => /^\d{1,2}:\d{2}:\d{2}[,.]\d{2,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{2,3}/.test(l.trim()));
-        if (tlIdx < 0) return null;
-        return { timeLine: lines[tlIdx].trim(), text: lines.slice(tlIdx + 1).join('\n').trim() };
-      }).filter(Boolean);
-    };
-
-    // Lấy text dịch từ response Gemini (strip markdown, parse entries)
-    const extractTranslatedTexts = (raw, expectedCount) => {
-      const cleaned = raw.replace(/^```[a-z]*\r?\n?/i, '').replace(/\r?\n?```$/i, '').trim();
-      const entries = parseSRTEntries(cleaned);
-      if (entries.length === expectedCount) return entries.map(e => e.text);
-      // fallback: cố gắng lấy từng dòng text (bỏ qua số thứ tự & timestamp)
-      const textLines = cleaned.split('\n').filter(l => l.trim() && !/^\d+$/.test(l.trim()) && !/-->/. test(l));
-      if (textLines.length >= expectedCount) return textLines.slice(0, expectedCount);
-      // nếu vẫn thiếu, trả về những gì có (caller sẽ giữ nguyên text gốc cho phần thiếu)
-      return entries.map(e => e.text);
-    };
-
-    // Parse tất cả entries từ bản gốc
-    const srcEntries = parseSRTEntries(srtContent);
-    if (!srcEntries.length) throw new Error('Không đọc được SRT gốc');
-
-    // ── Bước 1: Phân tích ngữ cảnh ──
-    logFn('🔍 [1/2] Đang phân tích ngữ cảnh & thuật ngữ chuyên môn...');
-    let contextGuide = null;
-    const sampleText = srcEntries.slice(0, 60).map(e => e.text).join('\n');
-    const contextPrompt = `Phân tích nội dung video phụ đề dưới đây. Trả về JSON (chỉ JSON, không giải thích thêm):\n\n{\n  "domain": "lĩnh vực tổng quát",\n  "topic": "chủ đề cụ thể",\n  "tone": "phong cách",\n  "audience": "đối tượng khán giả",\n  "keyTerms": [{ "original": "...", "best_translation_${tLang}": "...", "avoid": "..." }],\n  "styleGuide": "3-5 quy tắc dịch quan trọng nhất cho ${country}"\n}\n\nNỘI DUNG PHỤ ĐỀ:\n${sampleText.substring(0, 4000)}`;
-    try {
-      const contextRaw = await callGemini(contextPrompt, 'Phân tích');
-      const jsonMatch = contextRaw.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        contextGuide = JSON.parse(jsonMatch[0]);
-        logFn(`✅ Nhận diện: ${contextGuide.domain} — "${contextGuide.topic}" (${contextGuide.tone})`);
-        if (contextGuide.keyTerms?.length) logFn(`📚 ${contextGuide.keyTerms.length} thuật ngữ chuyên biệt đã được chuẩn hóa`);
-      }
-    } catch (e) { logFn(`⚠️ Bỏ qua phân tích ngữ cảnh (${e.message.substring(0, 50)}), vẫn tiếp tục dịch...`); }
-
-    // Tạo context header nhỏ gọn để nhúng vào mỗi chunk
-    let contextHeader = '';
-    if (contextGuide) {
-      const termLines = (contextGuide.keyTerms || []).slice(0, 10)
-        .map(t => `"${t.original}"→"${t[`best_translation_${tLang}`] || t.best_translation || ''}"`)
-        .join(', ');
-      contextHeader = `[Ngữ cảnh: ${contextGuide.domain} · ${contextGuide.topic} · ${contextGuide.tone}]\n[Thuật ngữ: ${termLines}]\n[Phong cách: ${contextGuide.styleGuide}]\n\n`;
-    }
-
-    // ── Bước 2: Dịch từng chunk 30 entries ──
-    const CHUNK_SIZE = 30;
-    const chunks = [];
-    for (let i = 0; i < srcEntries.length; i += CHUNK_SIZE) chunks.push(srcEntries.slice(i, i + CHUNK_SIZE));
-    const totalChunks = chunks.length;
-    logFn(`🌐 [2/2] Dịch sang ${langName} — ${totalChunks} phần · ${srcEntries.length} dòng tổng...`);
-
-    const translatedTexts = new Array(srcEntries.length).fill(null);
-
-    for (let ci = 0; ci < totalChunks; ci++) {
-      const chunk = chunks[ci];
-      const startIdx = ci * CHUNK_SIZE;
-      logFn(`  📄 Phần ${ci+1}/${totalChunks}: dòng ${startIdx+1}–${startIdx+chunk.length}...`);
-
-      // Build chunk SRT dùng số thứ tự đơn giản 1..N
-      const chunkSRT = chunk.map((e, i) => `${i+1}\n${e.timeLine}\n${e.text}`).join('\n\n');
-
-      const chunkPrompt = `${contextHeader}NHIỆM VỤ: Dịch ${chunk.length} entry phụ đề SRT sau sang ${langName} (${country}).\n\nQUY TẮC BẮT BUỘC:\n1. GIỮ NGUYÊN định dạng SRT: số thứ tự 1–${chunk.length}, timestamps, dòng trống giữa entry\n2. CHỈ dịch phần text — KHÔNG chạm vào timestamps hay số thứ tự\n3. Dịch tự nhiên như người ${country} nói — KHÔNG máy móc\n4. Kết thúc mỗi entry bằng dấu câu phù hợp (dấu phẩy nếu câu tiếp, dấu chấm/!/?  nếu câu hoàn chỉnh)\n5. Trả về ĐÚNG ${chunk.length} entry — không thêm/bớt, không giải thích\n\nSRT CẦN DỊCH:\n${chunkSRT}`;
-
-      try {
-        const raw = await callGemini(chunkPrompt, `Phần ${ci+1}`);
-        const texts = extractTranslatedTexts(raw, chunk.length);
-        for (let j = 0; j < chunk.length; j++) {
-          translatedTexts[startIdx + j] = texts[j] || chunk[j].text; // fallback: giữ text gốc
-        }
-        logFn(`  ✅ Phần ${ci+1}/${totalChunks}: ${texts.length}/${chunk.length} dòng dịch xong`);
-      } catch (e) {
-        logFn(`  ⚠️ Phần ${ci+1} lỗi (${e.message.slice(0,50)}) → giữ text gốc cho ${chunk.length} dòng`);
-        for (let j = 0; j < chunk.length; j++) translatedTexts[startIdx + j] = chunk[j].text;
-      }
-
-      // Nghỉ nhỏ giữa các chunk để không spam API
-      if (ci < totalChunks - 1) await new Promise(r => setTimeout(r, 300));
-    }
-
-    // ── Ghép lại: timestamp luôn từ BẢN GỐC, text từ bản dịch ──
-    const finalSRT = srcEntries.map((e, i) =>
-      `${i+1}\n${e.timeLine}\n${translatedTexts[i] ?? e.text}`
-    ).join('\n\n') + '\n';
-
-    return finalSRT;
   };
 
   const handleTranslate = async () => {
@@ -4150,19 +6392,16 @@ function SubtitlePanel() {
     const segments = subParseSRTtoSegments(srtContent);
     if (!segments.length) return alert('Không đọc được dữ liệu SRT!');
 
-    const isEdge = dubEngine === 'edge';
-    const voiceLabel = isEdge ? edgeDubVoice.split('-').pop() : dubVoice;
-
-    if (!isEdge) {
-      const apiKeys = JSON.parse(localStorage.getItem('fluxy_gemini_api_keys') || '[]');
-      if (!apiKeys.length) return alert('Cần API Key Gemini để lồng tiếng! Thêm key trong Creator.');
-    }
+    const isEdge    = dubEngine === 'edge';
+    const isVieNeu  = dubEngine === 'vieneu';
+    const voiceLabel = isEdge ? edgeDubVoice.split('-').pop() : isVieNeu ? (vnDubVoice || 'VieNeu') : dubVoice;
 
     setIsDubbing(true); setDubbedVideoPath(''); setLogOpen(true);
-    setDubProgress({ done: 0, total: segments.length, text: `Khởi động ${isEdge ? 'Edge TTS' : 'Gemini TTS'}...` });
-    addSubLog(`🎙️ Lồng tiếng ${isEdge ? 'Edge TTS' : 'Gemini TTS'} — ${voiceLabel} · ${segments.length} đoạn...`);
+    const engineLabel = isEdge ? 'Edge TTS' : 'VieNeu TTS';
+    setDubProgress({ done: 0, total: segments.length, text: `Khởi động ${engineLabel}...` });
+    addSubLog(`🎙️ Lồng tiếng ${engineLabel} — ${voiceLabel} · ${segments.length} đoạn...`);
     try {
-      const ext = isEdge ? 'mp3' : 'wav';
+      const ext = isVieNeu ? 'wav' : 'mp3';
       const audioPath = buildOutputPath(`lotieng_${voiceLabel}_audio`, ext);
       addSubLog(`💾 Audio sẽ lưu: ${audioPath.split('\\').pop()}`);
 
@@ -4170,8 +6409,7 @@ function SubtitlePanel() {
       if (isEdge) {
         ttsResult = await window.electronAPI.generateSRTVoice({ segments, voice: edgeDubVoice, outputPath: audioPath });
       } else {
-        const apiKeys = JSON.parse(localStorage.getItem('fluxy_gemini_api_keys') || '[]');
-        ttsResult = await window.electronAPI.geminiTTSSRT({ segments, voiceName: dubVoice, apiKeys, outputPath: audioPath });
+        ttsResult = await window.electronAPI.vieNeuSynthesizeSRT({ segments, voiceId: vnDubVoice || undefined, outputPath: audioPath });
       }
 
       if (!ttsResult.success) {
@@ -4184,7 +6422,7 @@ function SubtitlePanel() {
       const videoPath = buildOutputPath(`lotieng_${voiceLabel}`, 'mp4');
       const mixResult = await window.electronAPI.mixAudio({
         videoPath: subVideoFile, audioPath: ttsResult.path,
-        outputPath: videoPath, videoVol: 0.3, audioVol: 1.0
+        outputPath: videoPath, videoVol: 0, audioVol: 1.0
       });
       if (mixResult.success) {
         setDubbedVideoPath(mixResult.path); setSubPreviewTab('dubbed');
@@ -4206,9 +6444,10 @@ function SubtitlePanel() {
 
     const langObj    = SUBTITLE_LANGUAGES.find(l => l.code === targetLang);
     const langName   = langObj?.name || targetLang;
-    const totalSteps = 3 + (burnSubtitle ? 1 : 0) + (dubEnabled ? 1 : 0);
+    const useWhisperAll = transcribeEngine === 'whisper';
+    const totalSteps = 2 + (enableTranslate ? 1 : 0) + (burnSubtitle ? 1 : 0) + (dubEnabled ? 1 : 0);
 
-    addSubLog(`🚀 Bắt đầu toàn bộ quy trình — ${totalSteps} bước · lưu vào: ${subOutputFolder.split('\\').pop()}`);
+    addSubLog(`🚀 Bắt đầu toàn bộ quy trình — ${totalSteps} bước · ${useWhisperAll ? 'Whisper cục bộ' : 'Gemini AI'} · lưu vào: ${subOutputFolder.split('\\').pop()}`);
 
     try {
       // ── BƯỚC 1: Lưu audio gốc ──
@@ -4218,54 +6457,76 @@ function SubtitlePanel() {
       if (audioSave.success) { setSavedAudioPath(audioSave.filePath); addSubLog(`  💾 ${audioSave.filePath.split('\\').pop()}`, 'success'); }
       else addSubLog(`  ⚠️ Lưu audio gốc thất bại: ${audioSave.error}`, 'error');
 
-      // ── BƯỚC 2: Phiên âm → SRT gốc (chunked — quét 100% video) ──
-      addSubLog(`🎙️ [2/${totalSteps}] Phiên âm → SRT gốc (quét toàn bộ video theo từng phần)...`);
+      // ── BƯỚC 2: Phiên âm → SRT gốc ──
+      addSubLog(`🎙️ [2/${totalSteps}] Phiên âm → SRT gốc (${useWhisperAll ? '🤖 Whisper cục bộ' : '✨ Gemini AI'})...`);
       const metaRes2 = await window.electronAPI.prepareAudio(subVideoFile);
       if (!metaRes2.success || !metaRes2.duration) { addSubLog(`❌ Không đọc được thông tin video.`, 'error'); setIsRunningAll(false); return; }
       const dur2 = metaRes2.duration;
-      const chunks2 = Math.ceil(dur2 / 60);
-      addSubLog(`  📹 ${Math.floor(dur2/60)}p${Math.floor(dur2%60)}s → ${chunks2} phần...`);
-      const transcribeResult = await transcribeAudioChunked(
-        apiKeys, dur2,
-        async (startSec, durationSec) => window.electronAPI.extractAudioChunk({ filePath: subVideoFile, startSec, durationSec }),
-        (msg) => addSubLog(`  ⏳ ${msg}`),
-        (done, total, segCount, errMsg) => {
-          if (errMsg) addSubLog(`  ⚠️ Phần ${done}/${total}: ${errMsg}`);
-          else        addSubLog(`  ✅ Phần ${done}/${total}: ${segCount} câu`);
-        },
-        (msg) => addSubLog(msg)
-      );
+      addSubLog(`  📹 ${Math.floor(dur2/60)}p${Math.floor(dur2%60)}s...`);
+
+      let transcribeResult;
+      if (useWhisperAll) {
+        transcribeResult = await transcribeLocalChunked(
+          subVideoFile, dur2,
+          (msg) => addSubLog(`  ⏳ ${msg}`),
+          (done, total, segCount, errMsg) => {
+            if (errMsg) addSubLog(`  ⚠️ Đoạn ${done}/${total}: ${errMsg}`, 'error');
+            else        addSubLog(`  ✅ Đoạn ${done}/${total}: ${segCount} câu`);
+          },
+          (msg) => addSubLog(msg),
+          (msg) => addSubLog(msg)
+        );
+      } else {
+        if (!apiKeys.length) { addSubLog('❌ Chưa có API Key Gemini.', 'error'); setIsRunningAll(false); return; }
+        transcribeResult = await transcribeAudioChunked(
+          apiKeys, dur2,
+          async (startSec, durationSec) => window.electronAPI.extractAudioChunk({ filePath: subVideoFile, startSec, durationSec }),
+          (msg) => addSubLog(`  ⏳ ${msg}`),
+          (done, total, segCount, errMsg) => {
+            if (errMsg) addSubLog(`  ⚠️ Phần ${done}/${total}: ${errMsg}`);
+            else        addSubLog(`  ✅ Phần ${done}/${total}: ${segCount} câu`);
+          },
+          (msg) => addSubLog(msg)
+        );
+      }
+
       if (!transcribeResult?.segments?.length) { addSubLog('❌ Không nhận được kết quả phiên âm.', 'error'); setIsRunningAll(false); return; }
       const srtRaw = subSegmentsToSRT(transcribeResult.segments);
       setOriginalSegments(transcribeResult.segments);
       setRawOriginalSRT(srtRaw);
       setOriginalSRT(subNormalizeSRT(srtRaw, 42, subStyle.wordsPerLine));
       setSubPreviewTab('original');
-      // Lưu SRT gốc
       const srtGocPath = buildOutputPath('srt_goc', 'srt');
       await window.electronAPI.saveTextFile({ content: srtRaw, filePath: srtGocPath });
       addSubLog(`  💾 SRT gốc: ${srtGocPath.split('\\').pop()} (${transcribeResult.segments.length} câu thoại)`, 'success');
 
-      // ── BƯỚC 3: Dịch → SRT dịch ──
-      addSubLog(`🧠 [3/${totalSteps}] Dịch sang ${langName}...`);
-      const translatedRaw = await smartTranslateSRT(srtRaw, targetLang, apiKeys, (msg) => addSubLog(`  ${msg}`));
-      const translatedText = translatedRaw.trim();
-      const srcCount = (srtRaw.trim().match(/\n\n/g) || []).length + 1;
-      const dstCount = (translatedText.match(/\n\n/g) || []).length + 1;
-      setTranslatedSRT(translatedText); setSubPreviewTab('translated');
-      // Lưu SRT dịch
-      const srtDichPath = buildOutputPath(`srt_dich_${targetLang}`, 'srt');
-      await window.electronAPI.saveTextFile({ content: translatedText, filePath: srtDichPath });
-      addSubLog(`  💾 SRT dịch: ${srtDichPath.split('\\').pop()} — ${dstCount}/${srcCount} entry ${dstCount === srcCount ? '✅' : '⚠️'}`, 'success');
+      // ── BƯỚC 3: Dịch → SRT dịch (chỉ khi enableTranslate) ──
+      let srtForBurn = srtRaw; // mặc định dùng SRT gốc để ép
+      if (enableTranslate) {
+        if (!apiKeys.length) { addSubLog('❌ Chưa có API Key Gemini để dịch.', 'error'); setIsRunningAll(false); return; }
+        addSubLog(`🧠 [3/${totalSteps}] Dịch sang ${langName}...`);
+        const translatedRaw = await smartTranslateSRT(srtRaw, targetLang, apiKeys, (msg) => addSubLog(`  ${msg}`));
+        const translatedText = translatedRaw.trim();
+        const srcCount = (srtRaw.trim().match(/\n\n/g) || []).length + 1;
+        const dstCount = (translatedText.match(/\n\n/g) || []).length + 1;
+        setTranslatedSRT(translatedText); setSubPreviewTab('translated');
+        const srtDichPath = buildOutputPath(`srt_dich_${targetLang}`, 'srt');
+        await window.electronAPI.saveTextFile({ content: translatedText, filePath: srtDichPath });
+        addSubLog(`  💾 SRT dịch: ${srtDichPath.split('\\').pop()} — ${dstCount}/${srcCount} entry ${dstCount === srcCount ? '✅' : '⚠️'}`, 'success');
+        srtForBurn = translatedText;
+      } else {
+        addSubLog(`⏭️ Bỏ qua dịch — dùng SRT gốc để ép phụ đề`, 'info');
+      }
 
-      // ── BƯỚC 4: Ép phụ đề (nếu bật) ──
+      // ── BƯỚC tiếp theo: Ép phụ đề (nếu bật) ──
+      const burnStep = enableTranslate ? 4 : 3;
       let burnedPath = '';
-      if (burnSubtitle && translatedText) {
-        addSubLog(`🔥 [4/${totalSteps}] Ép phụ đề vào video...`);
-        const srtForBurn = subWrapSRTLines(translatedText, subStyle.wordsPerLine, 42);
-        const phuDePath  = buildOutputPath('phu_de', 'mp4');
+      if (burnSubtitle && srtForBurn) {
+        addSubLog(`🔥 [${burnStep}/${totalSteps}] Ép phụ đề ${enableTranslate ? 'dịch' : 'gốc'} vào video...`);
+        const srtWrapped = subWrapSRTLines(srtForBurn, subStyle.wordsPerLine, 42);
+        const phuDePath  = buildOutputPath(enableTranslate ? 'phu_de' : 'phu_de_goc', 'mp4');
         const burnResult = await window.electronAPI.burnSubtitles({
-          videoPath: subVideoFile, srtContent: srtForBurn,
+          videoPath: subVideoFile, srtContent: srtWrapped,
           outputFolder: subOutputFolder, outputPath: phuDePath, style: subStyle
         });
         if (burnResult.success) {
@@ -4275,17 +6536,18 @@ function SubtitlePanel() {
         } else { addSubLog(`  ⚠️ Ép phụ đề thất bại: ${burnResult.error}`, 'error'); }
       }
 
-      // ── BƯỚC 5: Lồng tiếng (nếu bật) ──
-      if (dubEnabled && translatedText) {
-        const isEdge = dubEngine === 'edge';
-        const voiceLabel = isEdge ? edgeDubVoice.split('-').pop() : dubVoice;
-        const dubStep = burnSubtitle ? 5 : 4;
-        const dubSegs = subParseSRTtoSegments(translatedText);
-        addSubLog(`🎙️ [${dubStep}/${totalSteps}] Lồng tiếng ${isEdge ? 'Edge TTS' : 'Gemini TTS'} (${voiceLabel}) · ${dubSegs.length} đoạn...`);
+      // ── BƯỚC Lồng tiếng (nếu bật) ──
+      if (dubEnabled && srtForBurn) {
+        const isEdge   = dubEngine === 'edge';
+        const isVN     = dubEngine === 'vieneu';
+        const voiceLabel = isEdge ? edgeDubVoice.split('-').pop() : isVN ? (vnDubVoice || 'VieNeu') : dubVoice;
+        const dubStep = burnSubtitle ? burnStep + 1 : burnStep;
+        const dubSegs = subParseSRTtoSegments(srtForBurn);
+        addSubLog(`🎙️ [${dubStep}/${totalSteps}] Lồng tiếng ${isEdge ? 'Edge TTS' : 'VieNeu TTS'} (${voiceLabel}) · ${dubSegs.length} đoạn...`);
         setDubProgress({ done: 0, total: dubSegs.length, text: 'Khởi động...' });
 
         // 5a. Tạo file audio lồng tiếng
-        const ext = isEdge ? 'mp3' : 'wav';
+        const ext = isVN ? 'wav' : 'mp3';
         const audioLotiengPath = buildOutputPath(`lotieng_${voiceLabel}_audio`, ext);
         addSubLog(`  💾 Audio sẽ lưu: ${audioLotiengPath.split('\\').pop()}`);
 
@@ -4293,7 +6555,7 @@ function SubtitlePanel() {
         if (isEdge) {
           ttsResult = await window.electronAPI.generateSRTVoice({ segments: dubSegs, voice: edgeDubVoice, outputPath: audioLotiengPath });
         } else {
-          ttsResult = await window.electronAPI.geminiTTSSRT({ segments: dubSegs, voiceName: dubVoice, apiKeys, outputPath: audioLotiengPath });
+          ttsResult = await window.electronAPI.vieNeuSynthesizeSRT({ segments: dubSegs, voiceId: vnDubVoice || undefined, outputPath: audioLotiengPath });
         }
 
         if (!ttsResult.success) {
@@ -4308,7 +6570,7 @@ function SubtitlePanel() {
           const finalVideoPath = buildOutputPath(finalSuffix, 'mp4');
           const mixResult = await window.electronAPI.mixAudio({
             videoPath: videoForMix, audioPath: ttsResult.path,
-            outputPath: finalVideoPath, videoVol: 0.3, audioVol: 1.0
+            outputPath: finalVideoPath, videoVol: 0, audioVol: 1.0
           });
           if (mixResult.success) {
             setDubbedVideoPath(mixResult.path); setSubPreviewTab('dubbed');
@@ -4335,14 +6597,26 @@ function SubtitlePanel() {
             <h2 className="text-sm font-bold text-white uppercase tracking-wider">Bóc tách &amp; Dịch Phụ đề</h2>
           </div>
           <div className="p-5 flex-1 overflow-y-auto space-y-5">
-            {/* Chọn video */}
+            {/* Chọn video / audio */}
             <div>
-              <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest mb-2 block">Video nguồn</label>
-              <button onClick={async () => { const p = await window.electronAPI.selectFile('video'); if (p) { setSubVideoFile(p); setSavedAudioPath(''); setOriginalSRT(''); setRawOriginalSRT(''); setTranslatedSRT(''); setOriginalSegments([]); } }}
-                className={`w-full h-24 border-2 border-dashed rounded-xl flex flex-col items-center justify-center gap-2 transition-colors ${subVideoFile ? 'border-amber-500/50 bg-amber-900/10' : 'border-slate-700 bg-[#0f172a] hover:bg-slate-800'}`}>
-                <div className={`p-2 rounded-full ${subVideoFile ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-800 text-slate-400'}`}><UploadCloud size={20} /></div>
-                <p className={`text-xs font-bold truncate w-[280px] text-center px-2 ${subVideoFile ? 'text-amber-400' : 'text-slate-300'}`}>{subVideoFile ? subVideoFile.split('\\').pop() : 'Nhấn để chọn file video'}</p>
-              </button>
+              <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest mb-2 block">Video / Audio nguồn</label>
+              <div className="flex gap-2 mb-2">
+                <button onClick={async () => { const p = await window.electronAPI.selectFile('video'); if (p) { setSubVideoFile(p); setSavedAudioPath(''); setOriginalSRT(''); setRawOriginalSRT(''); setTranslatedSRT(''); setOriginalSegments([]); } }}
+                  className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 border border-slate-700">
+                  <UploadCloud size={13}/> Chọn Video
+                </button>
+                <button onClick={async () => { const p = await window.electronAPI.selectFile('audio'); if (p) { setSubVideoFile(p); setSavedAudioPath(p); setOriginalSRT(''); setRawOriginalSRT(''); setTranslatedSRT(''); setOriginalSegments([]); } }}
+                  className="flex-1 py-2 bg-amber-800/60 hover:bg-amber-700/60 text-amber-300 text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 border border-amber-700/50">
+                  <Mic size={13}/> Chọn Audio
+                </button>
+              </div>
+              {subVideoFile && (
+                <div className={`w-full px-3 py-2 border rounded-lg flex items-center gap-2 ${savedAudioPath === subVideoFile ? 'border-amber-500/40 bg-amber-900/10' : 'border-slate-700 bg-[#0f172a]'}`}>
+                  <div className={`p-1 rounded-full shrink-0 ${savedAudioPath === subVideoFile ? 'text-amber-400' : 'text-slate-400'}`}><UploadCloud size={14}/></div>
+                  <p className="text-xs font-bold truncate text-amber-400">{subVideoFile.split('\\').pop()}</p>
+                  {savedAudioPath === subVideoFile && <span className="text-[10px] text-amber-500 shrink-0 ml-auto">🎵 Audio</span>}
+                </div>
+              )}
             </div>
             {/* Thư mục lưu */}
             <div>
@@ -4352,8 +6626,8 @@ function SubtitlePanel() {
                 <button onClick={async () => { const f = await window.electronAPI.selectFolder(); if (f) setSubOutputFolder(f); }} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-2 rounded-lg"><FolderOpen size={15} /></button>
               </div>
             </div>
-            {/* Bước 1 — Bóc tách Audio */}
-            <div className="border border-slate-700 rounded-xl p-4 bg-[#0f172a]/50">
+            {/* Bước 1 — Bóc tách Audio (ẩn nếu đã chọn file audio trực tiếp) */}
+            {savedAudioPath !== subVideoFile && <div className="border border-slate-700 rounded-xl p-4 bg-[#0f172a]/50">
               <p className="text-xs font-bold text-slate-400 mb-3 flex items-center gap-2"><Mic size={14} className="text-amber-400"/> Bước 1 — Bóc tách Audio</p>
               <button onClick={handleExtractAudio} disabled={isExtractingAudio || !subVideoFile || !subOutputFolder}
                 className="w-full bg-amber-700 hover:bg-amber-600 disabled:bg-slate-700 text-white font-bold py-2.5 rounded-lg flex items-center justify-center gap-2 text-sm transition-colors">
@@ -4365,39 +6639,70 @@ function SubtitlePanel() {
                   <span className="shrink-0">✅</span><span className="truncate cursor-pointer hover:underline" onClick={() => window.electronAPI.openFile(savedAudioPath)}>{savedAudioPath.split('\\').pop()}</span>
                 </p>
               )}
-            </div>
+            </div>}
             {/* Bước 2 — Tạo SRT */}
-            <div className="border border-slate-700 rounded-xl p-4 bg-[#0f172a]/50">
-              <p className="text-xs font-bold text-slate-400 mb-3 flex items-center gap-2"><FileText size={14} className="text-sky-400"/> Bước 2 — Tạo SRT gốc (Gemini 2.5)</p>
+            <div className="border border-slate-700 rounded-xl p-4 bg-[#0f172a]/50 space-y-3">
+              <p className="text-xs font-bold text-slate-400 flex items-center gap-2"><FileText size={14} className="text-sky-400"/> Bước 2 — Tạo SRT gốc</p>
+              {/* Engine toggle */}
+              <div className="flex rounded-lg overflow-hidden border border-slate-700/60">
+                <button onClick={() => setTranscribeEngine('gemini')}
+                  className={`flex-1 py-1.5 text-[10px] font-bold transition-colors ${transcribeEngine === 'gemini' ? 'bg-sky-600 text-white' : 'bg-slate-800/50 text-slate-500 hover:text-slate-300'}`}>
+                  ✨ Gemini AI
+                </button>
+                <button onClick={() => setTranscribeEngine('whisper')}
+                  className={`flex-1 py-1.5 text-[10px] font-bold transition-colors ${transcribeEngine === 'whisper' ? 'bg-emerald-600 text-white' : 'bg-slate-800/50 text-slate-500 hover:text-slate-300'}`}>
+                  🤖 Whisper cục bộ
+                </button>
+              </div>
+              {transcribeEngine === 'whisper' && (
+                <p className="text-[9px] text-emerald-400/80">✅ Offline · không cần API key · tốt nhất cho tiếng Anh</p>
+              )}
+              {transcribeEngine === 'gemini' && (
+                <p className="text-[9px] text-sky-400/80">✅ Cloud · cần API key · tốt nhất cho tiếng Việt</p>
+              )}
               <button onClick={handleTranscribe} disabled={isTranscribing || !subVideoFile}
                 className="w-full bg-sky-700 hover:bg-sky-600 disabled:bg-slate-700 text-white font-bold py-2.5 rounded-lg flex items-center justify-center gap-2 text-sm transition-colors">
                 {isTranscribing ? <Loader2 size={15} className="animate-spin" /> : <FileText size={15} />}
-                {isTranscribing ? 'ĐANG PHIÊN ÂM...' : 'Tạo SRT từ Video'}
+                {isTranscribing ? 'ĐANG PHIÊN ÂM...' : `Tạo SRT (${transcribeEngine === 'whisper' ? 'Whisper' : 'Gemini'})`}
               </button>
             </div>
             {/* Bước 3 — Dịch Thông Minh */}
             <div className="border border-purple-500/20 rounded-xl p-4 bg-purple-900/5 space-y-3">
-              <p className="text-xs font-bold text-purple-300 flex items-center gap-2"><Languages size={14} className="text-purple-400"/> Bước 3 — Dịch Thông Minh AI</p>
-              <div className="flex gap-1.5">
-                <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-blue-900/40 border border-blue-500/30 text-blue-300">① Phân tích ngữ cảnh</span>
-                <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-purple-900/40 border border-purple-500/30 text-purple-300">② Dịch chuẩn bản ngữ</span>
-              </div>
-              <div>
-                <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest mb-1.5 block">Ngôn ngữ đích</label>
-                <div className="relative">
-                  <select value={targetLang} onChange={e => setTargetLang(e.target.value)}
-                    className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none appearance-none pr-8">
-                    {SUBTITLE_LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
-                  </select>
-                  <ChevronDown size={14} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none"/>
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-bold text-purple-300 flex items-center gap-2"><Languages size={14} className="text-purple-400"/> Bước 3 — Dịch Thông Minh AI</p>
+                <div onClick={() => setEnableTranslate(v => !v)} className={`w-9 h-5 rounded-full transition-colors relative cursor-pointer shrink-0 ${enableTranslate ? 'bg-purple-500' : 'bg-slate-700'}`}>
+                  <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${enableTranslate ? 'left-4' : 'left-0.5'}`}/>
                 </div>
               </div>
-              <button onClick={handleTranslate} disabled={isTranslating || isRunningAll || !originalSRT}
-                className="w-full bg-gradient-to-r from-purple-700 to-indigo-700 hover:from-purple-600 hover:to-indigo-600 disabled:from-slate-700 disabled:to-slate-700 text-white font-bold py-2.5 rounded-lg flex items-center justify-center gap-2 text-sm transition-all">
-                {isTranslating ? <Loader2 size={15} className="animate-spin" /> : <Languages size={15} />}
-                {isTranslating ? 'ĐANG PHÂN TÍCH & DỊCH...' : 'Dịch Thông Minh (AI)'}
-              </button>
-              {!originalSRT && <p className="text-[10px] text-slate-600 text-center">Cần tạo SRT gốc trước</p>}
+              {!enableTranslate ? (
+                <div className="bg-slate-800/40 border border-slate-700/40 rounded-lg px-3 py-2 text-center">
+                  <p className="text-[10px] text-slate-400">⏭️ Bỏ qua dịch — giữ nguyên SRT gốc để ép phụ đề</p>
+                  <p className="text-[9px] text-slate-600 mt-0.5">Video nói gì → sub hiện đúng nội dung đó</p>
+                </div>
+              ) : (
+                <>
+                  <div className="flex gap-1.5">
+                    <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-blue-900/40 border border-blue-500/30 text-blue-300">① Phân tích ngữ cảnh</span>
+                    <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-purple-900/40 border border-purple-500/30 text-purple-300">② Dịch chuẩn bản ngữ</span>
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest mb-1.5 block">Ngôn ngữ đích</label>
+                    <div className="relative">
+                      <select value={targetLang} onChange={e => setTargetLang(e.target.value)}
+                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none appearance-none pr-8">
+                        {SUBTITLE_LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
+                      </select>
+                      <ChevronDown size={14} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none"/>
+                    </div>
+                  </div>
+                  <button onClick={handleTranslate} disabled={isTranslating || isRunningAll || !originalSRT}
+                    className="w-full bg-gradient-to-r from-purple-700 to-indigo-700 hover:from-purple-600 hover:to-indigo-600 disabled:from-slate-700 disabled:to-slate-700 text-white font-bold py-2.5 rounded-lg flex items-center justify-center gap-2 text-sm transition-all">
+                    {isTranslating ? <Loader2 size={15} className="animate-spin" /> : <Languages size={15} />}
+                    {isTranslating ? 'ĐANG PHÂN TÍCH & DỊCH...' : 'Dịch Thông Minh (AI)'}
+                  </button>
+                  {!originalSRT && <p className="text-[10px] text-slate-600 text-center">Cần tạo SRT gốc trước</p>}
+                </>
+              )}
             </div>
             {/* Bước 4 — Ép phụ đề */}
             <div className="border border-orange-500/20 rounded-xl p-4 bg-orange-900/5 space-y-3">
@@ -4489,52 +6794,51 @@ function SubtitlePanel() {
                 <div className="space-y-2">
                   {/* Engine toggle */}
                   <div className="flex gap-1">
-                    <button onClick={() => setDubEngine('gemini')}
-                      className={`flex-1 py-1.5 rounded text-[10px] font-bold border transition-colors ${dubEngine === 'gemini' ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'}`}>
-                      ✨ Gemini TTS
-                    </button>
                     <button onClick={() => setDubEngine('edge')}
                       className={`flex-1 py-1.5 rounded text-[10px] font-bold border transition-colors ${dubEngine === 'edge' ? 'bg-cyan-600 border-cyan-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'}`}>
                       🔵 Edge TTS
                     </button>
+                    <button onClick={() => setDubEngine('vieneu')}
+                      className={`flex-1 py-1.5 rounded text-[10px] font-bold border transition-colors ${dubEngine === 'vieneu' ? 'bg-orange-600 border-orange-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'}`}>
+                      🎙️ VieNeu TTS
+                    </button>
                   </div>
 
-                  {/* ── Gemini voice picker ── */}
-                  {dubEngine === 'gemini' && (
-                    <>
-                      <div className="flex gap-1">
-                        {[['all','Tất cả'],['female','Nữ'],['male','Nam'],['neutral','Trung tính']].map(([v,l]) => (
-                          <button key={v} onClick={() => setDubGenderFilter(v)}
-                            className={`flex-1 py-1 rounded text-[9px] font-bold border transition-colors ${dubGenderFilter === v ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'}`}>{l}</button>
-                        ))}
-                      </div>
-                      <select value={dubVoice} onChange={e => setDubVoice(e.target.value)}
-                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-blue-500">
-                        {dubGenderFilter === 'all' ? (
-                          <>
-                            <optgroup label="👩 Giọng Nữ">
-                              {GEMINI_VOICES_DUB.filter(v => v.gender === 'female').map(v => (
-                                <option key={v.id} value={v.id}>👩 {v.id} — {v.style}</option>
-                              ))}
-                            </optgroup>
-                            <optgroup label="👨 Giọng Nam">
-                              {GEMINI_VOICES_DUB.filter(v => v.gender === 'male').map(v => (
-                                <option key={v.id} value={v.id}>👨 {v.id} — {v.style}</option>
-                              ))}
-                            </optgroup>
-                            <optgroup label="🧑 Trung tính">
-                              {GEMINI_VOICES_DUB.filter(v => v.gender === 'neutral').map(v => (
-                                <option key={v.id} value={v.id}>🧑 {v.id} — {v.style}</option>
-                              ))}
-                            </optgroup>
-                          </>
-                        ) : (
-                          GEMINI_VOICES_DUB.filter(v => v.gender === dubGenderFilter).map(v => (
-                            <option key={v.id} value={v.id}>{v.gender === 'female' ? '👩' : v.gender === 'male' ? '👨' : '🧑'} {v.id} — {v.style}</option>
-                          ))
-                        )}
-                      </select>
-                    </>
+                  {/* ── VieNeu voice picker ── */}
+                  {dubEngine === 'vieneu' && (
+                    <div className="space-y-1.5">
+                      {vnDubVoices.length === 0 ? (
+                        <p className="text-[10px] text-slate-500 italic px-1">Đang tải giọng... (VieNeu cần được cài)</p>
+                      ) : (
+                        <div className="max-h-40 overflow-y-auto space-y-1 pr-0.5">
+                          {vnDubVoices.map(([desc, id]) => (
+                            <div key={id} className={`flex items-center gap-1.5 px-2 py-1.5 rounded-lg border transition-all ${vnDubVoice === id ? 'bg-orange-600/20 border-orange-500/50' : 'bg-slate-800/40 border-slate-700/40 hover:border-slate-600'}`}>
+                              <button onClick={() => setVnDubVoice(id)} className="flex-1 text-left text-[10px] text-slate-300 truncate">
+                                {vnDubVoice === id && <span className="text-orange-400 mr-1">✓</span>}{desc}
+                              </button>
+                              <button
+                                disabled={!!vnDubPreviewing}
+                                onClick={async () => {
+                                  if (!subOutputFolder) { alert('Chọn thư mục lưu trước để nghe thử giọng.'); return; }
+                                  setVnDubPreviewing(id); setVnDubPreviewUrl('');
+                                  const tmp = `${subOutputFolder}\\vnprev_${id}_${Date.now()}.wav`;
+                                  try {
+                                    const r = await window.electronAPI?.vieNeuSynthesize?.({ text: 'Xin chào, đây là giọng VieNeu thử nghiệm.', outputPath: tmp, voiceId: id });
+                                    if (r?.success) setVnDubPreviewUrl(`file:///${r.path.replace(/\\/g,'/')}`);
+                                  } catch(_) {}
+                                  finally { setVnDubPreviewing(''); }
+                                }}
+                                className="shrink-0 flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded bg-slate-700 hover:bg-orange-600/40 text-slate-400 hover:text-orange-300 transition-colors disabled:opacity-40">
+                                {vnDubPreviewing === id ? <span className="animate-spin inline-block">⟳</span> : '▶'}
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {vnDubPreviewUrl && (
+                        <audio key={vnDubPreviewUrl} controls autoPlay src={vnDubPreviewUrl} className="w-full h-7 mt-1"/>
+                      )}
+                    </div>
                   )}
 
                   {/* ── Edge TTS voice picker ── */}
@@ -4588,7 +6892,7 @@ function SubtitlePanel() {
                     </>
                   )}
 
-                  <p className="text-[9px] text-slate-500">🔊 Tiếng gốc giảm 30% · Voice lồng tiếng giữ nguyên 100%</p>
+                  <p className="text-[9px] text-slate-500">🔇 Tiếng gốc tắt · Voice lồng tiếng 100%</p>
                   {isDubbing && dubProgress.total > 0 && (
                     <div>
                       <div className="flex justify-between text-[9px] text-blue-400 font-bold mb-1">
@@ -4635,7 +6939,7 @@ function SubtitlePanel() {
               {isRunningAll ? 'ĐANG XỬ LÝ...' : '▶ BẮT ĐẦU TOÀN BỘ'}
             </button>
             <p className="text-[10px] text-slate-500 text-center mt-2">
-              {['SRT gốc → Dịch AI', burnSubtitle && '→ 🔥 Ép phụ đề', dubEnabled && `→ 🎙️ Lồng tiếng (${dubEngine === 'edge' ? edgeDubVoice.split('-').pop() : dubVoice})`].filter(Boolean).join(' ')}
+              {['SRT gốc → Dịch AI', burnSubtitle && '→ 🔥 Ép phụ đề', dubEnabled && `→ 🎙️ Lồng tiếng (${dubEngine === 'edge' ? edgeDubVoice.split('-').pop() : dubEngine === 'vieneu' ? (vnDubVoice || 'VieNeu') : dubVoice})`].filter(Boolean).join(' ')}
             </p>
           </div>
         </div>
@@ -4721,7 +7025,7 @@ function SubtitlePanel() {
                       className="w-full max-h-full rounded-xl border border-blue-500/30 bg-black shadow-lg shadow-blue-900/20" style={{ maxHeight: 'calc(100% - 56px)' }}/>
                     <div className="flex items-center gap-3 shrink-0">
                       <p className="text-[10px] text-slate-500 truncate">{dubbedVideoPath.split('\\').pop()}</p>
-                      <span className="text-[9px] text-blue-400 bg-blue-900/30 border border-blue-500/30 px-2 py-0.5 rounded-full font-bold shrink-0">{burnedVideoPath ? '✅ Phụ đề + Lồng tiếng · Tiếng gốc 30%' : `🎙️ Gemini ${dubVoice} · Tiếng gốc 30%`}</span>
+                      <span className="text-[9px] text-blue-400 bg-blue-900/30 border border-blue-500/30 px-2 py-0.5 rounded-full font-bold shrink-0">{burnedVideoPath ? '✅ Phụ đề + Lồng tiếng · Tiếng gốc tắt' : `🎙️ Gemini ${dubVoice} · Tiếng gốc tắt`}</span>
                     </div>
                   </>
                 ) : (
@@ -4919,6 +7223,11 @@ const U2V_STYLES = [
 
 function UrlToVideoPanel() {
   const [apiKeys]       = useState(loadKeys);
+  const [aiMode,     setAiMode]    = useState('gemini');
+  const [claudeKey]  = useState(loadClaudeKey);
+  const [claudeModel] = useState(loadClaudeModel);
+  const [groqKeys]   = useState(loadGroqKeys);
+  const [groqModel]  = useState(loadGroqModel);
   const [inputMode, setInputMode] = useState('url');   // 'url' | 'upload'
   const [videoUrl,  setVideoUrl]  = useState('');
   const [uploadedFile, setUploadedFile] = useState(null);   // File object from <input type="file">
@@ -5015,8 +7324,8 @@ function UrlToVideoPanel() {
       }
       addLog(clean, data.type === 'error' ? 'error' : data.type === 'success' ? 'success' : 'info');
     };
-    window.electronAPI?.onVeoLog?.(handler);
-    return () => window.electronAPI?.removeAllListeners?.('veo-log');
+    const _w = window.electronAPI?.onVeoLog?.(handler);
+    return () => { if (_w) window.electronAPI?.removeListener?.('veo-log', _w); };
   }, [running]);
 
   const addLog = useCallback((text, type = 'info') => {
@@ -5256,7 +7565,8 @@ function UrlToVideoPanel() {
       const envDnaTaskMap  = new Map(); // taskId → envId
       let _dnaIdx = 1;
 
-      charIds.forEach((charId, i) => {
+      // Hard cap: tối đa 5 nhân vật + 3 môi trường = 8 ảnh DNA
+      charIds.slice(0, 5).forEach((charId, i) => {
         const data      = charMap.get(charId);
         const name      = typeof data === 'object' ? (data.name || charId) : charId;
         const desc      = typeof data === 'object' ? (data.description || name) : data;
@@ -5265,12 +7575,13 @@ function UrlToVideoPanel() {
         dnaTasks.push({ id: `dna_c${i}`, prompt, fileIndex: _dnaIdx++ });
         charDnaTaskMap.set(`dna_c${i}`, charId);
       });
-      envIds.forEach((envId, i) => {
+      envIds.slice(0, 3).forEach((envId, i) => {
         const desc   = envMap.get(envId) || envId;
         const prompt = `Photorealistic wide establishing shot, ${desc}, empty scene, no people, cinematic quality, 4K`;
         dnaTasks.push({ id: `dna_e${i}`, prompt, fileIndex: _dnaIdx++ });
         envDnaTaskMap.set(`dna_e${i}`, envId);
       });
+      if (dnaTasks.length > 10) dnaTasks.length = 10;
 
       const charImgMap  = {}; // charId → filePath
       const charMediaMap= {}; // charId → mediaId
@@ -5285,7 +7596,7 @@ function UrlToVideoPanel() {
           addLog(`[Veo] Đang tạo ${dnaTasks.length} ảnh DNA tham chiếu...`, 'info');
           const r = await window.electronAPI.runVeo({
             mediaType: 'Image', tasks: dnaTasks,
-            aspectRatio: '1:1', model: imgMdl,
+            aspectRatio: ratio, model: imgMdl,
             genCount: '1x', quality: '720p',
             outputFolder: refDir, duration: null,
           });
@@ -5478,20 +7789,6 @@ function UrlToVideoPanel() {
             });
         }
 
-        // P5: random fill — chars còn lại rồi envs
-        if (picked.length < MAX) {
-          const remaining = [];
-          const rSeen = new Set(seen);
-          for (const id of [...new Set([...Object.keys(charMediaMap), ...Object.keys(charImgMap)])]) {
-            if (!rSeen.has(id)) { rSeen.add(id); remaining.push({ id, type: 'char' }); }
-          }
-          for (const id of [...new Set([...Object.keys(envMediaMap), ...Object.keys(envImgMap)])]) {
-            if (!rSeen.has(id)) { rSeen.add(id); remaining.push({ id, type: 'env' }); }
-          }
-          [...remaining].sort(() => Math.random() - 0.5)
-            .forEach(({ id, type }) => tryAdd(id, type));
-        }
-
         // Ưu tiên UUID (đã upload) hơn local path
         const withMedia = picked.filter(e => e.mediaId);
         const withPath  = picked.filter(e => !e.mediaId && e.imgPath);
@@ -5544,6 +7841,7 @@ function UrlToVideoPanel() {
 
       // ── Helper: 1 vòng retry, tham số maxRetry ───────────────────────────
       const u2vPolicySet = new Set();
+      const u2vTaskErrorMap = new Map();
       const runU2VVeoPass = async (passLabel, maxRetry) => {
         const filterPass = makeSubmitGuard();
         for (let attempt = 1; attempt <= maxRetry && pendingTasks.length > 0; attempt++) {
@@ -5562,10 +7860,14 @@ function UrlToVideoPanel() {
           const failedIds   = new Set(failedFiles.map(f => f.id));
           succeeded.forEach(f => { const idx = veoTaskMap.get(f.id) ?? 0; orderedVPaths[idx] = f.filePath; });
           if (succeeded.length > 0) addLog(`✅ ${passLabel}[Veo] Lần ${attempt}: ${succeeded.length}/${safeTasks.length} thành công`, 'success');
-          for (const ff of failedFiles) { if (isPolicyViolation(ff.error)) { u2vPolicySet.add(ff.id); addLog(`🚫 [Chính sách Veo] Vi phạm: "${(ff.error||'').slice(0,80)}" → đổi prompt`, 'error'); } }
+          for (const ff of failedFiles) {
+            if (ff.error) u2vTaskErrorMap.set(ff.id, ff.error);
+            if (isPolicyViolation(ff.error)) { u2vPolicySet.add(ff.id); addLog(`🚫 [Chính sách Veo] Vi phạm: "${(ff.error||'').slice(0,80)}" → đổi prompt`, 'error'); }
+          }
           pendingTasks = safeTasks.filter(t => failedIds.has(t.id)).map(t => {
             const ni = `${t.id}_r${attempt}`;
             veoTaskMap.set(ni, veoTaskMap.get(t.id)); veoTaskMap.delete(t.id);
+            if (u2vTaskErrorMap.has(t.id)) { u2vTaskErrorMap.set(ni, u2vTaskErrorMap.get(t.id)); u2vTaskErrorMap.delete(t.id); }
             if (u2vPolicySet.has(t.id)) { u2vPolicySet.delete(t.id); u2vPolicySet.add(ni); const cp = sanitizePrompt(t.prompt); addLog(`🔧 Prompt làm sạch: "${cp.slice(0,70)}..."`, 'info'); return { ...t, id: ni, prompt: cp }; }
             return { ...t, id: ni };
           });
@@ -5573,37 +7875,45 @@ function UrlToVideoPanel() {
         }
       };
 
-      // Vòng chính — 5 lần
+      // Vòng chính — 3 lần
       addLog(`📋 Tạo ${pendingTasks.length} video — thử ${MAX_FIRST_RETRY_U2V} lần/task`, 'info');
       await runU2VVeoPass('', MAX_FIRST_RETRY_U2V);
-      if (pendingTasks.length > 0) addLog(`⏭️ ${pendingTasks.length} video vẫn lỗi → bỏ qua, tiếp tục`, 'warn');
 
-      // Global retry sau khi TẤT CẢ xong
-      if (pendingTasks.length > 0) {
-        addLog(`\n🔄 ════ GLOBAL RETRY ════ ${pendingTasks.length} video lỗi → retry ${MAX_GLOBAL_RETRY_U2V} lần...`, 'info');
-        await sleep(3000);
-        const MAX_GLOBAL_U2V = 20;
-        for (let gPass = 1; gPass <= MAX_GLOBAL_U2V && pendingTasks.length > 0; gPass++) {
-          if (stopRef.current) throw new Error('Đã dừng.');
-          addLog(`🔄 [Global Retry ${gPass}/${MAX_GLOBAL_U2V}] ${pendingTasks.length} video vẫn lỗi → thử lại ${MAX_GLOBAL_RETRY_U2V} lần...`, 'info');
-          await sleep(5000);
-          pendingTasks = pendingTasks.map(t => {
-            const ni = `${t.id}_g${gPass}`;
-            veoTaskMap.set(ni, veoTaskMap.get(t.id)); veoTaskMap.delete(t.id);
-            return { ...t, id: ni };
-          });
-          await runU2VVeoPass(`[Global ${gPass}/${MAX_GLOBAL_U2V}]`, MAX_GLOBAL_RETRY_U2V);
-          if (pendingTasks.length === 0) addLog(`✅ [Global Retry] Tất cả hoàn thành ở vòng ${gPass}!`, 'success');
-          else addLog(`⚠️ [Global Retry ${gPass}] Còn ${pendingTasks.length} video lỗi...`, 'error');
+      // ── AI Prompt Fix loop — viết lại prompt rồi retry, lặp tối đa 10 vòng ──
+      const MAX_AI_FIX_ROUNDS = 10;
+      for (let aiRound = 1; aiRound <= MAX_AI_FIX_ROUNDS && pendingTasks.length > 0; aiRound++) {
+        if (stopRef.current) throw new Error('Đã dừng.');
+        addLog(`\n🤖 ════ AI PROMPT FIX [${aiRound}/${MAX_AI_FIX_ROUNDS}] ════ Viết lại ${pendingTasks.length} prompt thất bại...`, 'info');
+        const aiCfg = { aiMode, apiKeys, claudeKey, claudeModel, groqKeys, groqModel, geminiModel: _atvGeminiModel };
+        const fixedTasks = [];
+        for (const t of pendingTasks) {
+          const errMsg = u2vTaskErrorMap.get(t.id) || '';
+          try {
+            const rewritten = await rewritePromptForVeo(t.prompt, errMsg, aiCfg);
+            if (rewritten && rewritten.length > 20) {
+              const ni = `${t.id}_ai${aiRound}`;
+              veoTaskMap.set(ni, veoTaskMap.get(t.id));
+              fixedTasks.push({ ...t, id: ni, prompt: rewritten });
+              addLog(`  ✏️ [${aiRound}] Viết lại: "${rewritten.slice(0, 70)}..."`, 'info');
+            } else { fixedTasks.push(t); }
+          } catch { fixedTasks.push(t); }
         }
+        pendingTasks = fixedTasks;
+        addLog(`  ▶ Retry ${pendingTasks.length} video với prompt đã sửa...`, 'info');
+        await runU2VVeoPass(`[AI-Fix ${aiRound}]`, 3);
+        if (pendingTasks.length === 0)
+          addLog(`✅ AI Prompt Fix hoàn tất ở vòng ${aiRound}!`, 'success');
+        else
+          addLog(`⚠️ [AI-Fix ${aiRound}] Còn ${pendingTasks.length} video lỗi → thử vòng tiếp...`, 'error');
       }
-      // Policy Repair
+      // Policy Repair (với aiConfig để Level 0 AI hoạt động)
       if (pendingTasks.length > 0) {
-        addLog(`❌ ${pendingTasks.length} video vẫn lỗi — chạy Policy Repair...`, 'error');
+        addLog(`❌ ${pendingTasks.length} video vẫn lỗi — chạy Policy Repair (AI + rule-based)...`, 'error');
         const rpMap = new Map(pendingTasks.map(t => [t.id, veoTaskMap.get(t.id)]));
+        const aiCfg = { aiMode, apiKeys, claudeKey, claudeModel, groqKeys, groqModel, geminiModel: _atvGeminiModel };
         await runPolicyRepairLoop(pendingTasks, rpMap, orderedVPaths,
           async (task) => window.electronAPI.runVeo({ mediaType:'Video', tasks:[task], aspectRatio:ratio, model:vidMdl, genCount:'1x', quality:vidQuality, outputFolder:vidDir, duration:'8s' }),
-          addLog, stopRef);
+          addLog, stopRef, aiCfg);
       }
 
       const sortedVeo = orderedVPaths.filter(Boolean);
@@ -6305,7 +8615,12 @@ function UrlToVideoPanel() {
 // ─── Main export ─────────────────────────────────────────────────────────────
 // ─── StoryboardPanel ─────────────────────────────────────────────────────────
 function StoryboardPanel() {
-  const [apiKeys] = useState(loadKeys);
+  const [apiKeys]    = useState(loadKeys);
+  const [aiMode,     setAiMode]    = useState('gemini');
+  const [claudeKey]  = useState(loadClaudeKey);
+  const [claudeModel] = useState(loadClaudeModel);
+  const [groqKeys]   = useState(loadGroqKeys);
+  const [groqModel]  = useState(loadGroqModel);
 
   // Input mode
   const [inputMode,    setInputMode]    = useState('idea');
@@ -6377,7 +8692,7 @@ function StoryboardPanel() {
   useEffect(() => {
     setDuration(`${sceneDur}s`);
     if (sceneDur !== 8 && videoQuality === '1080p') setVideoQuality('720p');
-    if (sceneDur === 10) setVidModel('Omni Flash');
+    if (sceneDur === 10) setVidModel('Omni 1.1 Flash');
   }, [sceneDur]);
   // Khi parsedData thay đổi (sau parse): khởi tạo voice override cho từng nhân vật mới
   // Giữ nguyên giá trị cũ nếu char count không đổi
@@ -6431,15 +8746,16 @@ function StoryboardPanel() {
         const mime     = result.slice(5, commaIdx).replace(';base64', '') || 'image/jpeg';
         setRefImages(prev => {
           if (prev.length >= 8) return prev; // max 8
-          return [...prev, { id: Date.now() + Math.random(), name: file.name, base64: b64, mime, label: '' }];
+          return [...prev, { id: Date.now() + Math.random(), name: file.name, base64: b64, mime, label: 'character', charName: '' }];
         });
       };
       reader.readAsDataURL(file);
     });
     if (refImageInputRef.current) refImageInputRef.current.value = '';
   };
-  const removeRefImage  = (id) => setRefImages(prev => prev.filter(img => img.id !== id));
-  const updateRefLabel  = (id, label) => setRefImages(prev => prev.map(img => img.id === id ? { ...img, label } : img));
+  const removeRefImage    = (id) => setRefImages(prev => prev.filter(img => img.id !== id));
+  const updateRefLabel    = (id, label) => setRefImages(prev => prev.map(img => img.id === id ? { ...img, label } : img));
+  const updateRefCharName = (id, charName) => setRefImages(prev => prev.map(img => img.id === id ? { ...img, charName } : img));
   const clearAllRefImages = () => setRefImages([]);
 
   // VeoLog listener — real-time progress + instant preview on job_success
@@ -6499,8 +8815,8 @@ function StoryboardPanel() {
       if (!['progress', 'job_start', 'job_success', 'job_fail'].includes(data.type) && msg)
         addLog(msg, data.type === 'error' ? 'error' : data.type === 'success' ? 'success' : 'info');
     };
-    window.electronAPI?.onVeoLog?.(handler);
-    return () => window.electronAPI?.removeAllListeners?.('veo-log');
+    const _w = window.electronAPI?.onVeoLog?.(handler);
+    return () => { if (_w) window.electronAPI?.removeListener?.('veo-log', _w); };
   }, [addLog]);
 
   // ── Build image prompt per scene ─────────────────────────────────────────────
@@ -6658,7 +8974,9 @@ function StoryboardPanel() {
   const handleRunAll = async () => {
     if (!extConnected) return alert('Chưa kết nối Extension! Mở Google Labs và F5.');
     if (!outputFolder) return alert('Chọn thư mục lưu file trước!');
-    if (!apiKeys.length) return alert('Chưa có Gemini API Key! Vào Creator Studio để thêm.');
+    if (aiMode === 'gemini' && !apiKeys.length) return alert('Chưa có Gemini API Key! Vào Settings → API Key để thêm.');
+    if (aiMode === 'claude' && !claudeKey)      return alert('Chưa có Claude API Key! Vào Settings → API Key → Claude để thêm.');
+    if (aiMode === 'groq'   && !groqKeys.length) return alert('Chưa có Groq API Key! Vào Settings → API Key → Groq để thêm.');
     if (inputMode === 'idea'   && !ideaText.trim())   return alert('Nhập ý tưởng trước!');
     if (inputMode === 'script' && !scriptText.trim()) return alert('Nhập kịch bản trước!');
 
@@ -6670,27 +8988,197 @@ function StoryboardPanel() {
     setMergedPath(null);
 
     try {
+      // ── 0. Phân tích ảnh tham chiếu TRƯỚC — kết quả inject vào script generation ─
+      let refAnalysis = null;
+      let resizedRefImages = []; // ảnh đã nén, dùng lại cho Step 2
+      if (refImages.length > 0) {
+        setPhase('parse');
+        addLog(`🔍 Phân tích ${refImages.length} ảnh tham chiếu trước khi tạo kịch bản...`, 'info');
+
+        const labelNames = { character: 'Nhân vật', style: 'Phong cách', setting: 'Bối cảnh', '': 'Tham chiếu chung' };
+        const imgListText = refImages.map((img, i) => {
+          const nameTag = img.charName?.trim() ? ` — Tên: "${img.charName.trim()}"` : '';
+          return `Image ${i + 1}: "${img.name}" [${labelNames[img.label] || 'Tham chiếu chung'}]${nameTag}`;
+        }).join('\n');
+
+        const ANALYZE_PROMPT_EARLY = `You are a professional visual designer and character artist. Analyze ALL provided reference images carefully and output ONLY valid JSON (no markdown fences, no extra text).
+
+Images provided (${refImages.length} total):
+${imgListText}
+
+IMPORTANT: If an image has a "Tên:" (name) tag, use EXACTLY that name as "suggestedName". Otherwise infer from visual cues.
+
+Output this exact JSON structure:
+{
+  "characters": [
+    {
+      "imageIndex": 0,
+      "suggestedName": "Use the provided name if given, otherwise infer from appearance",
+      "gender": "male/female/unknown",
+      "ethnicity": "specific ethnicity",
+      "ageRange": "age range",
+      "hair": "exact color, length, style",
+      "skinTone": "exact skin tone",
+      "faceShape": "face shape description",
+      "eyes": "eye color and shape",
+      "build": "body build",
+      "clothing": "exact clothing description with colors",
+      "accessories": "accessories or none",
+      "distinctiveFeatures": "any unique features"
+    }
+  ],
+  "settings": [
+    {
+      "imageIndex": 0,
+      "description": "detailed setting description",
+      "timeOfDay": "time of day",
+      "colorPalette": "dominant colors"
+    }
+  ],
+  "artStyle": {
+    "renderStyle": "art style",
+    "colorGrading": "color grading",
+    "lightingStyle": "lighting",
+    "visualTone": "visual tone",
+    "referenceDescription": "overall style summary"
+  },
+  "summary": "Brief summary of all reference images"
+}`;
+
+        // Groq không hỗ trợ ảnh → KHÔNG dùng Gemini, bỏ qua hoàn toàn
+        const canVision = aiMode === 'groq' ? false : aiMode === 'claude' ? !!claudeKey : apiKeys.length > 0;
+        if (!canVision) {
+          addLog(`⚠️ ${aiMode === 'groq' ? 'Groq không hỗ trợ vision — bỏ qua phân tích ảnh, vẫn dùng ảnh làm DNA' : 'Không có API key'} — bỏ qua phân tích ảnh tham chiếu`, 'warn');
+        } else {
+        try {
+          // Resize ảnh xuống ≤800px để tránh vượt giới hạn payload Gemini (inline data limit)
+          const resizeBase64 = (base64, mime, maxPx = 800) => new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => {
+              const scale = Math.min(1, maxPx / Math.max(img.width, img.height));
+              const w = Math.round(img.width * scale);
+              const h = Math.round(img.height * scale);
+              const canvas = document.createElement('canvas');
+              canvas.width = w; canvas.height = h;
+              canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+              const out = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
+              resolve({ base64: out, mime: 'image/jpeg' });
+            };
+            img.onerror = () => resolve({ base64, mime }); // fallback ảnh gốc nếu lỗi
+            img.src = `data:${mime};base64,${base64}`;
+          });
+
+          addLog(`🖼️ Đang nén ${refImages.length} ảnh tham chiếu trước khi phân tích...`, 'info');
+          const resizedImgs = await Promise.all(refImages.map(img => resizeBase64(img.base64, img.mime)));
+          resizedRefImages = resizedImgs; // lưu lại để Step 2 dùng
+
+          const analyzeParts = resizedImgs.map(img => ({ inlineData: { mimeType: img.mime, data: img.base64 } }));
+          analyzeParts.push({ text: ANALYZE_PROMPT_EARLY });
+
+          // Thử tối đa tất cả key, dừng ngay khi thành công hoặc gặp lỗi không phải 429
+          const analyzeRaw = aiMode === 'claude'
+            ? await callClaudeVision({ apiKey: claudeKey, model: claudeModel, system: 'Output ONLY valid JSON.', images: resizedImgs.map(img => ({ base64: img.base64, mime: img.mime })), prompt: ANALYZE_PROMPT_EARLY, maxTokens: 4096, temperature: 0 })
+            : await (async () => {
+                let lastErr;
+                for (let i = 0; i < apiKeys.length; i++) {
+                  // Thử 2.5-flash trước, fallback 2.0-flash nếu không hỗ trợ
+                  const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+                  let res, t;
+                  for (const model of models) {
+                    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKeys[i]}`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ contents: [{ parts: analyzeParts }] }),
+                    });
+                    if (res.ok || res.status !== 404) break; // 404 = model không tồn tại → thử model kế
+                  }
+                  if (res.ok) {
+                    const d = await res.json();
+                    return d.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                  }
+                  t = await res.text();
+                  const is429 = res.status === 429 || t.includes('quota') || t.includes('RESOURCE_EXHAUSTED');
+                  const is503 = res.status === 503 || t.includes('high demand') || t.includes('overloaded') || t.includes('unavailable');
+                  lastErr = new Error(`Gemini ${res.status}: ${t.slice(0, 200)}`);
+                  if (!is429 && !is503) throw lastErr; // lỗi payload/cấu trúc → dừng ngay
+                  const reason = is429 ? 'hết quota' : 'quá tải';
+                  if (i < apiKeys.length - 1) addLog(`🔄 Key #${i + 1} ${reason} — thử key #${i + 2}...`, 'info');
+                }
+                throw lastErr || new Error('Tất cả key đều hết quota');
+              })();
+
+          const analyzeJson = analyzeRaw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+          refAnalysis = JSON.parse(analyzeJson);
+          const nC = refAnalysis.characters?.length || 0;
+          addLog(`✅ Phân tích ảnh xong: ${nC} nhân vật từ ảnh tham chiếu`, 'success');
+        } catch (err) {
+          addLog(`⚠️ Phân tích ảnh thất bại: ${err.message.slice(0, 150)} — tiếp tục không có dữ liệu ảnh`, 'warn');
+          refAnalysis = null;
+        }
+        } // end else canVision
+        if (stopRef.current) throw new Error('Đã dừng.');
+      }
+
+      // Build refCharFromImages: nhân vật trích từ ảnh tham chiếu → inject vào script gen
+      const refCharsForScript = (refAnalysis?.characters || []).map((c, i) => {
+        // Ưu tiên tên người dùng đặt > tên AI gợi ý > tên mặc định
+        const userCharName = refImages[c.imageIndex]?.charName?.trim() || refImages[i]?.charName?.trim() || '';
+        const charName = userCharName || c.suggestedName || `Nhân vật ${i + 1}`;
+        const appearance = [
+          c.ethnicity && `${c.ethnicity}`,
+          c.gender && c.ageRange && `${c.gender}, ${c.ageRange}`,
+          c.hair && `tóc: ${c.hair}`,
+          c.eyes && `mắt: ${c.eyes}`,
+          c.skinTone && `da: ${c.skinTone}`,
+          c.build && `vóc dáng: ${c.build}`,
+          c.distinctiveFeatures && c.distinctiveFeatures !== 'none' && `đặc điểm: ${c.distinctiveFeatures}`,
+        ].filter(Boolean).join(', ');
+        return {
+          id: `ref_char_${i}`,
+          name: charName,
+          gender: c.gender || '',
+          age: c.ageRange || '',
+          ethnicity: c.ethnicity || '',
+          appearance,
+          clothing: c.clothing || '',
+          accessories: c.accessories || '',
+          distinctiveFeatures: c.distinctiveFeatures || '',
+          role: i === 0 ? 'main' : 'secondary',
+          imageIndex: c.imageIndex ?? i,
+        };
+      });
+
       // ── 1. Generate script if idea mode ─────────────────────────────────────
       let finalScript = scriptText;
       if (inputMode === 'idea') {
         setPhase('gen_script');
         addLog('✍️ Đang tạo kịch bản từ ý tưởng...', 'info');
-        const sText = await generateScript(apiKeys, {
-          topic:         ideaText,
-          platform,
-          sceneDuration: sceneDur,
-          totalDuration: totalMins,
-          language,
-          style,
-          goal,
-          tone,
-          audience,
-          mainChar:  hasMainChar ? mainChar : null,
-          secChars:  secChars.filter(c => c.name || c.appearance),
-        }, (evt) => {
-          if (evt.type === 'chunk_done' && evt.total > 25) setGeneratedScript(evt.scriptSoFar || '');
-          else if (evt.type === 'key_switch') addLog('🔄 Chuyển API key', 'info');
-        });
+
+        // Nhân vật dùng cho script: ưu tiên ảnh tham chiếu, nếu không có thì dùng form input
+        const scriptMainChar  = refCharsForScript[0]  || (hasMainChar ? mainChar : null);
+        const scriptSecChars  = refCharsForScript.slice(1).length
+          ? refCharsForScript.slice(1)
+          : secChars.filter(c => c.name || c.appearance);
+
+        const sText = aiMode === 'groq'
+          ? await generateScriptGroq(groqKeys, { topic: ideaText, platform, sceneDuration: sceneDur, totalDuration: totalMins, language, style, goal, tone, audience, mainChar: scriptMainChar, secChars: scriptSecChars }, (evt) => { if (evt.type === 'chunk_done' && evt.total > 25) setGeneratedScript(evt.scriptSoFar || ''); else if (evt.type === 'key_switch') addLog('Groq: ' + evt.message, 'info'); }, groqModel)
+          : aiMode === 'claude'
+          ? await generateScriptClaude({
+              apiKey: claudeKey, model: claudeModel,
+              topic: ideaText, platform, sceneDuration: sceneDur, totalDuration: totalMins,
+              language, style, goal, tone, audience,
+              mainChar: scriptMainChar,
+              secChars: scriptSecChars,
+            })
+          : await generateScript(apiKeys, {
+              topic: ideaText, platform, sceneDuration: sceneDur, totalDuration: totalMins,
+              language, style, goal, tone, audience,
+              mainChar: scriptMainChar,
+              secChars: scriptSecChars,
+            }, (evt) => {
+              if (evt.type === 'chunk_done' && evt.total > 25) setGeneratedScript(evt.scriptSoFar || '');
+              else if (evt.type === 'key_switch') addLog('🔄 Chuyển API key', 'info');
+            });
         if (!sText) throw new Error('Không tạo được kịch bản từ ý tưởng.');
         finalScript = sText;
         setGeneratedScript(sText);
@@ -6701,108 +9189,8 @@ function StoryboardPanel() {
       // ── 2. Parse with Gemini ─────────────────────────────────────────────────
       setPhase('parse');
 
-      // ── 2a. Phân tích ảnh tham chiếu (nếu có) — bước riêng trước parse ────────
-      let refAnalysis = null;
-      if (refImages.length > 0) {
-        addLog(`🔍 Phân tích ${refImages.length} ảnh tham chiếu với Gemini...`, 'info');
-
-        const labelNames = { character: 'Nhân vật', style: 'Phong cách', setting: 'Bối cảnh', '': 'Tham chiếu chung' };
-        const imgListText = refImages.map((img, i) =>
-          `Image ${i + 1}: "${img.name}" [${labelNames[img.label] || 'Tham chiếu chung'}]`
-        ).join('\n');
-
-        const ANALYZE_PROMPT = `You are a professional visual designer and character artist. Analyze ALL provided reference images carefully and output ONLY valid JSON (no markdown fences, no extra text).
-
-Images provided (${refImages.length} total):
-${imgListText}
-
-Output this exact JSON structure:
-{
-  "characters": [
-    {
-      "imageIndex": 0,
-      "label": "Main character / Secondary character / Background character",
-      "suggestedName": "name if text visible in image, else null",
-      "gender": "male|female|unknown",
-      "ethnicity": "VERY SPECIFIC — e.g. East Asian Vietnamese woman / South Asian Indian man / Caucasian Western woman / Middle Eastern man / Black African woman / Hispanic Latino man / Southeast Asian Thai woman — never write just 'Asian' or 'Western'",
-      "ageRange": "early 20s / mid 30s / late 40s / etc.",
-      "hair": "EXACT color (jet-black / deep dark brown / chestnut brown / auburn / honey blonde / platinum blonde / ash grey — NEVER just 'dark' or 'light') + EXACT length (waist-length / hip-length / shoulder-length / chin-length / short pixie / buzz cut) + EXACT style (straight / wavy / curly / sleek / voluminous / tied back / ponytail / bun)",
-      "skinTone": "fair porcelain / light beige / warm olive / medium tan / deep brown / dark ebony",
-      "faceShape": "soft oval / sharp V-line / round / square jaw / heart-shaped",
-      "eyes": "eye shape (almond single-lid / large round double-lid / deep-set / hooded) + exact eye color (deep brown / dark hazel / warm amber / bright green / ice blue)",
-      "build": "height impression (petite/average/tall) and body type (slender/athletic/average/curvy)",
-      "clothing": "EXACT garment: type + cut + specific color names — e.g. oversized cream cable-knit sweater + high-waisted dark navy straight-leg jeans + white leather chunky sneakers",
-      "accessories": "list every item: glasses, hat, bag, jewelry, belt, watch — or 'none'",
-      "distinctiveFeatures": "moles, scars, tattoos, freckles, dimples — or 'none'",
-      "fullDesc": "one ultra-detailed paragraph combining ethnicity + all physical traits + clothing: '[Name/Character] is a [exact ethnicity] in their [age]. HAIR: [details]. FACE: [skin tone + eye + face shape]. BUILD: [details]. CLOTHING: [full outfit]. ACCESSORIES: [list]'"
-    }
-  ],
-  "settings": [
-    {
-      "imageIndex": 0,
-      "locationType": "very specific e.g. modern minimalist Japanese apartment living room / traditional Vietnamese village market / futuristic neon-lit Tokyo alley / sunlit Mediterranean coastal cafe",
-      "timeOfDay": "early morning / morning / midday / afternoon / golden hour / evening / night",
-      "lighting": "quality and direction: soft natural diffused / harsh midday sunlight / warm indoor tungsten / cool fluorescent / dramatic side-lighting / backlit silhouette / neon glow",
-      "dominantColors": "list 3-5 dominant colors with specific names e.g. muted sage green, warm ivory, terracotta orange, deep charcoal",
-      "mood": "e.g. peaceful and intimate / tense and dramatic / vibrant and energetic / melancholic and quiet",
-      "architecturalStyle": "e.g. minimalist contemporary / traditional Asian wooden / brutalist concrete / Art Deco / rustic farmhouse",
-      "keyProps": "important objects, furniture, plants, vehicles, signage that define the space"
-    }
-  ],
-  "artStyle": {
-    "renderStyle": "photorealistic / anime 2D / semi-realistic / 3D CGI render / stylized illustration / cinematic film / watercolor / ink sketch",
-    "colorGrading": "warm golden hour / cool blue / desaturated muted / vibrant saturated / high contrast B&W / pastel soft",
-    "lightingStyle": "soft natural diffused / dramatic chiaroscuro / rim-lit / backlit / flat lighting / Rembrandt",
-    "visualTone": "dark moody cinematic / bright airy / neutral balanced / dramatic intense / dreamy soft",
-    "filmGrain": true,
-    "aspectRatio": "16:9 / 9:16 / 1:1 / 4:3 / 2.35:1 anamorphic",
-    "referenceDescription": "2-sentence summary of the overall visual style and art direction these images convey"
-  },
-  "summary": "2-3 sentence summary explaining what these reference images communicate: character archetypes, visual world, tone, and how they should influence the storyboard visual language"
-}
-
-RULES:
-- For each image with a visible person → add entry to "characters" (imageIndex = 0-based)
-- For each image with a location/environment → add entry to "settings"
-- An image can contribute to BOTH characters AND settings arrays
-- If image is purely for style → only fill/update "artStyle"
-- Be EXTREMELY precise about colors — never use vague terms
-- If multiple characters in one image → add multiple character entries with the same imageIndex
-- Always fill "artStyle" based on the overall aesthetic of all images combined`;
-
-        try {
-          const analyzeParts = refImages.map(img => ({
-            inlineData: { mimeType: img.mime, data: img.base64 }
-          }));
-          analyzeParts.push({ text: ANALYZE_PROMPT });
-
-          const analyzeRaw = await retryWithKeyRotation(async (apiKey) => {
-            const res = await fetch(
-              `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-              { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ contents: [{ parts: analyzeParts }] }) }
-            );
-            if (!res.ok) { const e = await res.json().catch(() => ({})); const err = new Error(e?.error?.message || `HTTP ${res.status}`); err.status = res.status; throw err; }
-            const d = await res.json();
-            return d?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-          }, apiKeys, { onSwitch: (info) => addLog(`🔄 Chuyển API key #${(info?.toIdx ?? 0) + 1}`, 'info') });
-
-          const analyzeJson = analyzeRaw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-          refAnalysis = JSON.parse(analyzeJson);
-
-          const nC = refAnalysis.characters?.length || 0;
-          const nS = refAnalysis.settings?.length   || 0;
-          addLog(`✅ Phân tích ảnh xong: ${nC} nhân vật, ${nS} bối cảnh — phong cách: ${refAnalysis.artStyle?.renderStyle || '?'}`, 'success');
-          if (refAnalysis.summary) addLog(`📋 ${refAnalysis.summary}`, 'info');
-        } catch (err) {
-          addLog(`⚠️ Phân tích ảnh thất bại: ${err.message} — tiếp tục không có dữ liệu ảnh`, 'warn');
-          refAnalysis = null;
-        }
-        if (stopRef.current) throw new Error('Đã dừng.');
-      }
-
       // ── 2b. Parse kịch bản với Gemini ────────────────────────────────────────
-      addLog('🎭 Phân tích kịch bản với Gemini...', 'info');
+      addLog(`🎭 Phân tích kịch bản với ${aiMode === 'groq' ? '⚡ Groq' : aiMode === 'claude' ? '🤖 Claude' : '✨ Gemini'}...`, 'info');
 
       // Lấy art_style từ style user chọn — không để Gemini tự đoán
       const selectedArtStyle = STYLE_MAP[style] || `${style}, highly detailed, professional quality`;
@@ -6830,14 +9218,16 @@ RULES:
         const blocks = [];
         if (refAnalysis.characters?.length) {
           const charDescs = refAnalysis.characters.map((c, i) => {
-            const imgLabel = refImages[c.imageIndex]?.label
-              ? ` [${refImages[c.imageIndex].label}]` : '';
+            const imgRef = refImages[c.imageIndex] || refImages[i] || {};
+            const userGivenName = imgRef.charName?.trim();
+            const charDisplayName = userGivenName || c.suggestedName || `Nhân vật ${i + 1}`;
+            const imgLabel = imgRef.label ? ` [${imgRef.label}]` : '';
             return `  📸 REF CHARACTER #${i + 1}${imgLabel} (Ảnh ${c.imageIndex + 1}): ` +
-              (c.suggestedName ? `Tên đề xuất: "${c.suggestedName}" | ` : '') +
+              `TÊN: "${charDisplayName}"${userGivenName ? ' (do người dùng đặt — BẮT BUỘC dùng tên này)' : ''} | ` +
               `${c.gender}, ${c.ethnicity}, ${c.ageRange}. ` +
               `HAIR: ${c.hair}. SKIN: ${c.skinTone}. FACE: ${c.faceShape}, ${c.eyes}. ` +
               `BUILD: ${c.build}. CLOTHING: ${c.clothing}. ACCESSORIES: ${c.accessories}. ` +
-              `DISTINCTIVE: ${c.distinctiveFeatures}.\n  → Full desc: ${c.fullDesc}`;
+              `DISTINCTIVE: ${c.distinctiveFeatures}.`;
           }).join('\n');
           blocks.push(`📸 NHÂN VẬT TỪ ẢNH THAM CHIẾU — dùng CHÍNH XÁC các chi tiết này cho trường "desc" và "dna_prompt":\n${charDescs}`);
         }
@@ -6908,27 +9298,81 @@ Rules:
 Script:
 ` + finalScript;
 
-      // Build multimodal parts — gửi TẤT CẢ ảnh tham chiếu kèm parse prompt
+      // Build multimodal parts — chỉ gửi ảnh với Gemini/Claude (Groq không hỗ trợ)
       const _parseParts = [];
-      if (refImages.length > 0) {
-        refImages.forEach(img => _parseParts.push({ inlineData: { mimeType: img.mime, data: img.base64 } }));
-        addLog(`🖼️ Đính kèm ${refImages.length} ảnh tham chiếu → Gemini parse...`, 'info');
+      if (refImages.length > 0 && aiMode !== 'groq') {
+        // Dùng ảnh đã resize từ Step 0; nếu chưa có thì resize ngay
+        if (resizedRefImages.length === 0) {
+          const resizeBase64Parse = (base64, mime, maxPx = 800) => new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => {
+              const scale = Math.min(1, maxPx / Math.max(img.width, img.height));
+              const canvas = document.createElement('canvas');
+              canvas.width = Math.round(img.width * scale);
+              canvas.height = Math.round(img.height * scale);
+              canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+              resolve({ base64: canvas.toDataURL('image/jpeg', 0.85).split(',')[1], mime: 'image/jpeg' });
+            };
+            img.onerror = () => resolve({ base64, mime });
+            img.src = `data:${mime};base64,${base64}`;
+          });
+          resizedRefImages = await Promise.all(refImages.map(img => resizeBase64Parse(img.base64, img.mime)));
+        }
+        resizedRefImages.forEach(img => _parseParts.push({ inlineData: { mimeType: img.mime, data: img.base64 } }));
+        addLog(`🖼️ Đính kèm ${resizedRefImages.length} ảnh tham chiếu → ${aiMode === 'claude' ? '🤖 Claude' : '✨ Gemini'} parse...`, 'info');
       }
       _parseParts.push({ text: PARSE_PROMPT });
 
-      const rawText = await retryWithKeyRotation(async (apiKey) => {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-          { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts: _parseParts }] }) }
-        );
-        if (!res.ok) { const e = await res.json().catch(() => ({})); const err = new Error(e?.error?.message || `HTTP ${res.status}`); err.status = res.status; throw err; }
-        const d = await res.json();
-        return d?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      }, apiKeys, { onSwitch: (info) => addLog(`🔄 Chuyển API key #${(info?.toIdx ?? 0) + 1}`, 'info') });
+      const rawText = aiMode === 'claude'
+        ? await callClaudeVision({
+            apiKey: claudeKey, model: claudeModel,
+            system: 'You are a professional storyboard director. Output ONLY valid JSON (no markdown fences, no extra text).',
+            images: (resizedRefImages.length > 0 ? resizedRefImages : refImages).map(img => ({ base64: img.base64, mime: img.mime })),
+            prompt: PARSE_PROMPT,
+            maxTokens: 8192, temperature: 0,
+          })
+        : aiMode === 'groq'
+        ? await callGroqWithRotation(groqKeys, {
+            model: groqModel,
+            system: 'You are a professional storyboard director. Output ONLY valid JSON (no markdown fences, no extra text).',
+            prompt: PARSE_PROMPT,
+            maxTokens: 8000, temperature: 0,
+          }, (info) => addLog(`🔄 Chuyển Groq key #${(info?.toIdx ?? 0) + 1}`, 'info'))
+        : await retryWithKeyRotation(async (apiKey) => {
+            const res = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+              { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  contents: [{ parts: _parseParts }],
+                  generationConfig: { maxOutputTokens: 65536, temperature: 0 },
+                }) }
+            );
+            if (!res.ok) { const e = await res.json().catch(() => ({})); const err = new Error(e?.error?.message || `HTTP ${res.status}`); err.status = res.status; throw err; }
+            const d = await res.json();
+            // Kiểm tra lý do dừng — nếu bị cắt thì throw để retry
+            const finishReason = d?.candidates?.[0]?.finishReason;
+            if (finishReason && finishReason !== 'STOP') throw new Error(`Gemini output bị cắt (finishReason: ${finishReason}) — thử lại`);
+            return d?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          }, apiKeys, { onSwitch: (info) => addLog(`🔄 Chuyển API key #${(info?.toIdx ?? 0) + 1}`, 'info') });
 
       const jsonStr = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      const parsed  = JSON.parse(jsonStr);
+      let parsed;
+      try {
+        parsed = JSON.parse(jsonStr);
+      } catch (parseErr) {
+        // JSON bị cắt ngắn — thử sửa bằng cách đóng các bracket còn mở
+        addLog('⚠️ JSON bị cắt ngắn — đang thử tự sửa...', 'warn');
+        const fixed = jsonStr
+          .replace(/,\s*$/, '')           // trailing comma
+          .replace(/,\s*\]/, ']')          // trailing comma trước ]
+          .replace(/,\s*\}/, '}');         // trailing comma trước }
+        // Đếm bracket mở/đóng và thêm phần còn thiếu
+        let opens = 0, openSq = 0;
+        for (const ch of fixed) { if (ch === '{') opens++; else if (ch === '}') opens--; else if (ch === '[') openSq++; else if (ch === ']') openSq--; }
+        const tail = ']'.repeat(Math.max(0, openSq)) + '}'.repeat(Math.max(0, opens));
+        try { parsed = JSON.parse(fixed + tail); addLog('✅ Tự sửa JSON thành công', 'info'); }
+        catch { throw new Error(`JSON không hợp lệ sau khi cố sửa: ${parseErr.message}`); }
+      }
       // Force override art_style bằng style user chọn — Gemini không được tự thay đổi
       parsed.art_style = selectedArtStyle;
       setParsedData(parsed);
@@ -6965,10 +9409,10 @@ Script:
       // Không dùng BATCH_SIZE — veo-engine tự giới hạn MAX_WORKERS=5 song song
       // Khi retry: đổi task ID mới (_r1, _r2...) → server không nhận nhầm là request cũ
       const MAX_FIRST_RETRY  = 5;  // lần đầu: thử 5 lần rồi bỏ qua, làm video tiếp
-      const MAX_GLOBAL_RETRY = 20; // global: sau khi xong tất cả, retry lỗi 20 lần
-      const MAX_GLOBAL_PASSES = 20; // vòng global tối đa
+      const MAX_GLOBAL_RETRY = 5;  // global: sau khi xong tất cả, retry lỗi 5 lần
+      const MAX_GLOBAL_PASSES = 5; // vòng global tối đa
 
-      const runVeoBatch = async (baseParams, tasks, enableGlobalRetry = false) => {
+      const runVeoBatch = async (baseParams, tasks, enableGlobalRetry = false, onTaskDone = null) => {
         const taskIdxMap = new Map();
         tasks.forEach((t, i) => taskIdxMap.set(t.id, i));
         const orderedResults = new Array(tasks.length).fill(null);
@@ -7000,7 +9444,10 @@ Script:
 
             succeeded.forEach(f => {
               const idx = taskIdxMap.get(f.id);
-              if (idx !== undefined) orderedResults[idx] = f;
+              if (idx !== undefined) {
+                orderedResults[idx] = f;
+                onTaskDone?.(idx, f); // cập nhật UI ngay khi từng task xong
+              }
             });
 
             if (succeeded.length > 0)
@@ -7088,25 +9535,67 @@ Script:
       setPhase('gen_dna');
       const characters = parsed.characters || [];
       const dnaMap = {}; // charId → filePath
+
+      // ── Save ref images xuống disk ────────────────────────────────────────────
+      const refCharImgPaths  = []; // file paths ảnh nhân vật (label='character' hoặc '')
+      const refStyleImgPaths = []; // file paths ảnh phong cách (label='style')
+      if (refImages.length > 0) {
+        const refDir = `${outputFolder}\\__ref_imgs`;
+        await window.electronAPI.createFolder?.(refDir).catch(() => {});
+        for (let ri = 0; ri < refImages.length; ri++) {
+          const img = refImages[ri];
+          try {
+            const ext = img.mime?.includes('png') ? 'png' : img.mime?.includes('webp') ? 'webp' : 'jpg';
+            const refPath = `${refDir}\\ref_${ri}.${ext}`;
+            const r = await window.electronAPI.writeBase64File({ base64: img.base64, filePath: refPath });
+            if (r?.success) {
+              if (img.label === 'style') refStyleImgPaths.push(refPath);
+              else refCharImgPaths.push(refPath);
+            }
+          } catch {}
+        }
+        addLog(`📸 Đã lưu ${refCharImgPaths.length} ảnh nhân vật + ${refStyleImgPaths.length} ảnh phong cách`, 'info');
+      }
+
       if (characters.length > 0) {
-        const dnaTs    = Date.now();
-        const dnasMeta = characters.map((c, i) => ({ charId: c.id, name: c.name, taskId: `dna_c${i}_${dnaTs}` }));
-        const dnaTasks = characters.map((c, i) => ({
-          id:        `dna_c${i}_${dnaTs}`,
-          prompt:    c.dna_prompt || `MANDATORY ART STYLE: ${parsed.art_style || 'Cinematic quality'}. Multi-angle character turnaround reference sheet, 8 panels in 2 rows of 4: TOP ROW — [front face portrait] [left side profile] [back head] [right side profile]; BOTTOM ROW — [full body front] [full body 3/4 left] [full body back] [full body 3/4 right]. Plain pure white studio background, no scene, no props except own accessories. CHARACTER: ${c.desc}. Same character consistently across all 8 panels. Professional character design turnaround sheet. NO style deviation. No text labels, no arrows, no annotations, no captions, no watermarks, no on-screen text.`,
-          fileIndex: i + 1,
-        }));
+        // ── CHIẾN LƯỢC DNA ────────────────────────────────────────────────────
+        // Nếu user upload ảnh tham chiếu nhân vật → dùng TRỰC TIẾP làm DNA
+        // (không để Veo generate vì AI sẽ tạo nhân vật hoàn toàn khác)
+        // Phân phối: ref #0 → nhân vật #0, ref #1 → nhân vật #1, ...
+        // Nếu ít ảnh hơn nhân vật → nhân vật còn lại để Veo generate bình thường
+        const charNeedVeo = [];
+        characters.forEach((c, i) => {
+          if (refCharImgPaths[i]) {
+            // Dùng ảnh tham chiếu trực tiếp làm DNA
+            dnaMap[c.id] = refCharImgPaths[i];
+            addLog(`✅ DNA ${c.name} → dùng ảnh tham chiếu #${i + 1} (không cần Veo generate)`, 'success');
+          } else {
+            charNeedVeo.push({ char: c, idx: i });
+          }
+        });
 
-        // Map jobId → charId để real-time preview cập nhật DNA column ngay khi xong
-        const jobIdToCharId = {};
-        dnasMeta.forEach(m => { jobIdToCharId[m.taskId] = m.charId; });
-        setDnaJobIdToCharId(jobIdToCharId);
+        // Chỉ generate Veo cho các nhân vật chưa có ảnh tham chiếu
+        if (charNeedVeo.length > 0) {
+          const dnaTs    = Date.now();
+          const dnasMeta = charNeedVeo.map(({ char, idx }) => ({ charId: char.id, name: char.name, taskId: `dna_c${idx}_${dnaTs}` }));
+          const dnaTasks = charNeedVeo.map(({ char, idx }) => {
+            const task = {
+              id:        `dna_c${idx}_${dnaTs}`,
+              prompt:    char.dna_prompt || `MANDATORY ART STYLE: ${parsed.art_style || 'Cinematic quality'}. Multi-angle character turnaround reference sheet, 8 panels in 2 rows of 4: TOP ROW — [front face portrait] [left side profile] [back head] [right side profile]; BOTTOM ROW — [full body front] [full body 3/4 left] [full body back] [full body 3/4 right]. Plain pure white studio background, no scene, no props except own accessories. CHARACTER: ${char.desc}. Same character consistently across all 8 panels. Professional character design turnaround sheet. NO style deviation. No text labels, no arrows, no annotations, no captions, no watermarks, no on-screen text.`,
+              fileIndex: idx + 1,
+            };
+            // Nếu có ảnh style ref → gắn vào để giữ phong cách
+            if (refStyleImgPaths.length > 0) task.referenceImages = refStyleImgPaths.slice(0, 2);
+            return task;
+          });
 
-        {
-          // ── Veo DNA ─────────────────────────────────────────────────────────
-          addLog(`🧬 Batch tạo ${characters.length} ảnh DNA tham chiếu (TC_image_N)...`, 'info');
+          const jobIdToCharId = {};
+          dnasMeta.forEach(m => { jobIdToCharId[m.taskId] = m.charId; });
+          setDnaJobIdToCharId(jobIdToCharId);
+
+          addLog(`🧬 Veo generate ${charNeedVeo.length} DNA nhân vật còn lại...`, 'info');
           const dnaResults = await runVeoBatch(
-            { mediaType: 'Image', aspectRatio: '1:1', model: imgModel, outputFolder, genCount: '1x', quality: '1K', duration: '4s' },
+            { mediaType: 'Image', aspectRatio, model: imgModel, outputFolder, genCount: '1x', quality: '1K', duration: '4s' },
             dnaTasks
           );
           for (const meta of dnasMeta) {
@@ -7136,8 +9625,8 @@ Script:
           sceneNum:    sc.sceneNum || i + 1,
           title:       sc.title || `Cảnh ${i + 1}`,
           numShots:    (sc.shots || []).length,
-          prompt:      applyVeoPolicy(stripProminentPeople(buildImagePrompt(sc, parsed))),
-          videoPrompt: applyVeoPolicy(stripProminentPeople(buildVideoPrompt(sc, parsed))),
+          prompt:      sanitizePrompt(buildImagePrompt(sc, parsed)),
+          videoPrompt: sanitizePrompt(buildVideoPrompt(sc, parsed)),
           hasDialogue: !!sc.hasDialogue,
           speakerName: sc.speakerName || '',
           dialogue:    sc.dialogue || '',
@@ -7155,7 +9644,7 @@ Script:
 
       // ── 6. Batch tạo tất cả ảnh ───────────────────────────────────────────────
       setPhase('gen_images');
-      addLog(`🖼 Batch tạo ${jobs.length} ảnh cảnh (thử lại tối đa ${MAX_RETRY} lần)...`, 'info');
+      addLog(`🖼 Batch tạo ${jobs.length} ảnh cảnh...`, 'info');
       setSceneJobs(jobs.map(j => ({ ...j, imgStatus: 'running' })));
 
       // Mỗi cảnh dùng đúng prompt ảnh của cảnh đó + DNA nhân vật xuất hiện trong cảnh
@@ -7163,13 +9652,28 @@ Script:
         const dnaFiles = job.sceneDnaImgs.map(p => p.split(/[\\/]/).pop()).join(', ') || 'none';
         addLog(`[Storyboard] Cảnh ${job.sceneNum} (jobs[${i}]): tạo ảnh + DNA=[${dnaFiles}]`, 'info');
         const t = { id: job.imgJobId, prompt: job.prompt, fileIndex: i + 1 };
-        // Dùng referenceImages (không phải ingredientImages) để VeoEngine thực sự dùng DNA làm tham chiếu
-        if (job.sceneDnaImgs.length > 0) t.referenceImages = job.sceneDnaImgs;
+        // DNA ảnh nhân vật đã generate → dùng làm referenceImages chính
+        if (job.sceneDnaImgs.length > 0) {
+          // DNA + style ref nếu có (max 4 tổng)
+          t.referenceImages = [...job.sceneDnaImgs, ...refStyleImgPaths].slice(0, 4);
+        } else if (refCharImgPaths.length > 0 || refStyleImgPaths.length > 0) {
+          // Fallback: dùng trực tiếp ảnh tham chiếu gốc của user
+          t.referenceImages = [...refCharImgPaths, ...refStyleImgPaths].slice(0, 4);
+        }
         return t;
       });
       const imgResults = await runVeoBatch(
         { mediaType: 'Image', aspectRatio, model: imgModel, outputFolder, genCount: '1x', quality: '1K', duration: '4s' },
-        imgTasks
+        imgTasks,
+        false,
+        (taskIdx, f) => {
+          // Hiển thị ảnh ngay khi từng task xong — không chờ hết batch
+          if (jobs[taskIdx] && f.filePath) {
+            jobs[taskIdx] = { ...jobs[taskIdx], imgStatus: 'done', imgPath: f.filePath };
+            setSceneJobs([...jobs]);
+            sceneJobsRef.current = [...jobs];
+          }
+        }
       );
       for (let i = 0; i < jobs.length; i++) {
         const f = imgResults[jobs[i].imgJobId];
@@ -7189,7 +9693,7 @@ Script:
       // ── 7. Batch tạo tất cả video ─────────────────────────────────────────────
       setPhase('gen_videos');
       const jobsWithImg = jobs.filter(j => j.imgPath);
-      addLog(`🎬 Batch tạo ${jobsWithImg.length} video từ scene image (thử lại tối đa ${MAX_RETRY} lần)...`, 'info');
+      addLog(`🎬 Batch tạo ${jobsWithImg.length} video từ scene image...`, 'info');
       setSceneJobs(jobs.map(j => j.imgPath ? { ...j, vidStatus: 'running' } : j));
 
       // Đảm bảo cảnh N dùng đúng promptN + ảnhN — không được lệch thứ tự
@@ -7206,9 +9710,10 @@ Script:
         if (job.voiceId) t.voiceId = job.voiceId;
         return t;
       });
+      const vidTasksFinal = vidTasks;
       const vidResults = await runVeoBatch(
         { mediaType: 'Video', aspectRatio, model: vidModel, outputFolder, genCount: '1x', quality: videoQuality, duration },
-        vidTasks,
+        vidTasksFinal,
         true  // ← enableGlobalRetry: sau 20 lần thử, tự động retry toàn bộ lỗi
       );
       for (let i = 0; i < jobs.length; i++) {
@@ -7292,6 +9797,33 @@ Script:
             <span className={cn('ml-auto text-[9px] font-bold px-2 py-0.5 rounded-full', extConnected ? 'bg-emerald-900/50 text-emerald-400' : 'bg-red-900/30 text-red-400')}>
               {extConnected ? '● KẾT NỐI' : '○ OFFLINE'}
             </span>
+          </div>
+
+
+
+          {/* AI Provider */}
+          <div>
+            <label className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1.5 block">AI Provider</label>
+            <div className="flex rounded-lg overflow-hidden border border-slate-700/60">
+              {[{id:'gemini',label:'✨ Gemini'},{id:'claude',label:'🤖 Claude'},{id:'groq',label:'⚡ Groq'}].map(m => (
+                <button key={m.id} disabled={isRunning} onClick={() => setAiMode(m.id)}
+                  className={cn('flex-1 py-1.5 text-[10px] font-bold transition-colors',
+                    aiMode === m.id
+                      ? (m.id === 'groq' ? 'bg-green-600 text-white' : m.id === 'claude' ? 'bg-orange-600 text-white' : 'bg-blue-600 text-white')
+                      : 'bg-slate-800/50 text-slate-500 hover:text-slate-300')}>
+                  {m.label}
+                </button>
+              ))}
+            </div>
+            {aiMode === 'claude' && !claudeKey && (
+              <p className="text-[9px] text-orange-400 mt-1">⚠️ Chưa có Claude API Key — vào Settings để thêm</p>
+            )}
+            {aiMode === 'groq' && !groqKeys.length && (
+              <p className="text-[9px] text-green-400 mt-1">⚠️ Chưa có Groq API Key — vào Settings để thêm</p>
+            )}
+            {aiMode === 'groq' && groqKeys.length > 0 && (
+              <p className="text-[9px] text-green-500/60 mt-0.5">💡 Nên chọn Llama 3.1 8B trong Settings để tránh rate limit</p>
+            )}
           </div>
 
           {/* Input mode toggle */}
@@ -7556,8 +10088,7 @@ Script:
                         <div className="absolute bottom-0 left-0 right-0 bg-black/60 rounded-b-lg text-center text-[8px] text-slate-400 py-0.5 font-bold">#{idx + 1}</div>
                       </div>
                       {/* Info */}
-                      <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5">
-                        <p className="text-[9px] text-slate-400 truncate leading-tight">{img.name}</p>
+                      <div className="flex-1 min-w-0 flex flex-col gap-1 py-0.5">
                         <div>
                           <p className="text-[8px] text-slate-700 uppercase mb-0.5">Loại tham chiếu</p>
                           <select value={img.label} onChange={e => updateRefLabel(img.id, e.target.value)}
@@ -7566,6 +10097,19 @@ Script:
                             {REF_IMG_LABELS.map(o => <option key={o.v} value={o.v}>{o.l}</option>)}
                           </select>
                         </div>
+                        {img.label === 'character' && (
+                          <div>
+                            <p className="text-[8px] text-slate-700 uppercase mb-0.5">Tên nhân vật</p>
+                            <input
+                              type="text"
+                              value={img.charName || ''}
+                              onChange={e => updateRefCharName(img.id, e.target.value)}
+                              disabled={isRunning}
+                              placeholder="Ví dụ: Linh, An, Emma..."
+                              className="w-full bg-slate-800 border border-slate-700 text-slate-300 text-[9px] rounded-lg px-1.5 py-1 outline-none focus:border-amber-500/50 placeholder-slate-600 disabled:opacity-40"
+                            />
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -7657,7 +10201,7 @@ Script:
                     {d}
                   </button>
                 ))}
-                <button onClick={() => { setDuration('10s'); setSceneDur(10); setVidModel('Omni Flash'); }}
+                <button onClick={() => { setDuration('10s'); setSceneDur(10); setVidModel('Omni 1.1 Flash'); }}
                   className={cn('flex-1 py-1.5 text-[10px] font-bold rounded-lg border transition-all flex flex-col items-center leading-none gap-px',
                     duration === '10s' ? 'bg-orange-600 border-orange-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-500 hover:border-orange-700/60 hover:text-orange-400')}>
                   <span>10s</span>
@@ -7825,7 +10369,7 @@ Script:
                       style={{ width: 72, height: 72 }}>
                       <img src={toFUrl(fp)} alt="" className="w-full h-full object-cover"/>
                       <div className="absolute bottom-0 left-0 right-0 bg-black/70 text-[7px] text-emerald-300 text-center py-0.5">
-                        {fp.split(/[\\/]/).pop()}
+                        {fp.replace(/\\/g,'/').split('/').pop()}
                       </div>
                     </button>
                     <span className="text-[8px] text-slate-400 max-w-[72px] truncate text-center">{charId}</span>
@@ -8050,7 +10594,7 @@ Script:
                       Video:{' '}
                       <button onClick={() => window.electronAPI?.openFile?.(mergedPath)}
                         className="text-emerald-400 hover:underline">
-                        {mergedPath.split(/[\\/]/).pop()}
+                        {mergedPath.replace(/\\/g,'/').split('/').pop()}
                       </button>
                     </p>
                   )}
@@ -8139,6 +10683,741 @@ Script:
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// REVIEW PHIM PANEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Reup Video — moved to ReupVideoPanel.jsx
+export { VideoCleanerPanel } from './ReupVideoPanel';
+
+
+const TMPL_DURATIONS_OMNI = ['4s','6s','8s','10s'];
+const TMPL_DURATIONS_VEO  = ['4s','6s','8s'];
+
+function TemplateVideoPanel() {
+  const [videoFile,   setVideoFile]   = useState('');
+  const [frameFolder, setFrameFolder] = useState('');
+  const [outFolder,   setOutFolder]   = useState('');
+  const [interval,    setInterval]    = useState(2);
+  const [groupMode,   setGroupMode]   = useState(3); // 3 hoặc 4 ảnh/nhóm
+  const [noSpeech,    setNoSpeech]    = useState(true); // không lời thoại mặc định
+  const [autoCleanLogo, setAutoCleanLogo] = useState(false); // tự động xóa logo/watermark (luôn dùng crop)
+  const [frames,      setFrames]      = useState([]);
+  const [aspectRatio, setAspectRatio] = useState('16:9');
+  const [model,       setModel]       = useState('Veo 3.1 - Lite [Lower Priority]');
+  const [duration,    setDuration]    = useState('8s');
+  const [quality,     setQuality]     = useState('720p');
+
+  // pipeline state
+  const [running,     setRunning]     = useState(false);
+  const [step,        setStep]        = useState('');
+  const [stepErr,     setStepErr]     = useState('');
+  const [jobs,        setJobs]        = useState([]);
+  const [mergedPath,  setMergedPath]  = useState(null);
+  const [previewUrl,  setPreviewUrl]  = useState(null);
+  const [logs,        setLogs]        = useState([]);
+  const [paused, setPaused] = useState(false);
+  const pausedRef = useRef(false);
+  const pauseResolverRef = useRef(null); // resolve khi resume
+
+  const logListened = useRef(false);
+  const taskIds        = useRef(new Set());
+  const jobsRef        = useRef([]);
+  const logEndRef      = useRef(null);
+  const waitResolverRef = useRef(null); // resolver để event handler trigger waitAllDone
+
+  // Gọi trong vòng lặp pipeline để chờ khi paused
+  const pauseIfNeeded = () => {
+    if (!pausedRef.current) return Promise.resolve();
+    return new Promise(resolve => { pauseResolverRef.current = resolve; });
+  };
+
+  const togglePause = () => {
+    const next = !pausedRef.current;
+    pausedRef.current = next;
+    setPaused(next);
+    if (next) {
+      // Dừng: báo VeoEngine từ chối job mới
+      window.electronAPI?.pauseVeo?.();
+      addLog('⏸ Đã tạm dừng — job đang chạy sẽ hoàn tất, job chờ sẽ dừng lại. Nhấn Tiếp tục để chạy lại.', 'info');
+    } else {
+      // Tiếp tục: mở lại VeoEngine và giải phóng pipeline
+      window.electronAPI?.resumeVeo?.();
+      addLog('▶ Tiếp tục — đang retry các job bị tạm dừng...', 'info');
+      if (pauseResolverRef.current) {
+        pauseResolverRef.current();
+        pauseResolverRef.current = null;
+      }
+    }
+  };
+
+  const addLog = (msg, type = 'info') => {
+    const t = new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    setLogs(prev => {
+      const next = [...prev, { t, msg, type }];
+      return next.length > 500 ? next.slice(-500) : next; // giới hạn 500 dòng tránh memory leak
+    });
+  };
+
+  // keep jobsRef in sync for use inside promise
+  useEffect(() => { jobsRef.current = jobs; }, [jobs]);
+
+  // auto-scroll log to bottom
+  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
+
+  // sync duration when model changes
+  useEffect(() => {
+    if (model === 'Omni 1.1 Flash') { if (!TMPL_DURATIONS_OMNI.includes(duration)) setDuration('8s'); }
+    else { if (!TMPL_DURATIONS_VEO.includes(duration)) setDuration('8s'); }
+  }, [model]);
+
+  // auto-switch model + duration khi đổi groupMode
+  useEffect(() => {
+    if (groupMode === 7) { setModel('Omni 1.1 Flash'); setDuration('10s'); }
+    else { if (model === 'Omni 1.1 Flash') setModel('Veo 3.1 - Lite [Lower Priority]'); }
+  }, [groupMode]);
+
+  // Listener được đăng ký mỗi lần doStart, không dùng useEffect để tránh bị removeAllListeners kill
+  const registerVeoListener = (addLogFn) => {
+    const lastErrorByJob = {};
+    const handler = (data) => {
+      const { type, text } = data;
+      const match = typeof text === 'string' ? text.match(/^\[JOBID:(.+?)\]\s*(.*)$/) : null;
+      const jobId = match ? match[1] : null;
+      const msg   = match ? match[2] : (text || '');
+      if (!jobId || !taskIds.current.has(jobId)) return;
+
+      const pathMatch = type === 'job_success' ? text?.match(/\|PATH:(.+)$/) : null;
+      const fullPath  = pathMatch ? pathMatch[1].trim() : null;
+
+      // Lưu lại error message cuối của mỗi job để gắn vào dòng Thất bại
+      if (type === 'error' && msg.trim()) {
+        lastErrorByJob[jobId] = msg.trim();
+        addLogFn(`[${jobId.slice(-6)}] ⚠ ${msg}`, 'error');
+      }
+
+      if (type === 'job_start')   addLogFn(`[${jobId.slice(-6)}] Bắt đầu xử lý`, 'info');
+      if (type === 'progress' && parseInt(msg) > 0) addLogFn(`[${jobId.slice(-6)}] Tiến độ: ${msg}%`, 'progress');
+      if (type === 'job_success') addLogFn(`[${jobId.slice(-6)}] ✅ Hoàn thành${fullPath ? ': ' + fullPath.split(/[\\/]/).pop() : ''}`, 'success');
+      if (type === 'job_fail') {
+        const reason = lastErrorByJob[jobId] ? ` — ${lastErrorByJob[jobId].slice(0, 120)}` : '';
+        addLogFn(`[${jobId.slice(-6)}] ❌ Thất bại${reason}`, 'error');
+        delete lastErrorByJob[jobId];
+      }
+      if (type === 'success' && msg.includes('Lưu thành công')) addLogFn(`[${jobId.slice(-6)}] 💾 ${msg}`, 'success');
+      if (!['job_start','job_success','job_fail','job_cancel','progress','error'].includes(type) && msg.trim())
+        addLogFn(`[${jobId.slice(-6)}] ${msg}`, 'info');
+
+      // Update ref đồng bộ ngay → waitAllDone đọc được
+      const applyUpdate = (j) => {
+        if (j.id !== jobId) return j;
+        if (type === 'job_start')   return { ...j, status: 'running', progress: 0 };
+        if (type === 'progress')    return { ...j, progress: Math.max(j.progress||0, parseInt(msg)||0) };
+        if (type === 'job_success') return { ...j, status: 'done', progress: 100, files: fullPath ? [fullPath] : j.files };
+        if (type === 'job_fail')    return { ...j, status: 'error' };
+        if (type === 'success' && msg.includes('Lưu thành công') && !fullPath) {
+          const fn = msg.match(/Lưu thành công.*:\s*(.+)$/)?.[1]?.trim();
+          return fn ? { ...j, files: [...(j.files||[]), fn] } : j;
+        }
+        return j;
+      };
+      jobsRef.current = jobsRef.current.map(applyUpdate);
+      setJobs(prev => prev.map(applyUpdate));
+
+      // Nếu đang chờ waitAllDone và all jobs settled → resolve ngay, không chờ poll
+      if (waitResolverRef.current) {
+        const cur = jobsRef.current;
+        const allSettled = cur.length > 0 && cur.every(j => j.status === 'done' || j.status === 'error' || j.status === 'skipped');
+        if (allSettled) {
+          const res = waitResolverRef.current;
+          waitResolverRef.current = null;
+          res(cur);
+        }
+      }
+    };
+    const wrapper = window.electronAPI?.onVeoLog?.(handler);
+    return wrapper; // wrapper là fn thực đăng ký với ipcRenderer, dùng để removeListener
+  };
+
+  const pickVideo       = async () => { const f = await window.electronAPI.selectFile('video'); if (f) { setVideoFile(f); setFrames([]); setJobs([]); setMergedPath(null); setStepErr(''); setStep(''); taskIds.current.clear(); } };
+  const pickFrameFolder = async () => { const f = await window.electronAPI.selectFolder(); if (f) setFrameFolder(f); };
+  const pickOutFolder   = async () => { const f = await window.electronAPI.selectFolder(); if (f) setOutFolder(f); };
+
+  const waitAllDone = (initJobs) => new Promise((resolve) => {
+    const isAllSettled = (arr) => arr.length > 0 && arr.every(j => j.status === 'done' || j.status === 'error' || j.status === 'skipped');
+
+    // Check ngay — phòng trường hợp jobs đã xong trước khi hàm này được gọi
+    if (isAllSettled(jobsRef.current)) { resolve(jobsRef.current); return; }
+
+    // Đăng ký resolver để event handler gọi ngay khi job cuối xong
+    waitResolverRef.current = resolve;
+
+    // Fallback poll: timeout 8 phút/running job + deadlock detector cho pending
+    const JOB_TIMEOUT_MS = 8 * 60 * 1000;
+    const DEADLOCK_MS    = 5 * 60 * 1000; // 5 phút không có gì thay đổi → coi là đơ
+    const jobStartTime = {};
+    let lastSettledCount = jobsRef.current.filter(j => j.status !== 'pending').length;
+    let lastActivityTime = Date.now();
+
+    const check = setInterval(() => {
+      // Nếu đã resolve rồi (event handler trigger trước) → dọn interval
+      if (!waitResolverRef.current) { clearInterval(check); return; }
+
+      const cur = jobsRef.current;
+      const now = Date.now();
+      let forceUpdated = false;
+
+      // Theo dõi hoạt động — reset đồng hồ khi có job nào đổi trạng thái
+      const settledCount = cur.filter(j => j.status !== 'pending').length;
+      if (settledCount !== lastSettledCount) { lastSettledCount = settledCount; lastActivityTime = now; }
+
+      // Deadlock: không có gì thay đổi 5 phút → force tất cả pending/running → error
+      if (now - lastActivityTime > DEADLOCK_MS) {
+        addLog('⚠ Không có tiến độ trong 5 phút — tự động chuyển sang retry...', 'error');
+        const next = cur.map(j =>
+          (j.status === 'pending' || j.status === 'running') ? { ...j, status: 'error' } : j
+        );
+        jobsRef.current = next; setJobs(next);
+        clearInterval(check);
+        const res = waitResolverRef.current;
+        waitResolverRef.current = null;
+        if (res) res(next);
+        return;
+      }
+
+      const next = cur.map(j => {
+        if (j.status === 'running') {
+          if (!jobStartTime[j.id]) jobStartTime[j.id] = now;
+          if (now - jobStartTime[j.id] > JOB_TIMEOUT_MS) {
+            addLog(`[${j.id.slice(-6)}] ⏰ Timeout 8 phút — đánh dấu lỗi`, 'error');
+            forceUpdated = true;
+            return { ...j, status: 'error' };
+          }
+        } else { delete jobStartTime[j.id]; }
+        return j;
+      });
+      if (forceUpdated) { jobsRef.current = next; setJobs(next); }
+
+      if (isAllSettled(jobsRef.current)) {
+        clearInterval(check);
+        const res = waitResolverRef.current;
+        waitResolverRef.current = null;
+        if (res) res(jobsRef.current);
+      }
+    }, 1500);
+  });
+
+  // retryRound: submit lại các job lỗi, trả về true nếu còn job lỗi
+  const retryRound = async (roundLabel, allFrames, payload) => {
+    const cur = jobsRef.current;
+    const failedJobs = cur.filter(j => j.status === 'error');
+    if (failedJobs.length === 0) return false;
+    addLog(`🔄 ${roundLabel}: thử lại ${failedJobs.length} video lỗi...`, 'info');
+
+    const retryTasks = failedJobs.map(j => {
+      // label format: "Nhóm X (ảnh A-B-C)"
+      const fi = j.frameIndices;
+      if (!fi) return null;
+      const newId = `retry_${Date.now()}_${fi[0]}`;
+      taskIds.current.add(newId);
+      // Update cả jobsRef.current (để waitAllDone theo dõi đúng) và React state
+      jobsRef.current = jobsRef.current.map(jj => jj.id === j.id ? { ...jj, id: newId, status: 'pending', progress: 0 } : jj);
+      setJobs(prev => prev.map(jj => jj.id === j.id ? { ...jj, id: newId, status: 'pending', progress: 0 } : jj));
+      return {
+        id: newId,
+        prompt: (() => { const nums = fi.map(i=>i+1); const suf = payload._speechSuffix || ''; const pfx = payload._silentPrefix || ''; return `${pfx}Smooth seamless video that flows through scenes ${nums.join(', ')} in order. No text, no logos, no watermarks, no subtitles. Keep same characters/people/animals throughout. Cinematic transitions only.${suf}`; })(),
+        ingredientImages: fi.map(idx => allFrames[idx].path),
+        _tmplMode: true,
+        fileIndex: fi[0] + 1,
+      };
+    }).filter(Boolean);
+
+    if (retryTasks.length === 0) return false;
+    const retryPayload = { ...payload, tasks: retryTasks };
+    await window.electronAPI.runVeo(retryPayload);
+    await waitAllDone(retryTasks.map(t => ({ id: t.id })));
+    return jobsRef.current.some(j => j.status === 'error');
+  };
+
+  const doStart = async () => {
+    if (!videoFile)   return setStepErr('Chưa chọn video gốc');
+    if (!frameFolder) return setStepErr('Chưa chọn thư mục lưu khung hình');
+    if (!outFolder)   return setStepErr('Chưa chọn thư mục lưu video');
+    setRunning(true); setPaused(false); pausedRef.current = false; pauseResolverRef.current = null;
+    window.electronAPI?.resumeVeo?.(); // reset VeoEngine._paused về false trước khi chạy mới
+    setStepErr(''); setFrames([]); setJobs([]); setMergedPath(null); setLogs([]); taskIds.current.clear();
+    jobsRef.current = [];
+    waitResolverRef.current = null;
+    // Đăng ký listener mới mỗi lần chạy, lưu wrapper để removeListener đúng handler
+    const _veoWrapper = registerVeoListener(addLog);
+
+    try {
+      // ── Bước 1: Trích xuất khung hình ────────────────────────────────────
+      setStep('⏳ Bước 1/3 — Đang trích xuất khung hình...');
+      addLog(`▶ Bắt đầu trích xuất khung hình (cách ${interval}s)`, 'info');
+      addLog(`  Video: ${videoFile}`, 'info');
+      addLog(`  Thư mục ảnh: ${frameFolder}`, 'info');
+      const extRes = await window.electronAPI.extractImages({ inputPath: videoFile, interval, outputFolder: frameFolder });
+      if (!extRes?.success) throw new Error('Trích xuất thất bại: ' + (extRes?.error || ''));
+      const extractedFrames = extRes.files || [];
+      setFrames(extractedFrames);
+      if (extractedFrames.length < 2) throw new Error('Cần ít nhất 2 khung hình (video quá ngắn hoặc interval quá lớn)');
+      addLog(`✅ Trích xuất xong: ${extractedFrames.length} ảnh → sẽ tạo ${extractedFrames.length - 1} video`, 'success');
+      setStep(`✅ Bước 1/3 — Đã trích xuất ${extractedFrames.length} khung hình`);
+
+      // ── Bước 1.5: Inpaint xóa logo khỏi ảnh gốc + thêm prompt dặn Veo ──────
+      // Phải sửa ảnh tham chiếu — prompt đơn thuần không đủ mạnh để override visual input
+      const logoPromptSuffix = ' Erase all text, logos, watermarks and channel names from every corner of every reference image. Output must be 100% clean — no text or branding anywhere.';
+      if (autoCleanLogo) {
+        const useCrop = true;
+        addLog(`🔍 Phân tích và ${useCrop ? 'cắt xén' : 'xóa'} logo khỏi ${extractedFrames.length} ảnh tham chiếu...`, 'info');
+        setStep(`⏳ Bước 1.5/3 — Đang ${useCrop ? 'cắt xén' : 'xóa'} logo khỏi ảnh...`);
+        const _wmWrapper = window.electronAPI?.onWatermarkLog?.((d) => {
+          if (d.type === 'info')       addLog(`  ℹ️ ${d.text}`, 'info');
+          else if (d.type === 'error') addLog(`  ⚠️ ${d.text}`, 'warn');
+          else if (d.type === 'regions') {
+            if (d.regions?.length === 0) addLog('  ℹ️ Không phát hiện logo nào', 'info');
+            else addLog(`  🎯 Phát hiện ${d.regions.length} vùng logo — đang ${useCrop ? 'cắt xén cạnh ảnh' : 'xóa khỏi ảnh'}...`, 'info');
+          } else if (d.type === 'progress') {
+            setStep(`⏳ ${useCrop ? 'Cắt xén' : 'Xóa logo'}: ${d.done}/${d.total} ảnh...`);
+            if (d.done === d.total) addLog(`  ✅ ${useCrop ? 'Cắt xén' : 'Xóa logo'} xong: ${d.total} ảnh`, 'success');
+          }
+        });
+        try {
+          const apiCall = useCrop
+            ? window.electronAPI?.autoCropWatermark?.({ folder: frameFolder })
+            : window.electronAPI?.autoRemoveWatermark?.({ folder: frameFolder });
+          const wmRes = await apiCall;
+          if (wmRes?.success && wmRes?.regions?.length > 0) {
+            const detail = useCrop && wmRes?.crop
+              ? ` (cắt còn ${wmRes.crop.new_w}×${wmRes.crop.new_h}px)`
+              : '';
+            addLog(`✅ ${useCrop ? 'Cắt xén' : 'Xóa'} logo khỏi ảnh: ${wmRes.regions.length} vùng / ${wmRes.total} ảnh${detail}`, 'success');
+          } else if (wmRes?.regions?.length === 0) {
+            addLog('  ℹ️ Không phát hiện logo — ảnh giữ nguyên', 'info');
+          } else {
+            addLog(`⚠️ Xử lý logo thất bại: ${wmRes?.error} — Tiếp tục với ảnh gốc`, 'warn');
+          }
+        } catch (e) {
+          addLog(`⚠️ Lỗi xử lý logo: ${e.message} — Tiếp tục với ảnh gốc`, 'warn');
+        } finally {
+          if (_wmWrapper) window.electronAPI?.removeListener?.('watermark-log', _wmWrapper);
+        }
+        setStep('✅ Bước 1.5/3 — Đã xử lý ảnh tham chiếu');
+      }
+
+      // ── Bước 2: Gửi lên Veo ─────────────────────────────────────────────────
+      // groupMode=3: 1-2-3, 4-5-6...        (Veo r2v, ổn định)
+      // groupMode=7: 1-2-3-4-5-6-7, 8-9-10-11-12-13-14 (Omni Flash 10s)
+      const G = groupMode;
+      // Prefix im lặng đặt ở ĐẦU prompt để Veo ưu tiên cao nhất
+      const silentPrefix = noSpeech
+        ? '[SILENT FILM — ABSOLUTELY NO HUMAN SPEECH] No talking, no dialogue, no voice, no narration, no singing, no whispering. Every character moves without making any vocal sound. Ambient background audio only (wind, nature, footsteps). '
+        : '';
+      const buildPrompt = (nums) => {
+        const sceneList = nums.join(', ');
+        const count = nums.length;
+        const flow = count <= 3
+          ? `flows through scenes ${sceneList} in order`
+          : `flows through scenes ${sceneList} in sequence`;
+        return `${silentPrefix}Smooth seamless video that ${flow}. No text, no logos, no watermarks, no subtitles. Keep same characters/people/animals throughout. Cinematic transitions only.${logoPromptSuffix}`;
+      };
+      const speechSuffix = (noSpeech
+        ? ' [SILENT FILM] No speech, no dialogue, no voice, no talking, no narration, no singing. Ambient sound only.'
+        : '') + logoPromptSuffix;
+      const triplets = [];
+      for (let i = 0; i + (G - 1) < extractedFrames.length; i += G) {
+        triplets.push(Array.from({ length: G }, (_, k) => i + k));
+      }
+      if (triplets.length === 0) throw new Error(`Cần ít nhất ${G} khung hình để tạo video`);
+
+      setStep(`⏳ Bước 2/3 — Đang gửi ${triplets.length} nhóm vào Veo...`);
+      addLog(`▶ Chuẩn bị ${triplets.length} nhóm ảnh (${G} ảnh/nhóm, bước ${G})...`, 'info');
+      addLog(`  Model: ${model} | Thời lượng: ${duration} | Chất lượng: ${quality} | Tỉ lệ: ${aspectRatio}`, 'info');
+
+      const tasks = triplets.map((indices, idx) => {
+        const id = `tmpl_${Date.now()}_${idx}`;
+        const nums = indices.map(i => i + 1);
+        return {
+          id, _tmplMode: true,
+          prompt: buildPrompt(nums),
+          ingredientImages: indices.map(i => extractedFrames[i].path),
+          fileIndex: idx + 1,
+          _frameIndices: indices,
+        };
+      });
+      tasks.forEach((t, idx) => {
+        taskIds.current.add(t.id);
+        addLog(`  Nhóm ${idx+1}: ảnh #${triplets[idx].map(i => i+1).join('-')}`, 'info');
+      });
+
+      const initJobs = tasks.map((t, idx) => {
+        const nums = triplets[idx].map(i => i+1);
+        return { id: t.id, label: `Nhóm ${idx+1} (${nums.join('-')})`, frameIndices: triplets[idx], status: 'pending', progress: 0, files: [] };
+      });
+      setJobs(initJobs);
+      jobsRef.current = initJobs;
+
+      addLog(`▶ Gửi ${tasks.length} task lên Veo...`, 'info');
+      const payload = { mediaType: 'Video', tasks, aspectRatio, model, outputFolder: outFolder, genCount: '1x', quality, duration, _speechSuffix: speechSuffix, _silentPrefix: silentPrefix };
+      const veoRes = await window.electronAPI.runVeo(payload);
+      if (veoRes?.error) throw new Error(veoRes.error);
+      addLog(`✅ Đã gửi vào hàng đợi — đang chờ Veo xử lý...`, 'success');
+      setStep(`⏳ Bước 2/3 — Đang chờ Veo tạo ${tasks.length} video...`);
+
+      // ── Chờ xong + retry phase 1 (tối đa 5 lần) ─────────────────────────
+      await waitAllDone(initJobs);
+      // Chờ nếu user đang tạm dừng (sau khi tất cả job settle — kể cả job bị từ chối do pause)
+      await pauseIfNeeded();
+      for (let r = 1; r <= 5; r++) {
+        const hasErr = jobsRef.current.some(j => j.status === 'error');
+        if (!hasErr) break;
+        setStep(`⏳ Bước 2/3 — Retry lần ${r}/5...`);
+        const stillErr = await retryRound(`Retry ${r}/5`, extractedFrames, payload);
+        await pauseIfNeeded();  // chờ nếu user tạm dừng sau mỗi retry
+        if (!stillErr) break;
+      }
+
+      // đánh dấu job vẫn lỗi là 'skipped' (phase 1 failed)
+      setJobs(prev => prev.map(j => j.status === 'error' ? { ...j, status: 'skipped' } : j));
+      jobsRef.current = jobsRef.current.map(j => j.status === 'error' ? { ...j, status: 'skipped' } : j);
+
+      const afterPhase1 = jobsRef.current;
+      const skip1 = afterPhase1.filter(j => j.status === 'skipped').length;
+      const done1  = afterPhase1.filter(j => j.status === 'done').length;
+      addLog(`📊 Sau phase 1: ${done1} OK, ${skip1} bỏ qua`, done1 > 0 ? 'success' : 'error');
+
+      // ── Retry phase 2: lại 5 lần cho các job bị skip ─────────────────────
+      if (skip1 > 0) {
+        addLog(`🔁 Phase 2: thử lại ${skip1} video bị bỏ qua...`, 'info');
+        setStep(`⏳ Bước 2/3 — Phase 2: retry ${skip1} video bị bỏ...`);
+        // reset skipped → error để retryRound bắt được
+        setJobs(prev => prev.map(j => j.status === 'skipped' ? { ...j, status: 'error' } : j));
+        jobsRef.current = jobsRef.current.map(j => j.status === 'skipped' ? { ...j, status: 'error' } : j);
+        for (let r = 1; r <= 5; r++) {
+          const hasErr = jobsRef.current.some(j => j.status === 'error');
+          if (!hasErr) break;
+          await pauseIfNeeded();
+          setStep(`⏳ Bước 2/3 — Phase 2, retry lần ${r}/5...`);
+          const stillErr = await retryRound(`Phase2 retry ${r}/5`, extractedFrames, payload);
+          if (!stillErr) break;
+        }
+        // job vẫn lỗi sau phase 2 → bỏ hẳn
+        setJobs(prev => prev.map(j => j.status === 'error' ? { ...j, status: 'skipped' } : j));
+        jobsRef.current = jobsRef.current.map(j => j.status === 'error' ? { ...j, status: 'skipped' } : j);
+      }
+
+      const finalJobs = jobsRef.current;
+      const doneFiles = finalJobs.filter(j => j.status === 'done').flatMap(j => j.files || []).filter(Boolean);
+      const errCount  = finalJobs.filter(j => j.status === 'skipped').length;
+      if (doneFiles.length === 0) throw new Error('Tất cả video đều thất bại sau 2 phase retry');
+      addLog(`✅ Hoàn tất: ${doneFiles.length} video OK${errCount > 0 ? `, ${errCount} bỏ qua` : ''}`, 'success');
+      setStep(`✅ Bước 2/3 — ${doneFiles.length} video hoàn thành${errCount > 0 ? `, ${errCount} bỏ qua` : ''}`);
+
+      // ── Bước 3: Ghép video ────────────────────────────────────────────────
+      if (doneFiles.length >= 2) {
+        setStep('⏳ Bước 3/3 — Đang ghép video...');
+        addLog(`▶ Ghép ${doneFiles.length} video lại thành 1 file...`, 'info');
+        addLog(`  Thư mục đầu ra: ${outFolder}`, 'info');
+        const outName = `template_merged_${Date.now()}`;
+        const mr = await window.electronAPI.mergeVideo({
+          files: doneFiles, trimStart: 0, trimEnd: 0,
+          transition: 'Không có',
+          outputFolder: outFolder, outputName: outName,
+        });
+        if (!mr?.success || !mr?.path) throw new Error(mr?.error || 'Ghép video thất bại');
+        setMergedPath(mr.path);
+        setPreviewUrl(`file:///${encodeURI(mr.path.replace(/\\/g,'/'))}`);
+        addLog(`✅ Ghép xong: ${mr.path}`, 'success');
+        setStep(`✅ Hoàn tất! Đã ghép ${doneFiles.length} video thành công`);
+      } else {
+        addLog(`ℹ Chỉ có ${doneFiles.length} video — bỏ qua bước ghép`, 'info');
+        setStep(`✅ Xong! Chỉ có ${doneFiles.length} video — không cần ghép`);
+      }
+      addLog('🎉 Pipeline hoàn tất!', 'success');
+    } catch(e) {
+      addLog(`❌ Lỗi: ${e.message}`, 'error');
+      setStepErr(e.message);
+      setStep('');
+    } finally {
+      if (_veoWrapper) window.electronAPI?.removeListener?.('veo-log', _veoWrapper);
+      setRunning(false);
+    }
+  };
+
+  const doneCount    = jobs.filter(j => j.status === 'done').length;
+  const runningCount = jobs.filter(j => j.status === 'running').length;
+  const canStart     = !!videoFile && !!frameFolder && !!outFolder && !running;
+
+  return (
+    <div className="flex h-full w-full overflow-hidden">
+      {/* LEFT: controls */}
+      <div className="w-80 shrink-0 flex flex-col gap-3 overflow-y-auto p-4 border-r border-slate-800">
+        <div className="text-sm font-bold text-cyan-400 flex items-center gap-2"><Video size={14}/> Dựng Video Theo Mẫu</div>
+
+        {/* 1. Video gốc */}
+        <div className="bg-slate-800/40 border border-slate-700/40 rounded-xl p-3 space-y-2">
+          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">1. Video gốc</div>
+          {videoFile
+            ? <div className="bg-slate-900/60 rounded-lg px-2 py-1.5 text-[10px] text-slate-300 break-all">{videoFile}</div>
+            : <div className="text-[10px] text-slate-600 italic">Chưa chọn video</div>}
+          <button onClick={pickVideo} disabled={running} className="w-full py-1.5 bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 text-white text-[11px] font-bold rounded-lg flex items-center justify-center gap-1.5"><FolderOpen size={11}/> Chọn video</button>
+        </div>
+
+        {/* 2. Thư mục ảnh */}
+        <div className="bg-slate-800/40 border border-slate-700/40 rounded-xl p-3 space-y-2">
+          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">2. Trích xuất khung hình</div>
+          <div className="flex items-center gap-2">
+            <label className="text-[10px] text-slate-400 shrink-0">Cách (s):</label>
+            <input type="number" min={1} max={120} value={interval} onChange={e=>setInterval(+e.target.value)} disabled={running}
+              className="w-16 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[11px] text-white text-center disabled:opacity-50"/>
+          </div>
+          <div className="text-[10px] font-semibold text-slate-400 mt-0.5">Thư mục lưu ảnh:</div>
+          {frameFolder
+            ? <div className="bg-slate-900/60 rounded-lg px-2 py-1.5 text-[10px] text-slate-300 break-all">{frameFolder}</div>
+            : <div className="text-[10px] text-slate-600 italic">Chưa chọn thư mục</div>}
+          <button onClick={pickFrameFolder} disabled={running} className="w-full py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-white text-[11px] font-bold rounded-lg flex items-center justify-center gap-1.5"><FolderOpen size={11}/> Chọn thư mục lưu ảnh</button>
+        </div>
+
+        {/* 3. Cài đặt Veo */}
+        <div className="bg-slate-800/40 border border-slate-700/40 rounded-xl p-3 space-y-2">
+          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">3. Cài đặt Veo I2V</div>
+          {/* Chế độ nhóm ảnh */}
+          <div className="flex flex-col gap-1">
+            <label className="text-[9px] text-slate-500 uppercase">Chế độ nhóm ảnh</label>
+            <div className="flex gap-1.5">
+              {[3, 7].map(g => (
+                <button key={g} onClick={() => !running && setGroupMode(g)} disabled={running}
+                  className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold border transition-all disabled:opacity-50 ${groupMode === g ? 'bg-cyan-600 border-cyan-500 text-white' : 'bg-slate-800 border-slate-600 text-slate-400 hover:border-slate-500'}`}>
+                  {g} ảnh{g >= 4 ? ' (Omni)' : ''}
+                </button>
+              ))}
+            </div>
+            {groupMode === 7 && <p className="text-[9px] text-amber-400">⚡ Omni Flash 10s — tự động chọn</p>}
+          </div>
+          {/* Tự động xóa logo */}
+          <div className="flex items-center justify-between py-1">
+            <div>
+              <div className="text-[10px] text-slate-300 font-semibold">Tự động dò &amp; cắt logo</div>
+              <div className="text-[9px] text-slate-500">{autoCleanLogo ? 'Phát hiện logo → cắt xén cạnh ảnh cho sạch' : 'Bỏ qua bước xử lý logo'}</div>
+            </div>
+            <div onClick={() => !running && setAutoCleanLogo(v => !v)}
+              className={`w-10 h-5 rounded-full transition-colors relative cursor-pointer shrink-0 ${autoCleanLogo ? 'bg-orange-500' : 'bg-slate-700'}`}>
+              <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${autoCleanLogo ? 'left-5' : 'left-0.5'}`}/>
+            </div>
+          </div>
+          {/* Lời thoại */}
+          <div className="flex items-center justify-between py-1">
+            <div>
+              <div className="text-[10px] text-slate-300 font-semibold">Lời thoại trong video</div>
+              <div className="text-[9px] text-slate-500">{noSpeech ? 'Không phát ra tiếng nói / lời thoại' : 'Cho phép có lời thoại'}</div>
+            </div>
+            <div onClick={() => !running && setNoSpeech(v => !v)}
+              className={`w-10 h-5 rounded-full transition-colors relative cursor-pointer shrink-0 ${!noSpeech ? 'bg-green-500' : 'bg-slate-700'}`}>
+              <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${!noSpeech ? 'left-5' : 'left-0.5'}`}/>
+            </div>
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="text-[9px] text-slate-500 uppercase">Model AI</label>
+            <select value={model} onChange={e=>setModel(e.target.value)} disabled={running}
+              className="w-full bg-[#1e293b] border border-blue-500/50 text-blue-300 text-[11px] font-semibold rounded-lg px-2 py-1.5 outline-none cursor-pointer disabled:opacity-50">
+              <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 - Lite [Lower Priority]</option>
+              <option value="Omni 1.1 Flash">Omni 1.1 Flash r2v (4/6/8/10s)</option>
+            </select>
+            {model === 'Omni 1.1 Flash' && <p className="text-[9px] text-amber-400">⚡ 30 tín dụng / video</p>}
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] text-slate-500 uppercase">Tỉ lệ</label>
+              <select value={aspectRatio} onChange={e=>setAspectRatio(e.target.value)} disabled={running}
+                className="bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-[10px] text-white disabled:opacity-50">
+                {['16:9','4:3','1:1','3:4','9:16'].map(r=><option key={r}>{r}</option>)}
+              </select>
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] text-blue-400 uppercase">Thời lượng</label>
+              <select value={duration} onChange={e=>setDuration(e.target.value)} disabled={running}
+                className="bg-[#1e293b] border border-blue-500/50 text-blue-300 font-bold rounded px-1.5 py-1 text-[10px] disabled:opacity-50">
+                {(model === 'Omni 1.1 Flash' ? TMPL_DURATIONS_OMNI : TMPL_DURATIONS_VEO).map(d=><option key={d}>{d}</option>)}
+              </select>
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] text-slate-500 uppercase">Chất lượng</label>
+              <select value={quality} onChange={e=>setQuality(e.target.value)} disabled={running}
+                className="bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-[10px] text-white disabled:opacity-50">
+                <option value="720p">720p</option>
+                <option value="1080p">1080p</option>
+              </select>
+            </div>
+          </div>
+          <div className="text-[10px] font-semibold text-slate-400 mt-0.5">Thư mục lưu video:</div>
+          {outFolder
+            ? <div className="bg-slate-900/60 rounded-lg px-2 py-1.5 text-[10px] text-slate-300 break-all">{outFolder}</div>
+            : <div className="text-[10px] text-slate-600 italic">Chưa chọn thư mục</div>}
+          <button onClick={pickOutFolder} disabled={running} className="w-full py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-white text-[11px] font-bold rounded-lg flex items-center justify-center gap-1.5"><FolderOpen size={11}/> Chọn thư mục lưu video</button>
+        </div>
+
+        {/* Nút Bắt đầu + Tạm dừng */}
+        <div className="flex gap-2">
+          <button onClick={doStart} disabled={!canStart}
+            className="flex-1 py-3 bg-gradient-to-r from-cyan-600 to-green-600 hover:from-cyan-500 hover:to-green-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-[13px] font-black rounded-xl flex items-center justify-center gap-2 shadow-lg transition-all">
+            {running && !paused ? <><Loader2 size={14} className="animate-spin"/> Đang chạy...</> : <><Play size={14}/> Bắt đầu</>}
+          </button>
+          {running && (
+            <button onClick={togglePause}
+              className={`px-4 py-3 rounded-xl text-[13px] font-black flex items-center gap-1.5 transition-all shadow-lg ${
+                paused
+                  ? 'bg-green-600 hover:bg-green-500 text-white'
+                  : 'bg-amber-500 hover:bg-amber-400 text-white'
+              }`}>
+              {paused ? <><Play size={14}/> Tiếp</> : <><Pause size={14}/> Dừng</>}
+            </button>
+          )}
+        </div>
+        {paused && (
+          <div className="text-[11px] font-semibold px-3 py-2 rounded-lg border text-amber-300 bg-amber-900/20 border-amber-700/40 flex items-center gap-2">
+            <Pause size={11}/> Đã tạm dừng — nhấn Tiếp để chạy lại
+          </div>
+        )}
+
+        {/* Status */}
+        {step && (
+          <div className={`text-[11px] font-semibold px-3 py-2 rounded-lg border ${step.startsWith('✅') ? 'text-green-400 bg-green-900/20 border-green-700/40' : 'text-blue-300 bg-blue-900/20 border-blue-700/40'}`}>
+            {step}
+          </div>
+        )}
+        {stepErr && (
+          <div className="text-[11px] text-red-400 bg-red-900/20 border border-red-700/40 px-3 py-2 rounded-lg">❌ {stepErr}</div>
+        )}
+
+        {/* Kết quả ghép */}
+        {mergedPath && (
+          <div className="bg-slate-800/40 border border-violet-700/40 rounded-xl p-3 space-y-2">
+            <div className="text-[10px] font-bold text-violet-400 uppercase">Video hoàn chỉnh</div>
+            <div className="bg-slate-900/60 rounded-lg px-2 py-1.5 text-[10px] text-slate-300 break-all">{mergedPath}</div>
+            <div className="flex gap-2">
+              <button onClick={()=>window.electronAPI.openFolder(outFolder)} className="flex-1 py-1.5 bg-slate-700 hover:bg-slate-600 text-white text-[10px] font-bold rounded-lg">📁 Mở thư mục</button>
+              <button onClick={()=>window.electronAPI.openFile(mergedPath)} className="flex-1 py-1.5 bg-violet-700 hover:bg-violet-600 text-white text-[10px] font-bold rounded-lg">▶ Mở video</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* RIGHT: frames + jobs + preview + log */}
+      <div className="flex-1 flex flex-col overflow-hidden">
+
+        {/* Top area: thumbnails + jobs + preview */}
+        <div className="flex-1 flex flex-col overflow-hidden">
+          {/* Thumbnails strip */}
+          {frames.length > 0 && (
+            <div className="p-3 border-b border-slate-800 bg-slate-900/30 shrink-0">
+              <div className="text-[10px] font-bold text-slate-400 uppercase mb-2">Khung hình ({frames.length})</div>
+              <div className="flex gap-2 overflow-x-auto pb-1">
+                {frames.map((f, i) => (
+                  <div key={i} className="flex flex-col items-center gap-1 shrink-0">
+                    <img src={`file:///${encodeURI(f.path.replace(/\\/g,'/'))}`} className="w-20 h-14 object-cover rounded border border-slate-600"/>
+                    <span className="text-[9px] text-slate-500">#{i+1}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Jobs + preview */}
+          {jobs.length > 0 ? (
+            <div className="flex flex-1 overflow-hidden">
+              {/* Job list */}
+              <div className="w-48 shrink-0 overflow-y-auto border-r border-slate-800 p-2 space-y-1">
+                <div className="text-[10px] font-bold text-slate-400 uppercase mb-1 px-1">Tiến trình ({jobs.filter(j=>j.status==='done').length}/{jobs.length})</div>
+                {jobs.map(j => {
+                  const sColor = j.status==='done'?'text-green-400':j.status==='running'?'text-blue-400':j.status==='error'?'text-red-400':'text-slate-500';
+                  const sIcon  = j.status==='done'?'✅':j.status==='running'?'⏳':j.status==='error'?'❌':'⏸';
+                  const hasFile = j.files?.length > 0;
+                  return (
+                    <div key={j.id} onClick={()=>{if(hasFile){const p=j.files[0];setPreviewUrl(p.startsWith('file://')?p:`file:///${encodeURI(p.replace(/\\/g,'/'))}`);}}}
+                      className={`flex flex-col gap-1 p-2 rounded-lg border transition-all cursor-pointer
+                        ${hasFile?'border-green-700/40 bg-green-900/10 hover:bg-green-900/20':'border-slate-700/40 bg-slate-800/30'}`}>
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-bold text-slate-300">{j.label}</span>
+                        <span className={`text-[10px] ${sColor}`}>{sIcon}</span>
+                      </div>
+                      {j.status==='running' && (
+                        <div className="w-full h-1 bg-slate-700 rounded-full overflow-hidden">
+                          <div className="h-full bg-blue-500 transition-all" style={{width:`${j.progress||0}%`}}/>
+                        </div>
+                      )}
+                      {hasFile && <div className="text-[9px] text-green-400">▶ Nhấn xem</div>}
+                    </div>
+                  );
+                })}
+              </div>
+              {/* Video preview */}
+              <div className="flex-1 flex items-center justify-center bg-black/40 p-3 overflow-y-auto">
+                {mergedPath ? (
+                  <div className="flex flex-col items-center gap-3 w-full max-w-2xl">
+                    <div className="text-[10px] font-bold text-violet-400 uppercase tracking-wider">🎬 Video hoàn chỉnh đã ghép</div>
+                    <video key={mergedPath} src={`file:///${encodeURI(mergedPath.replace(/\\/g,'/'))}`} controls autoPlay className="w-full rounded-xl border border-violet-600 shadow-2xl max-h-[55vh]"/>
+                    <div className="text-[10px] text-slate-400 truncate">{mergedPath.replace(/\\/g,'/').split('/').pop()}</div>
+                  </div>
+                ) : previewUrl ? (
+                  <div className="flex flex-col items-center gap-3 w-full max-w-2xl">
+                    <video key={previewUrl} src={previewUrl.startsWith('file://')?previewUrl:`file:///${encodeURI(previewUrl.replace(/\\/g,'/'))}`} controls autoPlay className="w-full rounded-xl border border-slate-700 shadow-2xl max-h-[45vh]"/>
+                    <div className="text-[10px] text-slate-400 truncate">{previewUrl.split('/').pop()}</div>
+                  </div>
+                ) : (
+                  <div className="text-center text-slate-600">
+                    <Film size={32} className="mx-auto mb-2 opacity-30"/>
+                    <p className="text-[11px]">Nhấn vào video đã hoàn thành để xem trước</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
+            logs.length === 0 && (
+              <div className="flex-1 flex items-center justify-center text-slate-700">
+                <div className="text-center">
+                  <Video size={44} className="mx-auto mb-3 opacity-20"/>
+                  <p className="text-[12px]">Chọn video gốc và nhấn Bắt đầu để chạy tự động</p>
+                </div>
+              </div>
+            )
+          )}
+        </div>
+
+        {/* Bottom: Log panel */}
+        <div className="h-48 shrink-0 border-t border-slate-700/60 bg-[#060c18] flex flex-col">
+          <div className="flex items-center justify-between px-3 py-1.5 border-b border-slate-800 shrink-0">
+            <div className="flex items-center gap-2">
+              <Terminal size={11} className="text-green-400"/>
+              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Log</span>
+              {running && <span className="text-[9px] text-blue-400 animate-pulse">● đang chạy</span>}
+            </div>
+            <button onClick={()=>setLogs([])} className="text-[9px] text-slate-600 hover:text-slate-400 transition-colors">Xóa</button>
+          </div>
+          <div className="flex-1 overflow-y-auto px-3 py-2 space-y-0.5 font-mono">
+            {logs.length === 0
+              ? <div className="text-[10px] text-slate-700 italic">Chưa có log...</div>
+              : logs.map((l, i) => (
+                  <div key={i} className="flex gap-2 text-[10px] leading-relaxed">
+                    <span className="text-slate-600 shrink-0">{l.t}</span>
+                    <span className={
+                      l.type==='success' ? 'text-green-400' :
+                      l.type==='error'   ? 'text-red-400'   :
+                      l.type==='progress'? 'text-blue-400'  :
+                      'text-slate-300'
+                    }>{l.msg}</span>
+                  </div>
+                ))
+            }
+            <div ref={logEndRef}/>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
 const SUB = [
   { id:'idea',        label:'Idea to Video',         icon:Zap,       color:'bg-violet-600' },
   { id:'script2vid',  label:'Script to Video',        icon:FileText,  color:'bg-green-600'  },
@@ -8146,17 +11425,64 @@ const SUB = [
   { id:'url2vid',     label:'Url to Video',            icon:Link,      color:'bg-rose-600'   },
   { id:'subtitle',    label:'Bóc tách - Dịch phụ đề', icon:Languages, color:'bg-amber-600'  },
   { id:'storyboard',  label:'Storyboard',              icon:Film,      color:'bg-pink-600'   },
+  { id:'template',    label:'Dựng Mẫu',                icon:Video,     color:'bg-cyan-600'   },
 ];
+
+const AA_HELP = [
+  { id:'idea', icon:'💡', color:'text-violet-400', label:'Idea to Video',
+    desc:'Nhập ý tưởng → AI viết kịch bản → tự động tạo ảnh DNA → tạo video từng cảnh → ghép thành video hoàn chỉnh. Pipeline toàn tự động từ ý tưởng đến video.' },
+  { id:'script2vid', icon:'📄', color:'text-green-400', label:'Script to Video',
+    desc:'Upload kịch bản có sẵn → AI phân cảnh → tạo ảnh tham chiếu từng cảnh → tạo video Veo theo thứ tự. Dùng khi đã có script, muốn bỏ qua bước viết kịch bản.' },
+  { id:'audio', icon:'🎵', color:'text-blue-400', label:'Audio to Video',
+    desc:'Upload file MP3/audio → AI phân tích nội dung → tự tạo ảnh + video theo từng đoạn audio. Phù hợp podcast, bài giảng, audio book muốn chuyển thành video.' },
+  { id:'url2vid', icon:'🔗', color:'text-rose-400', label:'URL to Video',
+    desc:'Nhập link YouTube/TikTok → AI tải, phân tích transcript → viết kịch bản mới → tạo ảnh DNA nhân vật/bối cảnh → tạo video. Remix nội dung từ video bất kỳ.' },
+  { id:'subtitle', icon:'💬', color:'text-amber-400', label:'Bóc tách - Dịch phụ đề',
+    desc:'Upload video → Whisper bóc tách lời thoại → AI dịch sang ngôn ngữ mục tiêu → xuất file SRT. Hỗ trợ 50+ ngôn ngữ, fallback Gemini nếu Whisper cục bộ lỗi.' },
+  { id:'storyboard', icon:'🎬', color:'text-pink-400', label:'Storyboard',
+    desc:'Tạo storyboard trực quan từ kịch bản. Upload ảnh tham chiếu nhân vật → AI phân cảnh → tạo ảnh minh họa từng cảnh → xuất PDF/PNG storyboard. Hỗ trợ đặt tên nhân vật để AI giữ nhất quán.' },
+  { id:'template', icon:'🎞️', color:'text-cyan-400', label:'Dựng Mẫu',
+    desc:'Upload video gốc → trích xuất khung hình theo khoảng cách (mặc định 8s/ảnh) → dùng Veo I2V tạo video liền mạch từng cặp ảnh liền kề (1→2, 2→3...) → lưu về thư mục.' },
+];
+
+function AAHelpModal({ onClose }) {
+  return (
+    <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-[#0d1321] border border-slate-700/60 rounded-2xl w-full max-w-2xl max-h-[80vh] overflow-y-auto shadow-2xl" onClick={e=>e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800 sticky top-0 bg-[#0d1321]">
+          <div className="flex items-center gap-2">
+            <span className="text-lg">📖</span>
+            <h2 className="text-sm font-bold text-white">Hướng dẫn Auto Animation</h2>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"><X size={15}/></button>
+        </div>
+        <div className="p-5 space-y-3">
+          {AA_HELP.map(h=>(
+            <div key={h.id} className="bg-slate-800/40 border border-slate-700/40 rounded-xl p-4">
+              <div className="flex items-center gap-2 mb-1.5">
+                <span className="text-base">{h.icon}</span>
+                <span className={`text-[11px] font-black uppercase tracking-wider ${h.color}`}>{h.label}</span>
+              </div>
+              <p className="text-[12px] text-slate-300 leading-relaxed">{h.desc}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// BilibiliReupPanel — moved to ReupVideoPanel.jsx
 
 export default function AutoAnimation() {
   const [panel, setPanel] = useState('idea');
+  const [showHelp, setShowHelp] = useState(false);
   return (
     <div className="flex flex-col h-full w-full bg-[#080e1a]">
+      {showHelp && <AAHelpModal onClose={()=>setShowHelp(false)}/>}
       <div className="h-11 shrink-0 flex items-center gap-3 px-5 border-b border-slate-800/80 bg-[#0a0f1e]">
         <div className="flex items-center gap-1.5 font-bold text-sm text-white">
-          <Layers size={15} className="text-violet-400"/> Auto Animation
         </div>
-        <ChevronRight size={12} className="text-slate-800"/>
         <div className="flex items-center gap-1">
           {SUB.map(p=>{
             const Ic=p.icon; const on=panel===p.id;
@@ -8169,6 +11495,7 @@ export default function AutoAnimation() {
             );
           })}
         </div>
+        <button onClick={()=>setShowHelp(true)} className="ml-auto w-7 h-7 rounded-full border border-slate-600 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white text-[11px] font-black flex items-center justify-center transition-colors" title="Hướng dẫn">?</button>
       </div>
       <div className="flex-1 overflow-hidden relative">
         <div className="absolute inset-0 flex" style={{ display: panel === 'idea'       ? 'flex' : 'none' }}><IdeaToVideoPanel/></div>
@@ -8177,6 +11504,7 @@ export default function AutoAnimation() {
         <div className="absolute inset-0 flex" style={{ display: panel === 'subtitle'  ? 'flex' : 'none' }}><SubtitlePanel/></div>
         <div className="absolute inset-0 flex" style={{ display: panel === 'url2vid'   ? 'flex' : 'none' }}><UrlToVideoPanel/></div>
         <div className="absolute inset-0 flex" style={{ display: panel === 'storyboard'? 'flex' : 'none' }}><StoryboardPanel/></div>
+        <div className="absolute inset-0 flex" style={{ display: panel === 'template'   ? 'flex' : 'none' }}><TemplateVideoPanel/></div>
       </div>
     </div>
   );

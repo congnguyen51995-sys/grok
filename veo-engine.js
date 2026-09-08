@@ -65,6 +65,7 @@ class VeoEngine {
         if (!response.ok) {
             const errText = await response.text();
             if (response.status === 403 && errText.includes("reCAPTCHA")) {
+                global.googleLabsAuth.recaptchaToken = null; // xóa token hỏng → request mới
                 throw new Error("Mã bảo vệ hết hạn. Mẹo: Hãy ra trình duyệt F5 lại tab Google Labs và bấm Tạo Ảnh ngay!");
             }
             throw new Error(`API Error ${response.status}: ${errText.substring(0, 100)}`);
@@ -82,22 +83,26 @@ class VeoEngine {
                     global.googleLabsAuth.recaptchaToken = null;
                     global.googleLabsAuth.needRecaptcha = true;
                     let wait = 0;
-                    while (!global.googleLabsAuth.recaptchaToken && wait < 15) {
+                    while (!global.googleLabsAuth.recaptchaToken && wait < 60) {
                         await new Promise(r => setTimeout(r, 1000));
                         wait++;
+                        if (wait % 5 === 0 && !global.googleLabsAuth.recaptchaToken) {
+                            global.googleLabsAuth.needRecaptcha = true;
+                            if (sendLog) sendLog(`[JOBID:${jobId}] ⏳ Chờ ReCaptcha (${wait}s) — re-signal Extension...`, 'info');
+                        }
                     }
                     const token = global.googleLabsAuth.recaptchaToken;
                     if (!token) {
-                        const err = new Error("Lấy mã ReCaptcha thất bại. Hãy F5 trang Google Labs.");
+                        const err = new Error("Lấy mã ReCaptcha thất bại sau 60s. Kiểm tra Extension đang mở tab Google Labs.");
                         reject(err);
                         throw err;
                     }
                     resolve(token);
                 } catch (e) {
                     reject(e);
-                    throw e; // re-throw để chain tiếp theo vẫn chạy được
+                    throw e;
                 }
-            }).catch(() => {}); // absorb để không block lock với unhandled rejection
+            }).catch(() => {});
         });
     }
 
@@ -239,15 +244,16 @@ class VeoEngine {
         const prio = isLowPriority ? 'low_priority' : 'relaxed';
 
         if (isI2V) {
+            // 8s = no _s_, no duration suffix; 4s/6s = with _s_, with duration suffix
             if (hasEndImage) {
-                // fl (start+end): 1080p → fl_ultra_*, 720p → {dur}s_fl_*
-                if (is1080p) return `veo_3_1_i2v_s_${tier}_fl_ultra_${prio}`;
-                const dur = (duration || '4s').replace(/[^0-9]/g, '') || '4';
+                if (is1080p) return `veo_3_1_i2v_${tier}_fl_ultra_${prio}`;
+                const dur = (duration || '8s').replace(/[^0-9]/g, '') || '8';
+                if (dur === '8') return `veo_3_1_i2v_${tier}_fl_${prio}`;
                 return `veo_3_1_i2v_s_${tier}_${dur}s_fl_${prio}`;
             }
-            // Start only: 1080p → ultra_*, 720p → {dur}s_*
-            if (is1080p) return `veo_3_1_i2v_s_${tier}_ultra_${prio}`;
-            const dur = (duration || '4s').replace(/[^0-9]/g, '') || '4';
+            if (is1080p) return `veo_3_1_i2v_${tier}_ultra_${prio}`;
+            const dur = (duration || '8s').replace(/[^0-9]/g, '') || '8';
+            if (dur === '8') return `veo_3_1_i2v_${tier}_${prio}`;
             return `veo_3_1_i2v_s_${tier}_${dur}s_${prio}`;
         }
 

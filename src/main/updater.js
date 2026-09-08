@@ -128,9 +128,9 @@ async function _autoDownload(mainWindow) {
   if (!_updateInfo?.downloadUrl) return;
   const destPath = path.join(os.tmpdir(), `FluxySetup_v${_updateInfo.newVersion}.exe`);
 
-  // Đã tải xong từ trước
+  // Đã tải xong từ trước → cài luôn
   if (_installerPath && fs.existsSync(_installerPath)) {
-    mainWindow?.webContents?.send('update:downloaded', { installerPath: _installerPath });
+    _silentInstall(_installerPath, mainWindow);
     return;
   }
 
@@ -141,13 +141,46 @@ async function _autoDownload(mainWindow) {
       (pct) => mainWindow?.webContents?.send('update:progress', { percent: pct })
     );
     _installerPath = destPath;
-    console.log(`[Updater] Tải xong: ${destPath}`);
+    console.log(`[Updater] Tải xong: ${destPath} — cài đặt silent...`);
     mainWindow?.webContents?.send('update:downloaded', { installerPath: destPath });
+    // Chờ 3s cho renderer nhận event rồi cài luôn
+    setTimeout(() => _silentInstall(destPath, mainWindow), 3000);
   } catch (e) {
     console.warn('[Updater] Tải thất bại:', e.message);
     mainWindow?.webContents?.send('update:download-error', { error: e.message });
     // Thử lại sau 2 phút
     setTimeout(() => _autoDownload(mainWindow), 2 * 60 * 1000);
+  }
+}
+
+// Cài đặt silent + tự khởi động lại app sau khi xong
+function _silentInstall(installerPath, mainWindow) {
+  if (!installerPath || !fs.existsSync(installerPath)) return;
+  try {
+    const appExePath = process.execPath; // path đến .exe hiện tại
+    const batchPath  = path.join(os.tmpdir(), 'fluxy_update_restart.bat');
+    // Batch: đợi app tắt → cài silent → đợi installer xong → mở lại app
+    const batch = [
+      '@echo off',
+      'timeout /t 2 /nobreak >nul',
+      `"${installerPath}" /S`,
+      'timeout /t 4 /nobreak >nul',
+      `start "" "${appExePath}"`,
+      'del "%~f0"',
+    ].join('\r\n');
+    fs.writeFileSync(batchPath, batch, 'utf8');
+    console.log(`[Updater] Chạy batch restart: ${batchPath}`);
+    spawn('cmd.exe', ['/c', batchPath], {
+      detached: true, stdio: 'ignore', windowsHide: true
+    }).unref();
+    // Gửi thông báo renderer rồi thoát
+    mainWindow?.webContents?.send('update:installing');
+    setTimeout(() => app.quit(), 1500);
+  } catch (e) {
+    console.warn('[Updater] Silent install thất bại:', e.message);
+    // Fallback: mở installer bình thường
+    spawn(installerPath, [], { detached: true, stdio: 'ignore' }).unref();
+    setTimeout(() => app.quit(), 1500);
   }
 }
 
@@ -181,18 +214,13 @@ function registerUpdaterHandlers() {
     }
   });
 
-  // Renderer yêu cầu cài đặt (chạy installer rồi thoát app)
+  // Renderer yêu cầu cài đặt — silent + tự restart
   ipcMain.handle('update:install', () => {
     if (!_installerPath || !fs.existsSync(_installerPath)) {
       return { success: false, error: 'File installer không tồn tại' };
     }
-    try {
-      spawn(_installerPath, [], { detached: true, stdio: 'ignore' }).unref();
-      setTimeout(() => app.quit(), 1000);
-      return { success: true };
-    } catch (e) {
-      return { success: false, error: e.message };
-    }
+    _silentInstall(_installerPath, _mainWindow);
+    return { success: true };
   });
 
   // Renderer muốn kiểm tra thủ công

@@ -1,10 +1,53 @@
 import { GoogleGenAI } from '@google/genai';
 import { retryWithKeyRotation } from './keyRotation.js';
 
-const TRANSCRIBE_MODEL = 'gemini-2.5-flash';
-const LLM_MODEL        = 'gemini-2.5-flash';
+let TRANSCRIBE_MODEL = 'gemini-3-flash-preview';
+let LLM_MODEL        = 'gemini-3-flash-preview';
+export function setAudioToVideoLLMModel(model) { if (model) { LLM_MODEL = model; TRANSCRIBE_MODEL = model; } }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ─── SharedKeyPool — pool chung cho nhiều slot song song ────────────────────
+// Mỗi key chỉ được dùng bởi 1 slot tại 1 thời điểm (inFlight).
+// Key bị quota sẽ vào cooldown, slot tự động lấy key tiếp theo còn trống.
+class SharedKeyPool {
+  constructor(keys) {
+    this._keys   = keys;
+    this._inFlight = new Set();   // indices đang dùng
+    this._cooldown = new Map();   // idx -> expiry ms
+    this._dead     = new Set();   // indices bị invalid vĩnh viễn
+  }
+  // Lấy key tiếp theo không bị busy/cooldown/dead. Bắt đầu tìm từ preferFrom.
+  acquire(preferFrom = 0) {
+    const now = Date.now();
+    for (let i = 0; i < this._keys.length; i++) {
+      const idx = (preferFrom + i) % this._keys.length;
+      if (this._dead.has(idx))     continue;
+      if (this._inFlight.has(idx)) continue;
+      const cd = this._cooldown.get(idx) || 0;
+      if (now < cd)                continue;
+      this._inFlight.add(idx);
+      return { idx, key: this._keys[idx] };
+    }
+    return null; // tất cả bận
+  }
+  release(idx, cooldownMs = 0) {
+    this._inFlight.delete(idx);
+    if (cooldownMs > 0) this._cooldown.set(idx, Date.now() + cooldownMs);
+  }
+  markDead(idx) { this._dead.add(idx); this._inFlight.delete(idx); }
+  get liveCount() { return this._keys.length - this._dead.size; }
+  // Chờ cho đến khi có key free (poll mỗi 200ms, timeout 3 phút)
+  async waitAcquire(preferFrom = 0, timeoutMs = 180_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const k = this.acquire(preferFrom);
+      if (k) return k;
+      await sleep(200);
+    }
+    throw new Error('SharedKeyPool timeout: tất cả key đều bị rate-limit quá lâu');
+  }
+}
 
 // ─── Auto-retry helper ─────────────────────────────────────────────────────────
 // Dùng cho lỗi tạm thời (Gemini trả rỗng, JSON lỗi, network timeout).
@@ -63,40 +106,104 @@ function extractFirstJSON(raw) {
   return null; // JSON bị cắt giữa chừng (maxTokens đụng)
 }
 
+// ─── 1a. Transcribe 1 chunk với 1 key cụ thể (không tự rotate) ─────────────
+async function transcribeAudioSingle(key, base64, mimeType, model) {
+  const ai = new GoogleGenAI({ apiKey: key });
+  let response;
+  try {
+    response = await ai.models.generateContent({
+      model: model || TRANSCRIBE_MODEL,
+      contents: [{ role: 'user', parts: [
+        { inlineData: { data: base64, mimeType } },
+        { text: `Transcribe in original spoken language (no translation). Return ONLY JSON:\n{"text":"full transcript","segments":[{"start":0.0,"end":3.5,"text":"sentence"},...]}`}
+      ]}],
+      config: {
+        maxOutputTokens: 8192,
+        ...(/gemini-2\.5/.test(model || TRANSCRIBE_MODEL) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+        httpOptions: { timeout: 45_000 }
+      }
+    });
+  } catch (e) {
+    const emsg = (e?.message || '').toLowerCase();
+    if (e?.name === 'AbortError' || emsg.includes('timeout') || emsg.includes('timed out') ||
+        emsg.includes('aborted') || e?.code === 'ECONNRESET' || e?.code === 'ETIMEDOUT') {
+      throw new Error(`TRANSCRIBE_TIMEOUT: ${e.message}`);
+    }
+    throw e;
+  }
+  const raw = (response?.text || '').trim().replace(/^```[a-z]*\n?/i,'').replace(/\n?```$/i,'').trim();
+  if (!raw) throw new Error('Gemini trả về rỗng khi transcribe audio');
+  const parsed = extractFirstJSON(raw);
+  if (!parsed) throw new Error(`Không parse được JSON: ${raw.slice(0,200)}`);
+  const segments = (parsed.segments || [])
+    .map(s => ({ start: parseFloat(s.start)||0, end: parseFloat(s.end)||0, text:(s.text||'').trim() }))
+    .filter(s => s.text);
+  const fullText = parsed.text || segments.map(s => s.text).join(' ');
+  if (segments.length === 0 && fullText) segments.push({ start:0, end:-1, text:fullText });
+  return { fullText, segments };
+}
+
+// Phân loại lỗi Gemini để SharedKeyPool xử lý đúng
+function classifyGeminiError(e) {
+  const msg = (e?.message || '').toLowerCase();
+  let raw = ''; try { raw = JSON.stringify(e).toLowerCase(); } catch { raw = msg; }
+  const is429 = raw.includes('"code":429') || raw.includes('"code": 429') || msg.includes('429') ||
+    raw.includes('resource_exhausted') || msg.includes('quota') || msg.includes('rate limit') ||
+    msg.includes('rate_limit') || msg.includes('too many requests') || msg.includes('exceeded') ||
+    msg.includes('tokens per') || msg.includes('requests per') || msg.includes('daily limit') || msg.includes('billing');
+  const isDead = raw.includes('"code":403') || raw.includes('"code": 403') || raw.includes('"code":401') ||
+    raw.includes('"code": 401') || msg.includes('permission_denied') || msg.includes('unauthorized') ||
+    msg.includes('unauthenticated') || msg.includes('invalid api key') || msg.includes('api key not valid') ||
+    msg.includes('access_token_type_unsupported') || raw.includes('access_token_type_unsupported') ||
+    msg.includes('not_found') || raw.includes('"code":404') || raw.includes('"status":"not_found"');
+  const isTimeout = msg.includes('transcribe_timeout');
+  return { is429, isDead, isTimeout };
+}
+
 // ─── 1. Transcribe 1 chunk audio via Gemini multimodal ───────────────────────
 // Timeout 90s/lần dùng config.httpOptions.timeout của SDK (@google/genai v1.x).
 // SDK dùng AbortController nội bộ → hủy HTTP connection thực sự.
 // Khác Promise.race (chỉ bỏ qua result chứ không cancel fetch) — đã thử và thất bại.
-const TRANSCRIBE_TIMEOUT_MS = 90_000; // 90 giây mỗi attempt
+const TRANSCRIBE_TIMEOUT_MS = 45_000; // 45 giây mỗi attempt
 
-export async function transcribeAudio(apiKeys, base64, mimeType, onSwitch) {
+export async function transcribeAudio(apiKeys, base64, mimeType, onSwitch, model = null, scriptText = null) {
   return retryWithKeyRotation(async (key) => {
     const ai = new GoogleGenAI({ apiKey: key });
+
+    // Nếu có kịch bản sẵn → chỉ hỏi Gemini về TIMING, text lấy từ kịch bản
+    // Nếu không → transcribe thông thường
+    const promptText = scriptText && scriptText.trim()
+      ? `You have the exact script that was read aloud in this audio. Your ONLY task is to find accurate timestamps for each sentence — do NOT change or paraphrase the text.
+
+EXACT SCRIPT (use this text verbatim):
+"""
+${scriptText.slice(0, 6000)}
+"""
+
+Listen to the audio and align each sentence/phrase to its timestamp. Split long sentences at natural pauses.
+Return ONLY valid JSON — all start/end must be positive numbers in seconds:
+{"segments":[{"start":0.0,"end":4.2,"text":"exact sentence from script"},...]}`
+      : `Transcribe in original spoken language (no translation). Return ONLY JSON:
+{"text":"full transcript","segments":[{"start":0.0,"end":3.5,"text":"sentence"},...]}`
 
     let response;
     try {
       response = await ai.models.generateContent({
-        model: TRANSCRIBE_MODEL,
+        model: model || TRANSCRIBE_MODEL,
         contents: [{
           role: 'user',
           parts: [
             { inlineData: { data: base64, mimeType } },
-            {
-              text: `Transcribe in original spoken language (no translation). Return ONLY JSON:
-{"text":"full transcript","segments":[{"start":0.0,"end":3.5,"text":"sentence"},...]}`
-            }
+            { text: promptText }
           ]
         }],
         config: {
-          maxOutputTokens: 8192, // tăng từ 3000 → tránh JSON bị cắt giữa chừng với audio dài
-          thinkingConfig: { thinkingBudget: 0 }, // tắt thinking → tiết kiệm token, nhanh hơn
-          // SDK-level timeout: hủy HTTP request sau 90s nếu Gemini không phản hồi
+          maxOutputTokens: 8192,
+          ...(/gemini-2\.5/.test(model || TRANSCRIBE_MODEL) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
           httpOptions: { timeout: TRANSCRIBE_TIMEOUT_MS }
         }
       });
     } catch (e) {
-      // Chuẩn hóa mọi dạng timeout / abort → TRANSCRIBE_TIMEOUT
-      // để retryOnError (outer) xử lý retry thay vì keyRotation
       const emsg = (e?.message || '').toLowerCase();
       if (
         e?.name === 'AbortError'                      ||
@@ -117,54 +224,153 @@ export async function transcribeAudio(apiKeys, base64, mimeType, onSwitch) {
       .replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
     if (!raw) throw new Error('Gemini trả về rỗng khi transcribe audio');
 
-    // Dùng brace-counting thay vì greedy regex:
-    // Greedy /\{[\s\S]*\}/ lấy tới dấu } CUỐI CÙNG → fail khi Gemini thêm text sau JSON
-    // Brace-counting dừng đúng tại } kết thúc object đầu tiên hợp lệ
     const parsed = extractFirstJSON(raw);
     if (!parsed) throw new Error(`Không parse được JSON từ Gemini: ${raw.slice(0, 200)}`);
-    const segments = (parsed.segments || [])
+
+    let segments = (parsed.segments || [])
       .map(s => ({ start: parseFloat(s.start) || 0, end: parseFloat(s.end) || 0, text: (s.text || '').trim() }))
       .filter(s => s.text);
 
-    const fullText = parsed.text || segments.map(s => s.text).join(' ');
-    if (segments.length === 0 && fullText) {
-      segments.push({ start: 0, end: -1, text: fullText });
+    // Kiểm tra segments có timestamp hợp lệ không
+    const hasValidTimestamps = segments.length > 1 && segments.every(s => s.end > 0 && s.end > s.start);
+    if (hasValidTimestamps) {
+      const fullText = parsed.text || segments.map(s => s.text).join(' ');
+      return { fullText, segments };
     }
-    return { fullText, segments };
-  // maxCycles: 2 — transcription quan trọng, cho phép 2 vòng
-  // TRANSCRIBE_TIMEOUT là "lỗi khác" → keyRotation throw ngay, retryOnError xử lý retry.
+
+    // Timestamps không hợp lệ → retry nội bộ tối đa 2 lần với prompt khác nhau
+    const retryPrompts = [
+      // Retry 1: chỉ yêu cầu timestamps, không quan tâm text
+      `Listen to this audio carefully and return ONLY valid timestamps in JSON format.
+Every start and end must be a POSITIVE number in seconds (not -1, not 0 for end).
+{"segments":[{"start":0.0,"end":3.5,"text":"spoken sentence here"},{"start":3.5,"end":8.2,"text":"next sentence"},...]
+Cover the ENTIRE audio from beginning to end. No segment should have end <= start or end = -1.`,
+      // Retry 2: chia nhỏ hơn, yêu cầu mỗi 5 giây một segment
+      `Transcribe this audio. Return JSON with segments every ~5 seconds.
+CRITICAL: end must always be GREATER than start. No -1 values allowed.
+{"segments":[{"start":0.0,"end":5.0,"text":"..."},{"start":5.0,"end":10.0,"text":"..."},...]}`
+    ];
+
+    for (let r = 0; r < retryPrompts.length; r++) {
+      await sleep(1500);
+      try {
+        const retryResp = await ai.models.generateContent({
+          model: model || TRANSCRIBE_MODEL,
+          contents: [{ role: 'user', parts: [
+            { inlineData: { data: base64, mimeType } },
+            { text: retryPrompts[r] }
+          ]}],
+          config: {
+            maxOutputTokens: 8192,
+            ...(/gemini-2\.5/.test(model || TRANSCRIBE_MODEL) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+            httpOptions: { timeout: TRANSCRIBE_TIMEOUT_MS }
+          }
+        });
+        const retryRaw = (retryResp?.text || '').trim().replace(/^```[a-z]*\n?/i,'').replace(/\n?```$/i,'').trim();
+        const retryParsed = extractFirstJSON(retryRaw);
+        if (!retryParsed) continue;
+        const retrySegs = (retryParsed.segments || [])
+          .map(s => ({ start: parseFloat(s.start)||0, end: parseFloat(s.end)||0, text:(s.text||'').trim() }))
+          .filter(s => s.text && s.end > s.start && s.end > 0);
+        if (retrySegs.length > 1) {
+          // Nếu có scriptText → thay text từ script vào theo thứ tự (giữ timing thật)
+          if (scriptText && scriptText.trim()) {
+            const scriptSentences = scriptText.trim().split(/(?<=[.!?…])\s+/).map(s => s.trim()).filter(Boolean);
+            retrySegs.forEach((seg, i) => {
+              if (scriptSentences[i]) seg.text = scriptSentences[i];
+            });
+          }
+          return { fullText: retrySegs.map(s => s.text).join(' '), segments: retrySegs };
+        }
+      } catch (_) { /* tiếp tục retry */ }
+    }
+
+    // Tất cả retry thất bại → throw để caller biết, không fake timestamp
+    throw new Error('TIMESTAMP_FAILED: Gemini không tạo được timestamp hợp lệ sau 3 lần thử. Vui lòng thử lại.');
   }, apiKeys, { onSwitch, maxCycles: 2 });
 }
 
-// ─── 1b. Transcribe toàn bộ audio — chunk 90s, xử lý tuần tự (PARALLEL = 1) ──
-// PARALLEL = 1 để tránh double-hit cùng API key khi nhiều key từ cùng 1 project.
-// Nếu PARALLEL = 2, cả 2 chunk đều thử key[0] đồng thời → quota cạn 2× nhanh hơn.
-// onLog(msg) — live log từng bước nhỏ (extract xong, heartbeat, retry, kết quả từng chunk)
-export async function transcribeAudioChunked(apiKeys, totalDuration, extractChunkFn, onProgress, onChunkDone, onLog) {
-  const CHUNK_SECS  = 90;
+// ─── 1b. Transcribe toàn bộ audio — dùng SharedKeyPool, tất cả key dùng chung ──
+// Mỗi slot song song lấy key từ pool chung. Key nào bị quota thì cooldown 60s,
+// slot tự động chờ key khác còn trống → không bao giờ 2 slot tranh cùng 1 key.
+// Chunk lỗi được retry tuần tự sau khi batch hoàn tất.
+export async function transcribeAudioChunked(apiKeys, totalDuration, extractChunkFn, onProgress, onChunkDone, onLog, tempoFactor = 1, model = null) {
+  const CHUNK_SECS  = 60;
   const keys        = (apiKeys || []).map(k => (k || '').trim()).filter(Boolean);
   const totalChunks = Math.ceil(totalDuration / CHUNK_SECS);
-
-  // PARALLEL = số key có sẵn, tối đa 8.
-  // Mỗi chunk được giao 1 key riêng (xoay vòng theo idx) → không đụng nhau.
-  // 1 key → tuần tự; 6 key → 6 chunk song song cùng lúc → nhanh 6×.
-  const PARALLEL = Math.min(keys.length || 1, 8, totalChunks);
+  const PARALLEL    = Math.min(keys.length || 1, 8, totalChunks);
 
   const allSegments = [];
   let fullText = '';
-
   const fmt = sec => `${Math.floor(sec/60)}:${String(Math.floor(sec%60)).padStart(2,'0')}`;
 
+  // Pool chung cho toàn bộ session transcription
+  const pool = new SharedKeyPool(keys);
+
+  // Helper: transcribe 1 chunk với SharedKeyPool, tự động rotate khi quota
+  const transcribeWithPool = async (ex) => {
+    let lastKeyIdx = 0;
+    let attempts   = 0;
+    const MAX_ATTEMPTS = keys.length * 3; // tối đa 3 vòng qua tất cả key
+
+    while (attempts < MAX_ATTEMPTS) {
+      const ke = await pool.waitAcquire(lastKeyIdx);
+      const chunkLabel = `Đoạn ${ex.idx + 1}/${totalChunks}`;
+      onLog?.(`  📤 ${chunkLabel} [key${ke.idx + 1}/${keys.length}] → Gemini...`);
+      let heartbeat;
+      try {
+        let elapsed = 0;
+        heartbeat = setInterval(() => {
+          elapsed += 15;
+          onLog?.(`  ⏳ ${chunkLabel} [key${ke.idx + 1}]: đang xử lý... (${elapsed}s)`);
+        }, 15_000);
+
+        const r = await transcribeAudioSingle(ke.key, ex.base64, ex.mimeType, model);
+        clearInterval(heartbeat);
+        pool.release(ke.idx, 0); // thành công, không cooldown
+
+        const chunkEnd  = ex.startSec + ex.durSec;
+        const offsetSegs = (r.segments || []).map(s => ({
+          start: parseFloat((Math.min(s.start * tempoFactor, ex.durSec) + ex.startSec).toFixed(3)),
+          end:   s.end === -1 ? chunkEnd : parseFloat((Math.min(s.end * tempoFactor, ex.durSec) + ex.startSec).toFixed(3)),
+          text:  s.text
+        })).filter(s => s.text && s.end > s.start);
+        return { offsetSegs, textChunk: r.fullText || '' };
+
+      } catch (err) {
+        clearInterval(heartbeat);
+        const { is429, isDead, isTimeout } = classifyGeminiError(err);
+
+        if (isDead) {
+          onLog?.(`  ⚠️ Đoạn ${ex.idx + 1}: key${ke.idx + 1} không hợp lệ (401/403/404) — bỏ key này`);
+          pool.markDead(ke.idx);
+          if (pool.liveCount === 0) throw new Error('Tất cả key đều không hợp lệ');
+          lastKeyIdx = ke.idx + 1;
+        } else if (is429) {
+          onLog?.(`  🔄 Đoạn ${ex.idx + 1}: key${ke.idx + 1} bị quota → thử key khác`);
+          pool.release(ke.idx, 61_000); // cooldown 61s
+          lastKeyIdx = ke.idx + 1;
+        } else if (isTimeout) {
+          pool.release(ke.idx, 0);
+          onLog?.(`  ⏱️ Đoạn ${ex.idx + 1}: timeout, thử lại...`);
+          lastKeyIdx = ke.idx;
+        } else {
+          pool.release(ke.idx, 0);
+          throw err; // lỗi không xử lý được
+        }
+      }
+      attempts++;
+    }
+    throw new Error(`Đoạn ${ex.idx + 1}: đã thử ${MAX_ATTEMPTS} lần vẫn thất bại`);
+  };
+
   for (let i = 0; i < totalChunks; i += PARALLEL) {
-    // ── Tập hợp slots trong batch này ─────────────────────────────────────────
     const slots = [];
     for (let p = 0; p < PARALLEL && (i + p) < totalChunks; p++) {
       const idx      = i + p;
       const startSec = idx * CHUNK_SECS;
       const durSec   = Math.min(CHUNK_SECS, totalDuration - startSec);
-      // Mỗi chunk bắt đầu từ key khác nhau — tránh nhiều chunk cùng dùng key[0]
-      const keyStart = keys.length > 1 ? idx % keys.length : 0;
-      slots.push({ idx, startSec, durSec, keyStart });
+      slots.push({ idx, startSec, durSec });
     }
 
     const rangeStr = slots.length > 1
@@ -172,77 +378,39 @@ export async function transcribeAudioChunked(apiKeys, totalDuration, extractChun
       : `${slots[0].idx + 1}`;
     onProgress?.(`Phần ${rangeStr}/${totalChunks}: ${fmt(slots[0].startSec)}–${fmt(slots[slots.length-1].startSec + slots[slots.length-1].durSec)}`);
 
-    // ── Extract audio song song ────────────────────────────────────────────────
+    // ── Extract audio song song ─────────────────────────────────────────────
     const extracted = await Promise.all(
       slots.map(slot =>
         extractChunkFn(slot.startSec, slot.durSec)
-          .then(r => {
-            if (r?.success !== false) {
-              onLog?.(`  📤 Đoạn ${slot.idx + 1}/${totalChunks} (${Math.round(slot.durSec)}s) [key${slot.keyStart + 1}] → Gemini...`);
-            }
-            return { ...slot, ...r };
-          })
+          .then(r => ({ ...slot, ...r }))
           .catch(e => ({ ...slot, success: false, error: e.message }))
       )
     );
 
-    // ── Transcribe song song — mỗi chunk dùng key riêng ──────────────────────
-    // Dùng Map để giữ thứ tự khi gộp segment (chunk nhanh hơn có thể về trước)
-    const batchMap = new Map(); // idx → { offsetSegs, textChunk } | { err }
-
+    // ── Transcribe song song với SharedKeyPool ──────────────────────────────
+    const batchMap = new Map();
     await Promise.all(
       extracted.map(ex => {
-        if (!ex.success) {
+        if (ex.success === false) {
           const msg = `Lỗi extract: ${ex.error}`;
           batchMap.set(ex.idx, { err: msg });
           onChunkDone?.(ex.idx + 1, totalChunks, 0, msg);
           return Promise.resolve();
         }
-
-        // Xoay keys để chunk này bắt đầu từ key của nó, fallback sang key tiếp theo
-        const rotatedKeys = keys.length > 1
-          ? [...keys.slice(ex.keyStart), ...keys.slice(0, ex.keyStart)]
-          : keys;
-
-        // Heartbeat mỗi 15s — cho thấy đang chờ Gemini phản hồi
-        let elapsed = 0;
-        const heartbeat = setInterval(() => {
-          elapsed += 15;
-          onLog?.(`  ⏳ Đoạn ${ex.idx + 1}/${totalChunks}: Gemini đang xử lý... (${elapsed}s)`);
-        }, 15_000);
-
-        // retryOnError: 2 lần (1 retry) — tổng tối đa 2×90s rồi bỏ chunk
-        return retryOnError(
-          () => transcribeAudio(rotatedKeys, ex.base64, ex.mimeType, null),
-          2, 3000
-        )
-        .then(r => {
-          clearInterval(heartbeat);
-
-          // Tính offset segment về timeline gốc
-          const chunkEnd = ex.startSec + ex.durSec;
-          const offsetSegs = (r.segments || []).map(s => ({
-            start: parseFloat((Math.min(s.start, ex.durSec) + ex.startSec).toFixed(3)),
-            end:   s.end === -1 ? chunkEnd
-                                : parseFloat((Math.min(s.end, ex.durSec) + ex.startSec).toFixed(3)),
-            text:  s.text
-          })).filter(s => s.text && s.end > s.start);
-
-          batchMap.set(ex.idx, { offsetSegs, textChunk: r.fullText || '' });
-          onChunkDone?.(ex.idx + 1, totalChunks, offsetSegs.length);
-        })
-        .catch(e => {
-          clearInterval(heartbeat);
-          const errMsg = e.message.includes('TRANSCRIBE_TIMEOUT')
-            ? `Timeout — Gemini không phản hồi sau 90s, bỏ qua đoạn này`
-            : e.message;
-          batchMap.set(ex.idx, { err: errMsg });
-          onChunkDone?.(ex.idx + 1, totalChunks, 0, errMsg);
-        });
+        return transcribeWithPool(ex)
+          .then(res => {
+            batchMap.set(ex.idx, res);
+            onChunkDone?.(ex.idx + 1, totalChunks, res.offsetSegs.length);
+          })
+          .catch(e => {
+            const errMsg = e.message || String(e);
+            batchMap.set(ex.idx, { err: errMsg });
+            onChunkDone?.(ex.idx + 1, totalChunks, 0, errMsg);
+          });
       })
     );
 
-    // ── Gộp kết quả theo đúng thứ tự chunk ───────────────────────────────────
+    // ── Gộp kết quả theo đúng thứ tự chunk ────────────────────────────────
     for (const slot of slots) {
       const res = batchMap.get(slot.idx);
       if (!res || res.err) continue;
@@ -250,8 +418,8 @@ export async function transcribeAudioChunked(apiKeys, totalDuration, extractChun
       if (res.textChunk) fullText += (fullText ? ' ' : '') + res.textChunk;
     }
 
-    // Delay nhỏ giữa các batch để tránh RPM spike
-    if (i + PARALLEL < totalChunks) await sleep(500);
+    // Delay nhỏ giữa các batch
+    if (i + PARALLEL < totalChunks) await sleep(300);
   }
 
   return { fullText, segments: allSegments };
@@ -289,22 +457,41 @@ function cleanDialogueText(text) {
 // ─── 2. Chia audio thành chunks theo timeline cố định (port từ Python) ────────
 export function createTimeBasedChunks(segments, totalAudioSeconds, chunkDuration = 8) {
   const totalChunks = Math.ceil(totalAudioSeconds / chunkDuration);
-  const chunks = [];
+  const norm = (t) => t.replace(/[.,!?'"]/g, '').trim().toLowerCase();
 
+  // Tiền xử lý: expand các segment quá dài (span > 30s) thành sub-segments
+  // để tránh 1 segment phủ toàn bộ chunks → mọi chunk nhận full text
+  const expandedSegs = [];
+  for (const seg of segments) {
+    const segDur = (seg.end || 0) - (seg.start || 0);
+    if (segDur > 30 && seg.text && seg.text.trim()) {
+      // Chia proportionally theo từ
+      const words = seg.text.trim().split(/\s+/);
+      const subCount = Math.ceil(segDur / chunkDuration);
+      const wordsPerSub = Math.ceil(words.length / subCount);
+      for (let si = 0; si < subCount; si++) {
+        const subStart = seg.start + (si / subCount) * segDur;
+        const subEnd   = seg.start + ((si + 1) / subCount) * segDur;
+        const subWords = words.slice(si * wordsPerSub, (si + 1) * wordsPerSub);
+        if (subWords.length > 0) {
+          expandedSegs.push({ start: subStart, end: subEnd, text: subWords.join(' ') });
+        }
+      }
+    } else {
+      expandedSegs.push(seg);
+    }
+  }
+
+  const chunks = [];
   for (let i = 0; i < totalChunks; i++) {
     const chunkStart = i * chunkDuration;
     const chunkEnd   = Math.min((i + 1) * chunkDuration, totalAudioSeconds);
 
-    const rawTexts = segments
+    const rawTexts = expandedSegs
       .filter(seg => seg.start < chunkEnd && seg.end > chunkStart)
       .map(seg => seg.text);
 
-    // Bước 1: Loại bỏ subtitle trùng liên tiếp (cùng text, khác timestamp)
-    // VD: sub#40 "Don't miss a single one." và sub#41 "Don't miss a single one." → giữ 1
-    const norm       = (t) => t.replace(/[.,!?'"]/g, '').trim().toLowerCase();
     const dedupTexts = rawTexts.filter((t, idx) => idx === 0 || norm(t) !== norm(rawTexts[idx - 1]));
-
-    // Bước 2: Làm sạch stutter/lặp trong text đã ghép
     const joined = dedupTexts.length > 0
       ? cleanDialogueText(dedupTexts.join(' '))
       : '[Không có lời thoại - Âm thanh môi trường]';
@@ -424,7 +611,7 @@ function sampleTranscriptForContext(fullText, maxChars = 10000) {
 // ─── 3. Phân tích tổng quát toàn bộ transcript ───────────────────────────────
 export async function analyzeOverallContent(apiKeys, fullTranscript, onSwitch) {
   // Lấy mẫu thông minh — bao phủ toàn bộ video thay vì chỉ đọc phần đầu
-  const sampled = sampleTranscriptForContext(fullTranscript, 10000);
+  const sampled = sampleTranscriptForContext(fullTranscript, 12000);
 
   return retryWithKeyRotation(async (key) => {
     const ai = new GoogleGenAI({ apiKey: key });
@@ -433,32 +620,277 @@ export async function analyzeOverallContent(apiKeys, fullTranscript, onSwitch) {
       contents: [{
         role: 'user',
         parts: [{
-          text: `Analyze this audio/video transcript to build a comprehensive content profile for video prompt generation.
-${fullTranscript.length > 10000 ? `(Note: This is a sampled excerpt from a long video — intro, 6 evenly-spaced middle samples, and outro)\n` : ''}
+          text: `You are a master filmmaker and story analyst. Read this audio/video transcript as a COMPLETE STORY and build a deep cinematic profile for generating a cohesive film — not isolated clips, but connected scenes with narrative depth.
+${fullTranscript.length > 10000 ? `(Note: This is a sampled excerpt — intro, evenly-spaced middle samples, and outro)\n` : ''}
 TRANSCRIPT:
 ${sampled}
 
-Return ONLY valid JSON (no markdown):
+Before returning JSON, think about:
+1. What is the CORE EMOTIONAL JOURNEY? (How does the audience feel from beginning to end?)
+2. What STORY ARC is being told? (Setup → Conflict → Climax → Resolution or another structure)
+3. What do characters MEAN by what they SAY? (Subtext, desire, fear)
+4. What VISUAL MOTIFS would unify this as one film?
+5. How should LIGHTING and COLOR shift across the story arc to reflect emotional changes?
+
+Return ONLY valid JSON (no markdown, no extra text):
 {
   "topic": "main topic in 1 sentence",
-  "tone": "content tone (e.g. educational, motivational, storytelling, news, documentary)",
-  "key_entities": ["person/brand/place/concept that appear repeatedly"],
+  "tone": "content tone (e.g. horror, thriller, motivational, documentary, romantic)",
+  "key_entities": ["person/brand/place/concept appearing repeatedly"],
   "visual_themes": ["dominant visual themes to represent this content"],
-  "narrative_arc": "overall narrative structure description",
+  "narrative_arc": "overall narrative structure in 2-3 sentences",
   "recommended_visual_style": "cinematography and visual style recommendation",
-  "context_summary": "2-3 sentence summary giving full context for each scene prompt generation"
+  "context_summary": "2-3 sentence summary giving full context for scene prompt generation",
+  "emotional_journey": "complete emotional arc from first scene to last (e.g. hope → dread → despair → survival)",
+  "story_acts": [
+    {
+      "act": 1,
+      "name": "Setup",
+      "time_range": "0s-Xs",
+      "description": "what happens in this act",
+      "dominant_emotion": "e.g. tension, curiosity",
+      "visual_tone": "e.g. cold blue desaturated light, or warm golden tones"
+    }
+  ],
+  "character_descriptions": [
+    {
+      "role": "protagonist / narrator / antagonist / secondary",
+      "visual_description": "detailed physical description for visual consistency: gender, age, clothing, hair, distinguishing features — specific enough for image generation. Use generic role descriptors, never real names.",
+      "emotional_arc": "how this character changes emotionally across the story"
+    }
+  ],
+  "narrative_beats": [
+    {
+      "beat_type": "inciting_incident | rising_action | midpoint | dark_moment | climax | resolution",
+      "approximate_time": "e.g. 30s",
+      "description": "what happens at this beat",
+      "dialogue_anchor": "the exact line of dialogue that marks this beat (empty string if none)",
+      "visual_suggestion": "how to visualize this beat cinematically"
+    }
+  ],
+  "visual_motifs": [
+    {
+      "motif": "e.g. shadows, running, reflections",
+      "meaning": "what it represents thematically",
+      "how_to_show": "specific visual direction"
+    }
+  ],
+  "character_background_sync": "ONE concise paragraph describing the protagonist's appearance AND the consistent environment/setting, written for copy-paste into every scene prompt to ensure visual continuity"
 }`
         }]
       }],
-      config: { maxOutputTokens: 1024, thinkingConfig: { thinkingBudget: 0 } }
+      config: { maxOutputTokens: 3000, thinkingConfig: { thinkingBudget: 0 } }
     });
 
     const raw = (response?.text || '').trim();
     const parsed = extractFirstJSON(raw.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim());
     if (!parsed) throw new Error(`Không parse được JSON phân tích tổng quát: ${raw.slice(0, 200)}`);
     return parsed;
-  // maxCycles: 2 — thử hết key 1 lần, chờ 15s, thử lại 1 lần nữa (66 calls max vs 165 cũ)
+  // maxCycles: 2 — thử hết key 1 lần, chờ 15s, thử lại 1 lần nữa
   }, apiKeys, { onSwitch, maxCycles: 2 });
+}
+
+// ─── 3b. Gemini + Stock: Phân tích sâu transcript → nhân vật + scene-per-segment ─────
+/**
+ * Phân tích transcript bằng Gemini:
+ *   Lần 1 (context): lấy topic / nhân vật / setting / style
+ *   Lần 2+ (batch 60 segment): sinh imagePrompt + videoPrompt cho từng segment
+ *
+ * @param {string[]}  apiKeys    - Gemini API keys
+ * @param {Array}     segments   - Whisper segments [{text, startTime, endTime}]
+ * @param {string}    fullText   - toàn bộ lời thoại
+ * @param {string}    scriptText - (tùy chọn) kịch bản có sẵn để căn chỉnh
+ * @param {Function}  onSwitch
+ * @returns {{ topic, tone, characters[], mainSetting, visualStyle, scenes[] }}
+ */
+export async function analyzeForGeminiStock(apiKeys, segments, fullText, scriptText, onSwitch) {
+  const sampled = fullText.length > 6000
+    ? fullText.slice(0, 3000) + '\n...\n' + fullText.slice(-1500)
+    : fullText;
+  const scriptBlock = scriptText?.trim()
+    ? `\n\nKịch bản có sẵn (căn chỉnh cảnh theo kịch bản này):\n${scriptText.slice(0, 4000)}`
+    : '';
+
+  // ── Bước 1: context tổng quát ─────────────────────────────────────────────
+  const ctx = await retryWithKeyRotation(async (key) => {
+    const ai = new GoogleGenAI({ apiKey: key });
+    const res = await ai.models.generateContent({
+      model: LLM_MODEL,
+      contents: [{ role: 'user', parts: [{ text:
+        `Analyze this audio transcript for video production.
+
+TRANSCRIPT:
+${sampled}
+${scriptBlock}
+
+Return ONLY valid JSON (no markdown):
+{
+  "topic": "main topic in 1 sentence",
+  "tone": "educational|motivational|storytelling|news|comedy|documentary",
+  "characters": [
+    {
+      "name": "character name or Narrator",
+      "description": "detailed visual: age, gender, ethnicity, clothing, hairstyle, facial features — specific enough for image generation",
+      "role": "main|secondary"
+    }
+  ],
+  "mainSetting": "primary visual setting description (e.g. modern office, dense jungle, city street at night)",
+  "visualStyle": "recommended cinematography style (e.g. photorealistic, cinematic, documentary)"
+}` }] }],
+      config: { maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } }
+    });
+    const raw = (res?.text || '').trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+    const parsed = extractFirstJSON(raw);
+    if (!parsed) throw new Error('Cannot parse context JSON: ' + raw.slice(0, 120));
+    return parsed;
+  }, apiKeys, { onSwitch, maxCycles: 2 });
+
+  // ── Bước 2: scene per segment (batch 60) ──────────────────────────────────
+  const MAX_PER_CALL = 60;
+  const fallbackScene = {
+    imagePrompt: `${ctx.mainSetting || 'cinematic scene'}, dramatic lighting, 4K professional photography`,
+    videoPrompt: `Slow cinematic pan across ${ctx.mainSetting || 'the scene'}, atmospheric mood, safe for all audiences, family-friendly, aspect ratio 16:9, cinematic shot`
+  };
+  const allScenes = new Array(segments.length).fill(null);
+
+  const ctxBlock = [
+    ctx.topic   ? `Topic: ${ctx.topic}` : '',
+    ctx.tone    ? `Tone: ${ctx.tone}` : '',
+    ctx.mainSetting ? `Main setting: ${ctx.mainSetting}` : '',
+    ctx.visualStyle ? `Style: ${ctx.visualStyle}` : '',
+    (ctx.characters || []).length ? `Characters: ${ctx.characters.map(c => `${c.name} — ${c.description}`).join('; ')}` : ''
+  ].filter(Boolean).join('\n');
+
+  for (let start = 0; start < segments.length; start += MAX_PER_CALL) {
+    const batch = segments.slice(start, start + MAX_PER_CALL);
+    const segList = batch.map((s, idx) => {
+      const t0 = typeof s.startTime === 'number' ? s.startTime.toFixed(1) : (s.start || 0);
+      const t1 = typeof s.endTime   === 'number' ? s.endTime.toFixed(1)   : (s.end   || 0);
+      return `${start + idx + 1}. [${t0}s-${t1}s] "${(s.text || '').slice(0, 180)}"`;
+    }).join('\n');
+
+    const scenesPrompt = `Create video scene descriptions for each dialogue segment below.
+
+CONTEXT:
+${ctxBlock}
+${scriptBlock}
+
+SEGMENTS:
+${segList}
+
+Rules:
+- imagePrompt: describe the SCENE visually (subject, environment, lighting, camera angle) — 1-2 sentences in English
+- videoPrompt: describe MOTION (camera movement, character action, environment dynamics) — 1-2 sentences, end with: safe for all audiences, family-friendly, aspect ratio 16:9, cinematic shot
+- Match visuals to what is being SAID in that segment
+- If character is mentioned/speaking → include their visual appearance (not name) in scene
+- Keep SFW, no violence
+
+Return ONLY a JSON array with exactly ${batch.length} objects:
+[{"imagePrompt":"...","videoPrompt":"..."}, ...]`;
+
+    try {
+      const batchScenes = await retryWithKeyRotation(async (key) => {
+        const ai = new GoogleGenAI({ apiKey: key });
+        const res = await ai.models.generateContent({
+          model: LLM_MODEL,
+          contents: [{ role: 'user', parts: [{ text: scenesPrompt }] }],
+          config: { maxOutputTokens: 4096, thinkingConfig: { thinkingBudget: 0 } }
+        });
+        const raw = (res?.text || '').trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+        const m = raw.match(/\[[\s\S]*\]/);
+        if (!m) throw new Error('No JSON array in response');
+        const arr = JSON.parse(m[0]);
+        if (!Array.isArray(arr)) throw new Error('Not an array');
+        return arr;
+      }, apiKeys, { onSwitch, maxCycles: 2 });
+
+      batchScenes.forEach((sc, idx) => { if (sc) allScenes[start + idx] = sc; });
+    } catch (e) {
+      console.warn('[analyzeForGeminiStock] batch scenes failed:', e.message);
+    }
+  }
+
+  const scenes = allScenes.map(s => s || fallbackScene);
+  return { ...ctx, scenes };
+}
+
+// ─── 3b. AI sinh từ khóa stock video từ transcript (1 lần gọi, batch tất cả chunk) ───
+/**
+ * Dùng Gemini để phân tích nội dung từng đoạn transcript và sinh ra
+ * 2-3 từ khóa tiếng Anh có tính hình ảnh để tìm stock video phù hợp.
+ *
+ * @param {string[]} apiKeys - Gemini API keys
+ * @param {Array}    chunks  - timeChunks array (mỗi phần tử có .exactText)
+ * @param {object}   overallCtx - kết quả analyzeOverallContent (topic, visual_themes, ...)
+ * @param {Function} onSwitch
+ * @returns {string[]} - mảng keyword string, 1 phần tử cho mỗi chunk
+ */
+export async function generateStockKeywordsAI(apiKeys, chunks, overallCtx, onSwitch) {
+  const contextBlock = overallCtx ? `
+Content topic: ${overallCtx.topic || ''}
+Tone: ${overallCtx.tone || ''}
+Visual themes: ${(overallCtx.visual_themes || []).join(', ')}
+Key entities: ${(overallCtx.key_entities || []).join(', ')}` : '';
+
+  // Giới hạn 60 segment mỗi lần gọi để tránh quá token
+  const MAX_PER_CALL = 60;
+  const fallbackKw = (overallCtx?.topic || 'nature landscape')
+    .replace(/[^\p{L}\s]/gu, ' ').split(/\s+/).slice(0, 3).join(' ') || 'nature landscape';
+
+  const results = new Array(chunks.length).fill(fallbackKw);
+
+  for (let start = 0; start < chunks.length; start += MAX_PER_CALL) {
+    const batch = chunks.slice(start, start + MAX_PER_CALL);
+    const segmentList = batch.map((ch, idx) => {
+      const text = (ch.exactText || '').trim().slice(0, 200);
+      return `${start + idx + 1}. "${text || '[no text]'}"`;
+    }).join('\n');
+
+    const prompt = `You are a stock video search expert. Given audio transcript segments, suggest 2-3 English keywords per segment to find relevant stock footage on Pexels/Pixabay.
+${contextBlock}
+
+Rules:
+- Keywords must be in ENGLISH (translate if needed)
+- Choose VISUAL concepts that represent the scene (e.g. "business meeting office", "mountain sunrise hiking", "city traffic night")
+- Prefer concrete, searchable nouns over abstract words
+- If segment mentions a person/action/place → use that as keyword
+- If segment is unclear/short → use overall content theme
+
+Segments:
+${segmentList}
+
+Return ONLY a JSON array with exactly ${batch.length} strings, one per segment:
+["keyword1 keyword2", "keyword3 keyword4", ...]`;
+
+    try {
+      const batchResult = await retryWithKeyRotation(async (key) => {
+        const ai = new GoogleGenAI({ apiKey: key });
+        const response = await ai.models.generateContent({
+          model: LLM_MODEL,
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          config: { maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } }
+        });
+        const raw = (response?.text || '').trim()
+          .replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+        // Tìm mảng JSON
+        const arrMatch = raw.match(/\[[\s\S]*\]/);
+        if (!arrMatch) throw new Error(`Gemini không trả về JSON array: ${raw.slice(0, 200)}`);
+        const arr = JSON.parse(arrMatch[0]);
+        if (!Array.isArray(arr)) throw new Error('Kết quả không phải array');
+        return arr;
+      }, apiKeys, { onSwitch, maxCycles: 2 });
+
+      batchResult.forEach((kw, idx) => {
+        const clean = (kw || '').toString().trim().slice(0, 80);
+        if (clean) results[start + idx] = clean;
+      });
+    } catch (e) {
+      console.warn('[generateStockKeywordsAI] batch failed:', e.message);
+      // giữ nguyên fallback cho batch này
+    }
+  }
+
+  return results;
 }
 
 // ─── 4. Tạo Veo prompt cho 1 chunk ───────────────────────────────────────────
@@ -469,20 +901,62 @@ export async function generateVeoPrompt(apiKeys, chunk, targetDuration, overallC
     10: '10 seconds: SLOW, SMOOTH pan/zoom. Detailed description. Slow cinematic movements.'
   };
 
-  const contextBlock = overallContext ? `
-CONTENT CONTEXT (use this to keep prompts consistent and accurate):
-- Topic: ${overallContext.topic || ''}
-- Tone: ${overallContext.tone || ''}
-- Key entities: ${(overallContext.key_entities || []).join(', ')}
-- Visual themes: ${(overallContext.visual_themes || []).join(', ')}
-- Recommended style: ${overallContext.recommended_visual_style || ''}
-- Summary: ${overallContext.context_summary || ''}
+  const ctx = overallContext || {};
+  const acts = ctx.story_acts || [];
+  const beats = ctx.narrative_beats || [];
+  const chars = ctx.character_descriptions || [];
+  const motifs = ctx.visual_motifs || [];
+  const _forcedStyle = ctx.recommended_visual_style || '';
+
+  // Find story position for this chunk
+  const chunkTimeSeconds = parseFloat((chunk.time || '0').split('-')[0]) || 0;
+  const currentAct = acts.find(a => {
+    const [s, e] = (a.time_range || '0s-9999s').replace(/s/g, '').split('-').map(Number);
+    return chunkTimeSeconds >= s && chunkTimeSeconds <= (e || 9999);
+  });
+  const nearestBeat = beats.find(b => {
+    const bt = parseFloat((b.approximate_time || '0').replace(/s/g, ''));
+    return Math.abs(bt - chunkTimeSeconds) < targetDuration * 2;
+  });
+
+  const storyPositionBlock = (currentAct || nearestBeat) ? `
+STORY POSITION FOR THIS SCENE:
+${currentAct ? `Current Act: Act ${currentAct.act} "${currentAct.name}" | Dominant emotion: ${currentAct.dominant_emotion} | Visual tone: ${currentAct.visual_tone}` : ''}
+${nearestBeat ? `Narrative beat: [${nearestBeat.beat_type.toUpperCase()}] ${nearestBeat.description}${nearestBeat.visual_suggestion ? ' | Visual: ' + nearestBeat.visual_suggestion : ''}` : ''}
 ` : '';
 
-  const systemInstruction = `You are an expert Video Prompt Engineer for Google Veo 3 video generation.
+  const storyArcBlock = (acts.length || chars.length) ? `
+STORY ARC CONTEXT:
+Emotional journey: ${ctx.emotional_journey || ctx.narrative_arc || ''}
+${chars.length ? `Characters: ${chars.map(c => `[${c.role}]: ${c.visual_description}`).join(' | ')}` : ''}
+${motifs.length ? `Visual motifs: ${motifs.map(m => `${m.motif} (${m.meaning})`).join(', ')}` : ''}
+` : '';
+
+  const contextBlock = ctx.topic ? `
+CONTENT CONTEXT:
+- Topic: ${ctx.topic}
+- Tone: ${ctx.tone || ''}
+- Visual themes: ${(ctx.visual_themes || []).join(', ')}
+- Summary: ${ctx.context_summary || ''}${ctx.character_background_sync ? `
+- CHARACTER & BACKGROUND SYNC (CRITICAL): ${ctx.character_background_sync}` : ''}${_forcedStyle ? `
+⚠️ MANDATORY VISUAL STYLE: ${_forcedStyle}` : ''}
+${storyArcBlock}${storyPositionBlock}` : '';
+
+  const systemInstruction = `You are a master filmmaker and Veo 3 prompt engineer creating ONE scene in a cohesive film.
 
 Write ONE complete, detailed Veo_Video_Prompt for a ${targetDuration}-second scene.
 ${contextBlock}
+━━━ CINEMATIC LAW — VISUAL-DIALOGUE ALIGNMENT ━━━
+Ask: "What does this dialogue MEAN emotionally? What does the speaker truly want or fear?"
+Encode THAT meaning into the visuals — not just someone talking:
+• Fear/dread in words → shadows encroaching, character small in frame, cold light
+• Determination/defiance → low-angle shot, harsh directional light, character dominant
+• Grief/loss → empty space, desaturated palette, rain or mist, isolated character
+• Revelation/twist → sudden spatial shift, jarring angle change, new environment
+• Hope/turning point → lighting shifts cold to warm, character moves toward light source
+• Danger/flight → handheld camera urgency, fragmented shadows, rapid movement
+Show the EMOTIONAL TRUTH of the dialogue, not the literal words.
+
 ━━━ 🚫 VEO CONTENT POLICY — MANDATORY, ZERO EXCEPTIONS ━━━
 Google Veo will REJECT prompts containing: graphic violence, blood, gore, weapons used violently, murder, torture, execution; adult/sexual content, nudity; hate speech, racism; drug use/manufacture; terrorism, bombs; disturbing or traumatic imagery.
 
@@ -589,73 +1063,116 @@ async function generateVeoPromptBatch(apiKeys, chunks, targetDuration, overallCo
     8:  '8 seconds: Standard Veo 3 pace. Balance between action and transition.',
     10: '10 seconds: SLOW, SMOOTH pan/zoom. Detailed description. Slow cinematic movements.'
   };
-  const contextBlock = overallContext ? `
-CONTENT CONTEXT (keep all prompts consistent with this):
-- Topic: ${overallContext.topic || ''}
-- Tone: ${overallContext.tone || ''}
-- Key entities: ${(overallContext.key_entities || []).join(', ')}
-- Visual themes: ${(overallContext.visual_themes || []).join(', ')}
-- Recommended style: ${overallContext.recommended_visual_style || ''}
-- Summary: ${overallContext.context_summary || ''}
+
+  // Build rich cinematic context from story arc analysis
+  const ctx = overallContext || {};
+  const acts = ctx.story_acts || [];
+  const beats = ctx.narrative_beats || [];
+  const motifs = ctx.visual_motifs || [];
+  const chars = ctx.character_descriptions || [];
+
+  const storyArcBlock = (acts.length || beats.length) ? `
+━━━ FILM STORY ARC (USE TO MAINTAIN NARRATIVE CONTINUITY) ━━━
+EMOTIONAL JOURNEY: ${ctx.emotional_journey || ctx.narrative_arc || ''}
+STORY ACTS:
+${acts.map(a => `  Act ${a.act} "${a.name}" [${a.time_range}]: ${a.description} | Emotion: ${a.dominant_emotion} | Visual tone: ${a.visual_tone}`).join('\n')}
+${beats.length ? `KEY NARRATIVE BEATS:
+${beats.map(b => `  [${b.approximate_time}] ${b.beat_type.toUpperCase()}: ${b.description}${b.dialogue_anchor ? ` → triggered by: "${b.dialogue_anchor}"` : ''}${b.visual_suggestion ? ` | Visual: ${b.visual_suggestion}` : ''}`).join('\n')}` : ''}
+${motifs.length ? `VISUAL MOTIFS (weave in naturally):
+${motifs.map(m => `  • ${m.motif}: ${m.meaning} → ${m.how_to_show}`).join('\n')}` : ''}
+${chars.length ? `CHARACTER VISUAL DESCRIPTIONS (use for consistency):
+${chars.map(c => `  [${c.role}]: ${c.visual_description} | Arc: ${c.emotional_arc}`).join('\n')}` : ''}
 ` : '';
 
-  const systemInstruction = `You are an expert Video Prompt Engineer for Google Veo 3 video generation.
-${contextBlock}
-For each scene provided, write ONE complete Veo_Video_Prompt for a ${targetDuration}-second clip.
+  const contextBlock = ctx.topic ? `
+━━━ CONTENT CONTEXT (keep all prompts consistent) ━━━
+Topic: ${ctx.topic}
+Tone: ${ctx.tone || ''}
+Visual themes: ${(ctx.visual_themes || []).join(', ')}
+Recommended style: ${ctx.recommended_visual_style || ''}
+Summary: ${ctx.context_summary || ''}${ctx.character_background_sync ? `
+CHARACTER & BACKGROUND SYNC (CRITICAL — copy into EVERY scene): ${ctx.character_background_sync}` : ''}
+` : '';
+
+  const systemInstruction = `You are a master filmmaker and Veo 3 prompt engineer. Your goal is to generate a COHESIVE FILM — not disconnected clips, but scenes that flow together with narrative depth and visual continuity.
+${contextBlock}${storyArcBlock}
+━━━ CINEMATIC LAW — VISUAL-DIALOGUE ALIGNMENT ━━━
+When a character speaks or narrates, ask: "What does this line MEAN emotionally? What does the speaker truly want or fear?"
+Then encode THAT meaning into the visuals — not just show someone talking:
+• Dialogue expressing fear/dread → environment mirrors it: cold light, shadows encroaching, character small in frame
+• Dialogue of determination → low-angle empowering shot, harsh directional light, character dominant in frame
+• Dialogue revealing a lie/secret → averted gaze, tight close-up on tension, environmental contrast (warmth vs cold)
+• Dialogue of grief/loss → empty space, desaturated palette, rain or mist, character isolated
+• Dialogue of revelation/twist → sudden spatial shift, jarring angle, new environment revealed
+• Dialogue of hope/turning point → lighting shifts from cold to warm, character moves toward light
+• Narrative moment of danger/chase → handheld urgency, fragmented environment, rapid shadows
+The prompt must SHOW what the dialogue MEANS — not just describe the literal words.
+
+━━━ SCENE CONTINUITY ━━━
+Each scene's lighting, color, and character emotional state must match WHERE IT FALLS in the story arc.
+If a scene is in Act 1 (Setup), visuals should feel grounded and establishing.
+If a scene is in Act 2 (Conflict/Rising Action), visuals should feel tense and unstable.
+If a scene is in Act 3 (Climax/Resolution), visuals should reflect the emotional peak or release.
+Character appearance and environment must remain CONSISTENT across all scenes.
 
 ━━━ 🚫 VEO CONTENT POLICY — MANDATORY, ZERO EXCEPTIONS ━━━
 Google Veo will REJECT prompts containing: graphic violence, blood, gore, weapons used violently, murder, torture, execution; adult/sexual content, nudity; hate speech, racism; drug use; terrorism, bombs; disturbing imagery.
 
 ⛔ PROMINENT PEOPLE RULE — ABSOLUTE BAN (causes PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED):
-NEVER write the real name of ANY real person. Replace with their role/occupation:
-• Any celebrity, politician, athlete, musician, actor, business leader, historical figure → use role only
-• Examples: "Elon Musk" → "a tech entrepreneur" | "Obama" → "a world leader" | "Taylor Swift" → "a famous singer" | "Ronaldo" → "a world-class athlete" | "Einstein" → "a scientist" | "Sơn Tùng" → "a popular singer"
-• Speaker/narrator names in audio → "a presenter", "a speaker", "the narrator"
-• ANY "Firstname Lastname" of a real person → replace with occupation/role description
-This rule applies even if the audio explicitly names the person — describe their ROLE, never their NAME.
+NEVER write the real name of ANY real person. Replace with role/occupation only.
+• Any celebrity, politician, athlete, musician, actor, historical figure → use role description
+• Speaker/narrator names → "a presenter", "a speaker", "the narrator"
+This rule applies even if the audio names the person — describe their ROLE, never their NAME.
 
-CRITICAL RULE — REFRAME SENSITIVE AUDIO INTO SAFE VISUALS:
-When dialogue/narration contains sensitive or figurative language, translate the EMOTION and NARRATIVE INTENT into a safe visual — do NOT literally visualize violent/sensitive words.
-
-Reframing examples (APPLY TO ALL SCENES):
-• "killed it / crushed it" → triumphant performer, team celebrating, athlete winning
-• "going to war / battle / fight" → determined teamwork, intense training, fierce dedication
-• "blood sweat and tears" → sweating hands on work, exhausted-but-determined face, tears of joy
-• "explosion of sales / bomb deal" → soaring bar charts, confetti celebration, fireworks over city
-• "cut throat / knife the competition" → chess strategy, intense negotiation, competitor analysis
-• "overdose of success / high on results" → mountain summit elation, team cheering, euphoric celebration
-• "massacre / slaughter (market/results)" → dramatic stock charts, newspaper montage, financial transformation
-• "drugs / medication" → doctor with patient, pharmacy, medical breakthrough, healthcare setting
-• "death / dying / kill (old ways)" → old technology replaced by new, transformation montage, rebirth imagery
-• "war / military / soldiers (business context)" → strategic boardroom, mission briefing, business team deployment
-If content is narrative fiction, visualize tastefully with implied action and emotional close-ups — never graphic detail.
+REFRAME SENSITIVE AUDIO INTO SAFE VISUALS:
+Translate EMOTION and NARRATIVE INTENT into safe cinematic visuals:
+• "killed it / crushed it" → triumphant, team celebrating, winning athlete
+• "going to war / battle / fight" → determined teamwork, fierce dedication, strategic intensity
+• "blood sweat and tears" → sweating hands, exhausted-but-determined face, tears of joy
+• "explosion / bomb deal" → soaring charts, confetti, fireworks celebration
+• "death / dying / kill (old ways)" → transformation montage, old replaced by new, rebirth
+• Narrative fiction with violence → implied action, emotional close-ups, never graphic detail
 
 ━━━ EACH PROMPT MUST INCLUDE ALL 9 ELEMENTS ━━━
-1. SUBJECT & ACTION — specific subject and what they are doing
-2. ENVIRONMENT/SETTING — location, indoor/outdoor, background details
-3. CAMERA MOVEMENT — dolly in/out, pan, orbit, tracking, crane, aerial, handheld, etc.
-4. LIGHTING — direction, quality, time of day, artificial/natural
-5. COLOR PALETTE — dominant colors and overall tone
-6. VISUAL STYLE — cinematic, documentary, photorealistic, hyper-real, etc.
-7. MOOD/ATMOSPHERE — emotional quality of the scene
-8. AUDIO CUES — ambient sounds, music tone, voice-over style (Veo 3 native audio)
+1. SUBJECT & ACTION — specific subject, what they are doing, emotional state shown in body language
+2. ENVIRONMENT/SETTING — location, indoor/outdoor, background details matching story arc stage
+3. CAMERA MOVEMENT — specific technique expressing the scene's emotion (dolly, orbit, handheld, crane, etc.)
+4. LIGHTING — direction, quality, time of day — must match the act's visual tone
+5. COLOR PALETTE — dominant colors reflecting current emotional beat of the story
+6. VISUAL STYLE — cinematic, documentary, photorealistic, etc. (consistent across all scenes)
+7. MOOD/ATMOSPHERE — emotional quality matching the narrative position
+8. AUDIO CUES — ambient sounds, music tone, voice-over style matching story beat
 9. END TAG — always close with: "safe for all audiences, family-friendly, aspect ratio 16:9, cinematic shot"
 
 ━━━ RULES ━━━
-- STRICT ALIGNMENT: every object/action/number in dialogue MUST appear in the prompt (safely reframed if sensitive).
+- STRICT CONTENT ALIGNMENT: every key object/action in dialogue MUST appear visually (safely reframed if sensitive)
 - DYNAMIC MOVEMENT: chain camera movements for 2+ ideas: "Starts with X, then pans to Y, reveals Z"
 - PACING: ${pacingMap[targetDuration] || pacingMap[8]}
-- NUMBERS/DATA: visualize as glowing holographic overlays or floating infographics.
-- LANGUAGE: 100% English output only. Translate from ANY input language.
+- UNIQUE: each prompt must be visually distinct — different angle, action, composition
+- LANGUAGE: 100% English output only
 
 ━━━ OUTPUT FORMAT ━━━
 Return ONLY a valid JSON array with exactly ${chunks.length} strings — one prompt per scene, in order:
 ["<prompt for scene 1>", "<prompt for scene 2>", ...]
-No markdown, no extra text, no explanation outside the JSON array.`;
+No markdown, no extra text outside the JSON array.`;
 
-  const scenesText = chunks.map(c =>
-    `Scene ${c.scene} | Time: ${c.time}\nDialogue: "${c.exactText}"`
-  ).join('\n\n---\n\n');
+  // Annotate each chunk with its story act and nearest narrative beat
+  const scenesText = chunks.map(c => {
+    const timeSeconds = parseFloat((c.time || '0').split('-')[0]) || 0;
+    const currentAct = acts.find(a => {
+      const [s, e] = (a.time_range || '0s-9999s').replace(/s/g, '').split('-').map(Number);
+      return timeSeconds >= s && timeSeconds <= (e || 9999);
+    });
+    const nearestBeat = beats.find(b => {
+      const bt = parseFloat((b.approximate_time || '0').replace(/s/g, ''));
+      return Math.abs(bt - timeSeconds) < targetDuration * 2;
+    });
+    const arcHint = [
+      currentAct ? `[Act ${currentAct.act}: ${currentAct.name} | Emotion: ${currentAct.dominant_emotion} | Visual: ${currentAct.visual_tone}]` : '',
+      nearestBeat ? `[Narrative beat: ${nearestBeat.beat_type} — ${nearestBeat.description}]` : '',
+    ].filter(Boolean).join(' ');
+    return `Scene ${c.scene} | Time: ${c.time}${arcHint ? '\n' + arcHint : ''}\nDialogue: "${c.exactText}"`;
+  }).join('\n\n---\n\n');
 
   return retryWithKeyRotation(async (key) => {
     const ai = new GoogleGenAI({ apiKey: key });
@@ -664,14 +1181,14 @@ No markdown, no extra text, no explanation outside the JSON array.`;
       contents: [{
         role: 'user',
         parts: [{
-          text: `${scenesText}\n\nWrite ONE complete Veo_Video_Prompt for EACH of the ${chunks.length} scenes above.\nReturn ONLY a JSON array of ${chunks.length} prompt strings, in order.`
+          text: `${scenesText}\n\nWrite ONE complete Veo_Video_Prompt for EACH of the ${chunks.length} scenes above. Apply the CINEMATIC LAW — make each prompt show what the dialogue MEANS emotionally, not just the literal words. Maintain visual continuity across all scenes.\nReturn ONLY a JSON array of ${chunks.length} prompt strings, in order.`
         }]
       }],
       config: {
         systemInstruction,
-        maxOutputTokens: chunks.length * 450,
+        maxOutputTokens: chunks.length * 500,
         thinkingConfig: { thinkingBudget: 0 },
-        temperature: 0.7
+        temperature: 0.65
       }
     });
 
@@ -688,7 +1205,6 @@ No markdown, no extra text, no explanation outside the JSON array.`;
     return prompts.map(p =>
       String(p).replace(/^["']|["']$/g, '').trim()
     );
-  // maxCycles: 2 — 66 calls max, có 1 chờ 15s giữa 2 vòng
   }, apiKeys, { onSwitch, maxCycles: 2 });
 }
 
@@ -810,6 +1326,321 @@ export async function analyzeScenes(apiKeys, chunks, targetDuration, overallCont
   }
 
   // Lọc bỏ slot undefined (nếu có lỗi extract nào đó)
+  return results.filter(Boolean);
+}
+
+// ─── 5b. analyzeScenesContinuity — Story Bible mode ─────────────────────────
+// Flow:
+//   Bước 0: Gemini đọc full transcript → tạo Story Bible JSON (nhân vật, bối cảnh, style)
+//   Bước 1+: Mỗi scene: "Viewer đang NGHE [audio] → SHOW visual minh họa đúng nội dung đó"
+//            + kế thừa Story Bible → nhân vật/bối cảnh nhất quán
+export async function analyzeScenesContinuity(
+  apiKeys, chunks, targetDuration, overallContext, fullText,
+  onSceneProgress, onSceneReady
+) {
+  const n = chunks.length;
+  const BATCH    = n > 150 ? 12 : n > 60 ? 10 : 6;
+  const DELAY_MS = 500;
+
+  const pacingMap = {
+    5:  '5s: FAST, SHARP action. Quick cuts. High energy.',
+    8:  '8s: Standard cinematic pace. Mix action and establishing shots.',
+    10: '10s: SLOW, SMOOTH pan/zoom. Rich detail. Contemplative.'
+  };
+
+  // ── Bước 0: Tạo Story Bible JSON từ full transcript ────────────────────────
+  const trimmedTx = (fullText || '').slice(0, 10000);
+  let bible = null; // structured JSON
+  let bibleText = ''; // fallback prose
+
+  onSceneProgress?.(0, n, 'Đang tạo Story Bible...');
+  try {
+    const rawBible = await retryWithKeyRotation(async (key) => {
+      const ai = new GoogleGenAI({ apiKey: key });
+      const res = await ai.models.generateContent({
+        model: LLM_MODEL,
+        contents: [{ role: 'user', parts: [{ text: `You are a visual Story Bible creator for Google Veo 3 video generation.
+
+Analyze this audio/video transcript and create a STRUCTURED STORY BIBLE in JSON format.
+This bible will be used to generate consistent Veo video prompts for EVERY scene.
+
+TRANSCRIPT:
+${trimmedTx}
+
+${overallContext ? `OVERALL CONTEXT: ${overallContext.topic || ''} | ${overallContext.tone || ''} | ${overallContext.context_summary || ''}` : ''}
+${overallContext?.character_background_sync ? `USER CHARACTER NOTES: ${overallContext.character_background_sync}` : ''}
+
+Return ONLY valid JSON (no markdown, no explanation):
+{
+  "title": "story title",
+  "genre": "genre/style (e.g. documentary, drama, tutorial, storytelling)",
+  "visual_style": "detailed Veo visual style: camera type, film grain, color grade, lighting style",
+  "color_palette": "primary colors that define the mood throughout",
+  "characters": [
+    {
+      "role": "safe role name for Veo (NO real names — e.g. 'the narrator', 'the hero', 'the mentor')",
+      "keywords": ["name variations that appear in transcript to identify this character"],
+      "visual": "detailed physical description: age, gender, appearance, clothing, distinctive features — consistent across ALL scenes"
+    }
+  ],
+  "locations": [
+    {
+      "name": "location name",
+      "keywords": ["words in transcript that indicate this location"],
+      "visual": "detailed visual description: architecture, lighting, atmosphere, props"
+    }
+  ],
+  "narrative_arc": {
+    "opening": "visual tone for first 20% of video",
+    "rising": "visual tone for middle 60%",
+    "climax_resolution": "visual tone for final 20%"
+  },
+  "recurring_motifs": ["3-5 visual symbols/themes repeated throughout"],
+  "camera_style": "preferred camera movements and shot types"
+}` }] }],
+        config: { maxOutputTokens: 1200, thinkingConfig: { thinkingBudget: 0 }, temperature: 0.4 }
+      });
+      return (res?.text || '').trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+    }, apiKeys, { maxCycles: 2 });
+
+    const m = rawBible.match(/\{[\s\S]*\}/);
+    if (m) bible = JSON.parse(m[0]);
+    bibleText = rawBible;
+  } catch (e) {
+    console.warn('[StoryBible] Tạo JSON thất bại, dùng prose fallback:', e.message);
+    bibleText = overallContext
+      ? `Topic: ${overallContext.topic || ''}. Tone: ${overallContext.tone || ''}. Style: ${overallContext.recommended_visual_style || 'cinematic'}. Summary: ${overallContext.context_summary || ''}.`
+      : 'Cinematic documentary style. Maintain visual consistency.';
+  }
+
+  // ── Build character lookup: keyword → visual description ──────────────────
+  // Dùng khi resolve tên nhân vật trong audio transcript → visual description
+  const charLookup = []; // [{keywords: [], role: '', visual: ''}]
+  if (bible?.characters) {
+    bible.characters.forEach(c => {
+      charLookup.push({
+        keywords: (c.keywords || []).map(k => k.toLowerCase()),
+        role: c.role || '',
+        visual: c.visual || '',
+      });
+    });
+  }
+
+  const resolveCharacters = (text) => {
+    // Thay tên nhân vật trong transcript bằng visual description từ bible
+    let resolved = text;
+    charLookup.forEach(({ keywords, role, visual }) => {
+      keywords.forEach(kw => {
+        if (kw && resolved.toLowerCase().includes(kw)) {
+          resolved = resolved.replace(new RegExp(kw, 'gi'), `${role} (${visual.slice(0, 80)})`);
+        }
+      });
+    });
+    return resolved;
+  };
+
+  const locationLookup = (bible?.locations || []).map(l => ({
+    keywords: (l.keywords || []).map(k => k.toLowerCase()),
+    name: l.name || '',
+    visual: l.visual || '',
+  }));
+
+  const resolveLocation = (text) => {
+    for (const loc of locationLookup) {
+      if (loc.keywords.some(k => k && text.toLowerCase().includes(k))) {
+        return loc.visual;
+      }
+    }
+    return '';
+  };
+
+  // ── Compact bible summary cho system prompt ────────────────────────────────
+  const bibleCompact = bible ? [
+    `GENRE: ${bible.genre || ''}`,
+    `VISUAL STYLE: ${bible.visual_style || ''}`,
+    `COLOR PALETTE: ${bible.color_palette || ''}`,
+    `CAMERA: ${bible.camera_style || ''}`,
+    bible.characters?.length ? `CHARACTERS:\n${bible.characters.map(c => `  - ${c.role}: ${c.visual}`).join('\n')}` : '',
+    bible.locations?.length  ? `LOCATIONS:\n${bible.locations.map(l => `  - ${l.name}: ${l.visual}`).join('\n')}` : '',
+    bible.recurring_motifs?.length ? `MOTIFS: ${bible.recurring_motifs.join(', ')}` : '',
+  ].filter(Boolean).join('\n') : bibleText;
+
+  // ── System prompt cố định ─────────────────────────────────────────────────
+  const BASE_SYSTEM = `You are an expert Voice-Synced Narrative Video Prompt Engineer for Google Veo 3.
+
+━━━ STORY BIBLE ━━━
+${bibleCompact}
+
+━━━ VOICE-VIDEO SYNC RULE (MOST IMPORTANT) ━━━
+Each scene has an AUDIO TRANSCRIPT — what the viewer is HEARING.
+Your job: write a visual prompt that ILLUSTRATES exactly what is being said/narrated.
+- If audio says "she walks into the forest" → show that character entering a forest
+- If audio is explaining a concept → show that concept visually with metaphors
+- If audio is emotional narration → show faces, environments that FEEL that emotion
+- The visual must make sense WITH the audio, not just be thematically similar
+
+━━━ CONSISTENCY RULES ━━━
+- Use character descriptions from Story Bible whenever that character is in the scene
+- Use location descriptions from Story Bible for settings
+- Maintain visual style, color palette, camera style throughout ALL scenes
+- Characters must look IDENTICAL across every scene (same clothes, age, features)
+
+━━━ 🚫 VEO CONTENT POLICY ━━━
+NEVER: graphic violence, blood, weapons, adult content, nudity, hate speech, drugs, terrorism.
+⛔ PROMINENT PEOPLE: NEVER use real person names. Replace: "Elon Musk" → "a visionary tech entrepreneur".
+REFRAME: "killed it" → "dominated the stage", "war" → "intense competition".
+
+━━━ PROMPT STRUCTURE ━━━
+[Character(s) doing action that matches audio] + [Setting from bible] + [Camera movement] + [Lighting] + [Color] + [Mood] + [Style]. Safe for all audiences, family-friendly.
+
+PACING: ${pacingMap[targetDuration] || pacingMap[8]}
+LANGUAGE: 100% English.`;
+
+  // ── Build narrative position per scene ────────────────────────────────────
+  const totalScenes = n;
+  const getNarrativePhase = (idx) => {
+    const pct = idx / totalScenes;
+    if (!bible?.narrative_arc) return '';
+    if (pct < 0.2) return `NARRATIVE: Opening — ${bible.narrative_arc.opening || 'Establish the world'}`;
+    if (pct < 0.8) return `NARRATIVE: Rising action — ${bible.narrative_arc.rising || 'Build tension'}`;
+    return `NARRATIVE: Climax/Resolution — ${bible.narrative_arc.climax_resolution || 'Resolve and conclude'}`;
+  };
+
+  // ── Batch groups ──────────────────────────────────────────────────────────
+  const batchGroups = [];
+  for (let i = 0; i < n; i += BATCH) {
+    batchGroups.push({ startIdx: i, chunks: chunks.slice(i, i + BATCH) });
+  }
+
+  const results     = new Array(n);
+  const donePrompts = [];
+
+  const processBatch = async (group, batchIdx) => {
+    const { startIdx, chunks: batchChunks } = group;
+    onSceneProgress?.(startIdx + 1, n);
+
+    // Continuity context: 4 prompt gần nhất
+    const prevSnippets = donePrompts.slice(-4)
+      .map((p, i) => `S${startIdx - Math.min(donePrompts.length, 4) + i + 1}: ${p.slice(0, 90)}`)
+      .join('\n');
+    const continuityBlock = prevSnippets
+      ? `PREVIOUS SCENES (continue seamlessly):\n${prevSnippets}`
+      : 'OPENING SCENES — establish the visual world from Story Bible.';
+
+    // Build scene list with character/location resolution
+    const scenesText = batchChunks.map(c => {
+      const phase = getNarrativePhase(c.scene - 1);
+      const locVisual = resolveLocation(c.exactText);
+      return `Scene ${c.scene} [${c.time}]${phase ? ` (${phase})` : ''}:
+AUDIO (what viewer HEARS): "${c.exactText}"
+${locVisual ? `SETTING HINT: ${locVisual}` : ''}`;
+    }).join('\n\n');
+
+    const userMsg = `${continuityBlock}
+
+${scenesText}
+
+For EACH scene above:
+1. READ the audio transcript carefully — understand what is being said/narrated
+2. RESOLVE which Story Bible characters and locations are present
+3. WRITE a Veo prompt where the VISUAL directly illustrates the audio content
+4. ENSURE character appearances match Story Bible exactly
+
+Return ONLY a JSON array of exactly ${batchChunks.length} English Veo prompt strings:
+["<prompt 1>", "<prompt 2>", ...]`;
+
+    const systemInstruction = BASE_SYSTEM;
+
+    let batchPrompts = null;
+    try {
+      batchPrompts = await retryWithKeyRotation(async (key) => {
+        const ai = new GoogleGenAI({ apiKey: key });
+        const res = await ai.models.generateContent({
+          model: LLM_MODEL,
+          contents: [{ role: 'user', parts: [{ text: userMsg }] }],
+          config: {
+            systemInstruction,
+            maxOutputTokens: batchChunks.length * 480,
+            thinkingConfig: { thinkingBudget: 0 },
+            temperature: 0.6
+          }
+        });
+        const raw = (res?.text || '').trim()
+          .replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+        const m = raw.match(/\[[\s\S]*\]/);
+        if (!m) throw new Error('Không tìm thấy JSON array');
+        const arr = JSON.parse(m[0]);
+        if (!Array.isArray(arr) || arr.length !== batchChunks.length)
+          throw new Error(`Nhận ${arr?.length ?? 0}/${batchChunks.length} prompts`);
+        return arr.map(p => String(p).replace(/^["']|["']$/g, '').trim());
+      }, apiKeys, {
+        onSwitch: ({ fromIdx, toIdx }) => onSceneProgress?.(startIdx + 1, n, `Key ${fromIdx + 1}→${toIdx + 1}`),
+        maxCycles: 2
+      });
+    } catch (batchErr) {
+      console.warn(`[StoryBible] Batch ${batchIdx} lỗi, fallback đơn lẻ:`, batchErr.message);
+    }
+
+    for (let j = 0; j < batchChunks.length; j++) {
+      const chunk  = batchChunks[j];
+      const absIdx = startIdx + j;
+      onSceneProgress?.(absIdx + 1, n);
+
+      if (batchPrompts?.[j]) {
+        const sd = {
+          sceneNumber: chunk.scene, timeEstimation: chunk.time,
+          dialogue: chunk.exactText, veoVideoPrompt: batchPrompts[j],
+        };
+        results[absIdx] = sd;
+        donePrompts.push(batchPrompts[j]);
+        onSceneReady?.(sd, false);
+      } else {
+        try {
+          const phase = getNarrativePhase(chunk.scene - 1);
+          const locVisual = resolveLocation(chunk.exactText);
+          const singleMsg = `Scene ${chunk.scene} [${chunk.time}]${phase ? ` (${phase})` : ''}:
+AUDIO (what viewer HEARS): "${chunk.exactText}"
+${locVisual ? `SETTING: ${locVisual}` : ''}
+${prevSnippets ? `PREVIOUS: ${donePrompts.slice(-2).map(p => p.slice(0, 80)).join(' → ')}` : ''}
+
+Write ONE Veo prompt that visually illustrates this audio. Return ONLY the prompt string.`;
+          const veoPrompt = await retryWithKeyRotation(async (key) => {
+            const ai = new GoogleGenAI({ apiKey: key });
+            const res = await ai.models.generateContent({
+              model: LLM_MODEL,
+              contents: [{ role: 'user', parts: [{ text: singleMsg }] }],
+              config: { systemInstruction, maxOutputTokens: 500, thinkingConfig: { thinkingBudget: 0 }, temperature: 0.6 }
+            });
+            return (res?.text || '').trim().replace(/^["']|["']$/g, '');
+          }, apiKeys, {
+            onSwitch: ({ fromIdx, toIdx }) => onSceneProgress?.(absIdx + 1, n, `Key ${fromIdx + 1}→${toIdx + 1}`),
+            maxCycles: 2
+          });
+          const sd = {
+            sceneNumber: chunk.scene, timeEstimation: chunk.time,
+            dialogue: chunk.exactText, veoVideoPrompt: veoPrompt,
+          };
+          results[absIdx] = sd;
+          donePrompts.push(veoPrompt);
+          onSceneReady?.(sd, false);
+        } catch (e) {
+          const fb = {
+            sceneNumber: chunk.scene, timeEstimation: chunk.time,
+            dialogue: chunk.exactText, veoVideoPrompt: buildFallbackPrompt(chunk), error: e.message,
+          };
+          results[absIdx] = fb;
+          donePrompts.push(fb.veoVideoPrompt);
+          onSceneReady?.(fb, true);
+        }
+      }
+    }
+  };
+
+  for (let i = 0; i < batchGroups.length; i++) {
+    await processBatch(batchGroups[i], i);
+    if (i < batchGroups.length - 1) await sleep(DELAY_MS);
+  }
+
   return results.filter(Boolean);
 }
 

@@ -3,11 +3,55 @@ const path = require('path');
 const { pipeline } = require('stream/promises');
 const crypto = require('crypto');
 const https = require('https');
-const { HttpsProxyAgent, proxyManager } = require('./proxy-manager');
+
+// Convert WebP/PNG → JPEG dùng Electron nativeImage (main process only)
+function convertToJpeg(srcPath, quality = 92) {
+    try {
+        const { nativeImage } = require('electron');
+        const img = nativeImage.createFromPath(srcPath);
+        if (img.isEmpty()) return srcPath; // không đọc được → giữ nguyên
+        const jpegBuf = img.toJPEG(quality);
+        const jpgPath = srcPath.replace(/\.(webp|png|bmp)$/i, '.jpg');
+        fs.writeFileSync(jpgPath, jpegBuf);
+        if (jpgPath !== srcPath) {
+            try { fs.unlinkSync(srcPath); } catch (_) {}
+        }
+        return jpgPath;
+    } catch (_) {
+        return srcPath; // fallback: giữ nguyên nếu convert lỗi
+    }
+}
 
 // ── Veo Prompt Sanitizer — chặn PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED ──
 // Chạy trong main process TRƯỚC khi gửi prompt lên Veo API (lớp phòng thủ cuối)
 const _VEO_SAFE_SUFFIX = ', no real people, no celebrities, no public figures, safe for all audiences, family-friendly';
+
+// Từ khoá vi phạm chính sách Veo — thay thế bằng từ an toàn
+const _POLICY_REPLACEMENTS = [
+  // Vị thành niên / trẻ em trong ngữ cảnh nhạy cảm
+  [/\b(minor|minors|underage|child|children|kid|kids|teen|teens|teenager|teenagers|juvenile|toddler|baby|infant|boy|girl)\b/gi, 'person'],
+  [/\b(young\s+(girl|boy|woman|man|person))\b/gi, 'person'],
+  [/\b(little\s+(girl|boy|kid|child))\b/gi, 'person'],
+  // Bạo lực / vũ khí
+  [/\b(kill|killing|murder|murdered|shoot|shooting|stab|stabbing|weapon|weapons|gun|guns|rifle|knife|bomb|explosion|violence|violent|blood|bloody|gore|dead body|corpse)\b/gi, ''],
+  // Nội dung người lớn
+  [/\b(nude|naked|explicit|sexual|sexy|seductive|erotic|porn|pornographic|lingerie|swimsuit|bikini|underwear|intimate|sensual)\b/gi, ''],
+  // Cờ bạc / ma túy
+  [/\b(gambling|casino|drug|drugs|cocaine|marijuana|alcohol|drunk|intoxicated|cigarette|smoking|weed|heroin|meth)\b/gi, ''],
+  // Nội dung thù ghét / phân biệt
+  [/\b(racist|racism|hate|hatred|discriminat\w+|slur|offensive|extremist|terrorist|terrorism)\b/gi, ''],
+];
+
+function sanitizeVeoPrompt(prompt) {
+  if (!prompt) return prompt;
+  let p = String(prompt);
+  _PERSON_NAMES_RE.forEach(re => { p = p.replace(re, 'a person'); });
+  // Thay thế từ vi phạm chính sách
+  _POLICY_REPLACEMENTS.forEach(([re, replacement]) => { p = p.replace(re, replacement); });
+  // Thêm suffix nếu chưa có
+  if (!p.includes('no real people') && !p.includes('no celebrities')) p += _VEO_SAFE_SUFFIX;
+  return p.replace(/\s{2,}/g, ' ').trim();
+}
 
 const _PERSON_NAMES_RE = [
   // Công nghệ / Kinh doanh
@@ -29,20 +73,6 @@ const _PERSON_NAMES_RE = [
   /\b(Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.|Sir|Dame)\s+[A-Z][a-z]+\s+[A-Z][a-z]+\b/g,
 ];
 
-function sanitizeVeoPrompt(prompt) {
-  if (!prompt) return prompt;
-  let p = String(prompt);
-  _PERSON_NAMES_RE.forEach(re => { p = p.replace(re, 'a person'); });
-  // Thay "Firstname Lastname" 2 chữ hoa liền (fallback)
-  p = p.replace(/\b([A-Z][a-z]{1,})\s+([A-Z][a-z]{1,}(?:\s+[A-Z][a-z]{1,})?)\b/g, (m) => {
-    // Giữ lại địa danh
-    if (/\b(New York|Los Angeles|San Francisco|United States|United Kingdom|South Korea|North Korea|Hong Kong|World Cup|Super Bowl)\b/i.test(m)) return m;
-    return 'a person';
-  });
-  // Thêm suffix nếu chưa có
-  if (!p.includes('no real people') && !p.includes('no celebrities')) p += _VEO_SAFE_SUFFIX;
-  return p.replace(/\s{2,}/g, ' ').trim();
-}
 
 // Mutex để serialize các Extension upload — kênh pendingImageUpload/uploadedMediaId
 let _extensionUploadLock = Promise.resolve();
@@ -56,6 +86,21 @@ let _resolveMediaLock = Promise.resolve();
 let _downloadViaExtLock = Promise.resolve();
 
 class VeoEngine {
+    static _paused = false;
+    static pause()  { this._paused = true;  console.log('[VeoEngine] paused'); }
+    static resume() { this._paused = false; console.log('[VeoEngine] resumed'); }
+    static clearUploadCache() { VeoEngine._imageUploadCache.clear(); console.log('[VeoEngine] upload cache cleared'); }
+
+    // Mutex cho Flow Extension calls — chỉ 1 task được ghi pending* tại một thời điểm
+    // (extension chỉ xử lý 1 lệnh, nhiều worker ghi đè nhau → sai kết quả)
+    static _flowExtMutexQueue = Promise.resolve();
+    static _withFlowExtMutex(fn) {
+        let release;
+        const prev = VeoEngine._flowExtMutexQueue;
+        VeoEngine._flowExtMutexQueue = new Promise(r => { release = r; });
+        return prev.then(() => fn()).finally(() => release());
+    }
+
 
     static async checkCookie() {
         try {
@@ -64,12 +109,13 @@ class VeoEngine {
             const start = Date.now();
             while (Date.now() - start < TIMEOUT) {
                 const auth = global.googleLabsAuth;
-                if (auth && auth.bearerToken && auth.cookie) {
+                // Chấp nhận: bearer (cũ) HOẶC cookie + projectId (flow.google.com mới)
+                if (auth && (auth.bearerToken || (auth.cookie && auth.projectId))) {
                     return { success: true, credits: "API Mode (Sẵn sàng)" };
                 }
                 await new Promise(r => setTimeout(r, INTERVAL));
             }
-            return { success: false, error: "Chưa có Token. Hãy F5 trang Google Labs để Extension bắt dữ liệu!" };
+            return { success: false, error: "Chưa kết nối Extension. Mở Chrome → flow.google.com → bật FluxyExtension." };
         } catch (error) {
             return { success: false, error: error.message };
         }
@@ -120,11 +166,26 @@ class VeoEngine {
                         try { resolve(JSON.parse(data)); } catch { resolve(data); }
                     } else {
                         if (res.statusCode === 403 && data.includes('reCAPTCHA')) {
+                            // Xóa token ngay → acquireRecaptcha sẽ request token mới thay vì tái dùng token hỏng
+                            global.googleLabsAuth.recaptchaToken = null;
                             const e = new Error('RECAPTCHA_EXPIRED');
                             e.isRecaptchaExpired = true;
                             return reject(e);
                         }
-                        reject(new Error(`API Error ${res.statusCode}: ${data.substring(0, 200)}`));
+                        if (res.statusCode === 401 || (res.statusCode === 403 && !data.includes('reCAPTCHA'))) {
+                            // Bearer token hết hạn — cần F5 Google Labs để Extension capture token mới
+                            global.googleLabsAuth.bearerToken = null;
+                            global.googleLabsAuth.recaptchaToken = null;
+                            const e = new Error(`BEARER_TOKEN_EXPIRED:${res.statusCode}`);
+                            e.isBearerExpired = true;
+                            e.isRecaptchaExpired = true; // dùng lại cơ chế reload hiện có
+                            return reject(e);
+                        }
+                        const errBody = data.substring(0, 300);
+                        console.error(`[fetchAPI] ${res.statusCode} → ${errBody}`);
+                        const err = new Error(`API Error ${res.statusCode}: ${errBody}`);
+                        err.statusCode = res.statusCode;
+                        reject(err);
                     }
                 });
             });
@@ -147,33 +208,35 @@ class VeoEngine {
                 try {
                     if (sendLog) sendLog(`[JOBID:${jobId}] Đang lấy mã bảo mật ReCaptcha...`, 'info');
                     global.googleLabsAuth.recaptchaAction = action;
+                    // Token single-use: phải xóa để Extension cấp token MỚI cho mỗi request
                     global.googleLabsAuth.recaptchaToken = null;
                     global.googleLabsAuth.needRecaptcha = true;
-                    // Timeout 90s: đủ cho CapSolver (thường 10–30s) + Extension fallback
+
+                    // Timeout 60s, mỗi 5s re-signal nếu Extension SW bị Chrome kill
                     let wait = 0;
-                    while (!global.googleLabsAuth.recaptchaToken && wait < 90) {
+                    while (!global.googleLabsAuth.recaptchaToken && wait < 60) {
                         await new Promise(r => setTimeout(r, 1000));
                         wait++;
-                        // Log tiến trình mỗi 10s để user biết đang chờ CapSolver
-                        if (wait === 10 && sendLog) sendLog(`[JOBID:${jobId}] ⏳ Đang chờ mã ReCaptcha (${wait}s)...`, 'info');
-                        if (wait === 30 && sendLog) sendLog(`[JOBID:${jobId}] ⏳ Đang chờ mã ReCaptcha (${wait}s) — CapSolver đang giải...`, 'info');
-                        if (wait === 60 && sendLog) sendLog(`[JOBID:${jobId}] ⏳ Đang chờ mã ReCaptcha (${wait}s) — CapSolver chậm hơn bình thường...`, 'info');
+                        // Re-signal mỗi 5s — phòng Extension SW bị kill giữa chừng không nhận được lệnh
+                        if (wait % 5 === 0 && !global.googleLabsAuth.recaptchaToken) {
+                            global.googleLabsAuth.needRecaptcha = true;
+                            if (sendLog) sendLog(`[JOBID:${jobId}] ⏳ Chờ ReCaptcha (${wait}s) — re-signal Extension...`, 'info');
+                        }
                     }
                     const token = global.googleLabsAuth.recaptchaToken;
                     if (!token) {
-                        const err = new Error("Lấy mã ReCaptcha thất bại sau 90s. Kiểm tra CapSolver key hoặc F5 Google Labs.");
+                        const err = new Error("Lấy mã ReCaptcha thất bại sau 60s. Kiểm tra Extension đang mở tab Google Labs.");
                         reject(err);
                         throw err;
                     }
-                    // Jitter ngẫu nhiên 2–5s sau khi nhận token, trước khi release lock
-                    // → mỗi lệnh API cách nhau ít nhất 2s, tối đa 5s, không đều đặn
-                    await VeoEngine.randDelay(2000, 5000);
+                    // Jitter ngẫu nhiên 1–3s sau khi nhận token, trước khi release lock
+                    await VeoEngine.randDelay(1000, 3000);
                     resolve(token);
                 } catch (e) {
                     reject(e);
-                    throw e; // re-throw để chain tiếp theo vẫn chạy được
+                    throw e;
                 }
-            }).catch(() => {}); // absorb để không block lock với unhandled rejection
+            }).catch(() => {});
         });
     }
 
@@ -200,6 +263,7 @@ class VeoEngine {
         const map = {
             'Nano Banana Pro': 'GEM_PIX_2',
             'Nano Banana 2': 'NARWHAL',
+            'Nano Banana 2 Lite': 'HARBOR_SEAL',
             'Imagen 4': 'IMAGEN_3_5',
         };
         return map[modelName] || 'GEM_PIX_2';
@@ -218,7 +282,7 @@ class VeoEngine {
 
     static generateImagePayload(prompt, aspectRatio, genCount, workspaceProjectId, recaptchaToken, modelName, referenceImageIds = []) {
         const sessionId = `;${Date.now()}`;
-        const outputCount = parseInt(genCount?.replace(/x/ig, '')) || 1;
+        const outputCount = parseInt(String(genCount ?? '1').replace(/x/ig, '')) || 1;
         const imageModelName = this.mapModelName(modelName);
 
         // Xây dựng imageInputs từ danh sách UUID ảnh tham chiếu đã upload
@@ -251,11 +315,522 @@ class VeoEngine {
                 }
             },
             "mediaGenerationContext": {
-                "batchId": crypto.randomUUID()
+                "batchId": crypto.randomUUID(),
+                "audioFailurePreference": "BLOCK_SILENCED_VIDEOS"
             },
             "requests": requests,
             "useNewMedia": true
         };
+    }
+
+    // ── flow.google.com batchexecute helpers ──────────────────────────────────
+
+    static mapAspectCodeForFlow(aspectRatio) {
+        // Image (ogiZ0b) aspect codes — confirmed from F12: 16:9=3, 9:16=2.
+        // aspectRow[1] is always 22 (constant). row0[4] carries the actual aspect code.
+        const map = {
+            '1:1':  1,
+            '9:16': 2,
+            '16:9': 3,
+            '4:3':  4,
+            '3:4':  5
+        };
+        return map[aspectRatio] !== undefined ? map[aspectRatio] : 3;
+    }
+
+    static mapVideoAspectCodeForFlow(aspectRatio) {
+        // Video (YhhmEf) aspect codes — confirmed from F12: 16:9=2, 9:16=1.
+        // Goes into task[2], NOT into aspectRow (aspectRow[1] is always 22).
+        const map = {
+            '9:16': 1,
+            '16:9': 2,
+            '1:1':  0,
+        };
+        return map[aspectRatio] !== undefined ? map[aspectRatio] : 2;
+    }
+
+    static fetchBatchexecute(rpcid, freqJsonStr, timeoutMs = 90000, atOverride = null) {
+        return new Promise((resolve, reject) => {
+            const auth = global.googleLabsAuth;
+            const atToken = atOverride || auth.atToken;
+            if (!atToken || !auth.cookie) return reject(new Error('Thiếu at token hoặc cookie cho flow.google.com'));
+            const projectId = auth.projectId || '';
+            const params = new URLSearchParams({ rpcids: rpcid, bl: auth.bl || '', hl: 'vi', rt: 'c' });
+            if (auth.fsid) params.set('f.sid', auth.fsid);
+            if (projectId) params.set('source-path', `/project/${projectId}`);
+            const urlPath = `/_/AiSandboxAngularFrontend/data/batchexecute?${params.toString()}`;
+            const body = `f.req=${encodeURIComponent(freqJsonStr)}&at=${encodeURIComponent(atToken)}`;
+            const headers = {
+                'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                'cookie': auth.cookie,
+                'origin': 'https://flow.google.com',
+                'referer': `https://flow.google.com/project/${projectId}`,
+                'user-agent': auth.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+                'accept': '*/*',
+                'x-same-domain': '1',
+                'content-length': Buffer.byteLength(body).toString()
+            };
+            let req;
+            const timer = setTimeout(() => { try { req && req.destroy(); } catch (_) {} reject(new Error(`batchexecute ${rpcid} timeout ${timeoutMs}ms`)); }, timeoutMs);
+            try {
+                req = https.request({ hostname: 'flow.google.com', path: urlPath, method: 'POST', headers }, (res) => {
+                    let data = '';
+                    res.on('data', chunk => { data += chunk; });
+                    res.on('end', () => {
+                        clearTimeout(timer);
+                        if (res.statusCode >= 200 && res.statusCode < 300) resolve(data);
+                        else reject(new Error(`batchexecute ${rpcid} HTTP ${res.statusCode}: ${data.substring(0, 200)}`));
+                    });
+                });
+                req.on('error', e => { clearTimeout(timer); reject(e); });
+                req.write(body);
+                req.end();
+            } catch (e) { clearTimeout(timer); reject(e); }
+        });
+    }
+
+    static parseBatchexecuteResponse(body, rpcid) {
+        const stripped = body.replace(/^\)\]}'[\n\r]+/, '');
+        const chunks = [];
+        let pos = 0;
+        while (pos < stripped.length) {
+            const nl = stripped.indexOf('\n', pos);
+            if (nl < 0) break;
+            const lenStr = stripped.substring(pos, nl).trim();
+            const len = parseInt(lenStr, 10); // decimal, not hex!
+            if (isNaN(len) || len <= 0) { pos = nl + 1; continue; }
+            const jsonStr = stripped.substring(nl + 1, nl + 1 + len);
+            try { chunks.push(JSON.parse(jsonStr)); } catch (_) {}
+            pos = nl + 1 + len;
+        }
+        for (const chunk of chunks) {
+            if (!Array.isArray(chunk)) continue;
+            for (const item of chunk) {
+                if (Array.isArray(item) && item[0] === 'wrb.fr' && item[1] === rpcid && item[2]) {
+                    try { return JSON.parse(item[2]); } catch (_) { return item[2]; }
+                }
+            }
+        }
+        return null;
+    }
+
+    // Fetch AT token từ flow.google.com HTML (Node.js https, không cần browser)
+    static async fetchFlowAt(auth) {
+        if (!auth.cookie) return null;
+        const https = require('https');
+        const projectId = auth.projectId || '';
+        const html = await new Promise(resolve => {
+            const req = https.request({
+                hostname: 'flow.google.com',
+                path: projectId ? `/project/${projectId}` : '/',
+                method: 'GET',
+                headers: {
+                    'Cookie': auth.cookie,
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'vi-VN,vi;q=0.9'
+                }
+            }, res => {
+                let data = '';
+                res.on('data', c => { data += c; if (data.length > 600000) req.destroy(); });
+                res.on('end', () => resolve(data));
+            });
+            req.on('error', () => resolve(''));
+            req.setTimeout(12000, () => { req.destroy(); resolve(''); });
+            req.end();
+        });
+        // Google WIZ apps embed XSRF token as "SNlM0e":"AIQ-..."
+        const m = html.match(/"SNlM0e":"(AIQ-[^"]+)"|"xsrf","(AIQ-[^"]+)"/) ||
+                  html.match(/\bAIQ-([A-Za-z0-9_\-]{20,}:\d{10,})/);
+        return m ? (m[1] || m[2] || (m[0].startsWith('AIQ-') ? m[0] : null)) : null;
+    }
+
+    // POST batchexecute từ Node.js với cookie + AT
+    static async flowBatchPost(rpcid, freq, auth, at) {
+        const https = require('https');
+        const bl = auth.bl || '';
+        const fsid = auth.fsid || '';
+        const projectId = auth.projectId || '';
+        const mkReqid = () => String(Math.floor(Math.random() * 9000000) + 1000000);
+        const params = new URLSearchParams({ rpcids: rpcid, bl, hl: 'vi', rt: 'c', 'source-path': `/project/${projectId}`, _reqid: mkReqid() });
+        if (fsid) params.set('f.sid', fsid);
+        const body = `f.req=${encodeURIComponent(freq)}&at=${encodeURIComponent(at)}`;
+        const headers = {
+            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            'Content-Length': Buffer.byteLength(body),
+            'Cookie': auth.cookie || '',
+            'x-same-domain': '1',
+            'Origin': 'https://flow.google.com',
+            'Referer': `https://flow.google.com/project/${projectId}`,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36'
+        };
+        return new Promise(resolve => {
+            const req = https.request({
+                hostname: 'flow.google.com',
+                path: `/_/AiSandboxAngularFrontend/data/batchexecute?${params}`,
+                method: 'POST', headers
+            }, res => {
+                let data = '';
+                res.on('data', c => data += c);
+                res.on('end', () => resolve(data));
+            });
+            req.on('error', () => resolve(''));
+            req.setTimeout(90000, () => { req.destroy(); resolve(''); });
+            req.write(body);
+            req.end();
+        });
+    }
+
+    // Parse ogiZ0b response: trả về { downloadUrls, uuid2 } hoặc { error }
+    static parseOgiZ0bResponse(body) {
+        const unescapeUrl = s => s.replace(/\\u003d/gi,'=').replace(/\\u0026/gi,'&').replace(/\\u002f/gi,'/').replace(/\\\//g,'/');
+        let dataStr = null;
+        const stripped = body.replace(/^\)\]}'[\n\r]+/, '');
+        let pos = 0;
+        while (pos < stripped.length) {
+            const nl = stripped.indexOf('\n', pos);
+            if (nl < 0) break;
+            const len = parseInt(stripped.substring(pos, nl).trim(), 10);
+            if (isNaN(len) || len <= 0) { pos = nl + 1; continue; }
+            const chunk = stripped.substring(nl + 1, nl + 1 + len);
+            try {
+                for (const item of (JSON.parse(chunk) || [])) {
+                    if (Array.isArray(item) && item[0] === 'wrb.fr' && item[1] === 'ogiZ0b' && item[2]) { dataStr = item[2]; break; }
+                }
+            } catch (_) {
+                const cm = chunk.match(/"wrb\.fr","ogiZ0b","((?:[^"\\]|\\.)*)"/);
+                if (cm) { try { dataStr = JSON.parse('"' + cm[1] + '"'); } catch(__) {} }
+            }
+            pos = nl + 1 + len;
+            if (dataStr) break;
+        }
+        if (!dataStr) {
+            const m = body.match(/"wrb\.fr","ogiZ0b","((?:[^"\\]|\\.)*)"/);
+            if (m) { try { dataStr = JSON.parse('"' + m[1] + '"'); } catch(_) {} }
+        }
+        if (!dataStr) return { error: `ogiZ0b no data. body=${body.substring(0, 150)}` };
+        // Check for [3] error
+        if (body.includes('"ogiZ0b",null,null,null,[3]')) return { error: 'ogiZ0b [3] — AT token không hợp lệ' };
+        const rawData = JSON.stringify(JSON.parse(dataStr));
+        const urlPattern = /https:\\?\/\\?\/flow-content\.google\\?\/image\\?\/[^\s"\\]+/g;
+        const urls = (rawData.match(urlPattern) || []).map(u => unescapeUrl(u)).filter(u => u.startsWith('https://'));
+        if (!urls.length) return { error: 'no_download_url. dataStr=' + dataStr.substring(0, 200) };
+        // Extract uuid2 from URL
+        const uuid2Match = urls[0].match(/\/([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})\?/i);
+        return { downloadUrls: urls, downloadUrl: urls[0], uuid2: uuid2Match ? uuid2Match[1] : '' };
+    }
+
+    // Full-resolution download via as29s (Node.js)
+    static async getFullResUrl(cdnUrl, auth, at) {
+        const mUuid = (cdnUrl.match(/\/image\/([0-9a-f][0-9a-f-]{30,})\?/i) || [])[1];
+        if (!mUuid) return cdnUrl;
+        try {
+            const dlFreq = JSON.stringify([[['as29s', JSON.stringify([mUuid]), null, 'generic']]]);
+            const dlBody = await VeoEngine.flowBatchPost('as29s', dlFreq, auth, at);
+            const dlm = dlBody.match(/"wrb\.fr","as29s","((?:[^"\\]|\\.)*)"/);
+            if (dlm) {
+                const dlData = JSON.parse(JSON.parse('"' + dlm[1] + '"'));
+                const u = dlData?.[5]?.[12] || dlData?.[6]?.[0]?.[13];
+                if (typeof u === 'string' && u.startsWith('https://')) return u;
+            }
+        } catch(_) {}
+        return cdnUrl;
+    }
+
+    static async generateImageViaFlow(prompt, aspectRatio, genCount, modelName, sendLog, taskId, referenceImagePaths = []) {
+        const auth = global.googleLabsAuth;
+        const count = parseInt(String(genCount ?? '1').replace(/x/ig, '')) || 1;
+        const model = this.mapModelName(modelName);
+        const aspectCode = this.mapAspectCodeForFlow(aspectRatio);
+        const projectId = auth.projectId;
+        console.log(`[VeoEngine] generateImageViaFlow via Extension: aspectRatio="${aspectRatio}" → aspectCode=${aspectCode} model=${model} refImages=${referenceImagePaths.length}`);
+        sendLog(`[JOBID:${taskId}] 🧠 Flow model: "${modelName}" → API code: "${model}"`, 'info');
+
+        // Đọc ảnh tham chiếu đầu tiên (nếu có) thành base64 để maseQ upload trong extension
+        let referenceImageBase64 = null;
+        let referenceImageFilename = null;
+        if (referenceImagePaths.length > 0) {
+            try {
+                const fsr = require('fs');
+                const refPath = referenceImagePaths[0];
+                const refBuf = fsr.readFileSync(refPath);
+                referenceImageBase64 = refBuf.toString('base64');
+                referenceImageFilename = require('path').basename(refPath);
+                sendLog(`[JOBID:${taskId}] 🖼️ Flow: Dùng ảnh tham chiếu: ${referenceImageFilename} (${(refBuf.length / 1024).toFixed(0)} KB)`, 'info');
+            } catch (e) {
+                sendLog(`[JOBID:${taskId}] ⚠️ Không đọc được ảnh tham chiếu: ${e.message}`, 'warn');
+            }
+        }
+
+        const results = [];
+        for (let i = 0; i < count; i++) {
+            if (i > 0) await VeoEngine.randDelay(3000, 5000);
+            sendLog(`[JOBID:${taskId}] 🎨 Flow: Tạo ảnh${count > 1 ? ` (${i + 1}/${count})` : ''}${referenceImageBase64 ? ' (có ảnh tham chiếu)' : ''}...`, 'info');
+
+            // Mutex: chỉ 1 task được dùng Extension tại một thời điểm (tránh ghi đè pendingFlowImageGen)
+            const timeoutMs = referenceImageBase64 ? 90000 : 60000;
+            const extResult = await VeoEngine._withFlowExtMutex(async () => {
+                auth.flowImageGenResult = null;
+                auth.flowImageGenTriggered = false;
+                auth.pendingFlowImageGen = {
+                    prompt, model, aspectCode,
+                    projectId, atToken: auth.atToken || '',
+                    bl: auth.bl || '', fsid: auth.fsid || '', count: 1,
+                    ...(referenceImageBase64 ? { referenceImageBase64, referenceImageFilename } : {})
+                };
+                let waited = 0;
+                while (!auth.flowImageGenResult && waited < timeoutMs) {
+                    await new Promise(r => setTimeout(r, 1000));
+                    waited += 1000;
+                }
+                auth.pendingFlowImageGen = null;
+                auth.flowImageGenTriggered = false;
+                const res = auth.flowImageGenResult;
+                auth.flowImageGenResult = null;
+                if (!res) throw new Error(`Extension timeout — không phản hồi sau ${timeoutMs / 1000}s. Hãy mở flow.google.com trong Chrome.`);
+                if (res.error) throw new Error(`Flow image gen lỗi: ${res.error}`);
+                return res;
+            });
+
+
+            // Log maseQ (ảnh tham chiếu) status để debug
+            if (extResult.maseQStatus && extResult.maseQStatus !== 'not_requested') {
+                const ok = extResult.maseQStatus.startsWith('success');
+                sendLog(`[JOBID:${taskId}] ${ok ? '✅' : '⚠️'} maseQ upload: ${extResult.maseQStatus}`, ok ? 'success' : 'warn');
+            }
+
+            const downloadedPaths = extResult.downloadedPaths || [];
+            const downloadUrls = extResult.downloadUrls || (extResult.downloadUrl ? [extResult.downloadUrl] : []);
+            const fss = require('fs');
+
+            // Ưu tiên file đã tải (chrome.downloads), fallback về URL HTTP
+            let added = 0;
+            for (const dp of downloadedPaths) {
+                const hasFile = dp.filePath && fss.existsSync(dp.filePath);
+                results.push({
+                    downloadUrl: dp.url || downloadUrls[0] || '',
+                    uuid2: extResult.uuid2 || '',
+                    imageData: hasFile ? { fromFilePath: true, filePath: dp.filePath, mimeType: 'image/webp' } : null
+                });
+                added++;
+            }
+            if (added === 0 && downloadUrls.length > 0) {
+                results.push({ downloadUrl: downloadUrls[0], uuid2: extResult.uuid2 || '', imageData: null });
+            }
+        }
+        return results;
+    }
+
+    // ── Flow.google.com r2v (Ingredients) model codes ────────────────────────
+    // 8s confirmed: "veo_3_1_r2v_lite_low_priority"; 4s/6s inferred from t2v pattern
+    static mapFlowR2VModelCode(modelName, duration) {
+        const dur = parseInt(String(duration || '8').replace(/[^0-9]/g, '')) || 8;
+        if (modelName === 'Veo 3.1 - Lite [Lower Priority]' || modelName === 'Veo 3.1 – Lite [Lower Priority]') {
+            if (dur === 4) return 'veo_3_1_r2v_lite_4s_low_priority';
+            if (dur === 6) return 'veo_3_1_r2v_lite_6s_low_priority';
+            return 'veo_3_1_r2v_lite_low_priority'; // 8s default
+        }
+        if (modelName === 'Omni 1.1 Flash') {
+            return `abra_r2v_${dur}s`;
+        }
+        return 'veo_3_1_r2v_lite_low_priority';
+    }
+
+    // ── Flow.google.com video model codes ────────────────────────────────────
+    static mapFlowVideoModelCode(modelName, duration) {
+        // Duration is ENCODED IN the model code string (confirmed from F12):
+        // 4s → "veo_3_1_t2v_lite_4s_low_priority"
+        // 8s → "veo_3_1_t2v_lite_low_priority" (no suffix = default)
+        // 6s → "veo_3_1_t2v_lite_6s_low_priority" (inferred, unconfirmed)
+        const dur = parseInt(String(duration || '8').replace(/[^0-9]/g, '')) || 8;
+        if (modelName === 'Veo 3.1 - Lite [Lower Priority]' || modelName === 'Veo 3.1 – Lite [Lower Priority]') {
+            if (dur === 4) return 'veo_3_1_t2v_lite_4s_low_priority';
+            if (dur === 6) return 'veo_3_1_t2v_lite_6s_low_priority';
+            return 'veo_3_1_t2v_lite_low_priority'; // 8s default (no suffix)
+        }
+        if (modelName === 'Omni 1.1 Flash') {
+            // Pattern confirmed from F12: abra_t2v_{N}s
+            return `abra_t2v_${dur}s`;
+        }
+        return 'veo_3_1_t2v_lite_low_priority';
+    }
+
+    // ── Video gen via flow.google.com: Extension triggers YhhmEf, Node.js polls jwpduf ──
+    static async generateVideoViaFlowBatchexecute(prompt, aspectRatio, modelName, duration, sendLog, taskId) {
+        const auth = global.googleLabsAuth;
+        const projectId = auth.projectId;
+        const aspectCode = this.mapVideoAspectCodeForFlow(aspectRatio); // video-specific: 16:9=2, 9:16=1
+        const dur = parseInt((duration || '8s').replace(/[^0-9]/g, '')) || 8;
+        const modelCode = this.mapFlowVideoModelCode(modelName, dur); // dur baked into model code
+
+        sendLog(`[JOBID:${taskId}] Flow video via Extension: model=${modelCode} dur=${dur}s aspect=${aspectCode}`, 'info');
+
+        // Mutex: chỉ 1 task được dùng Extension tại một thời điểm (tránh ghi đè pendingFlowVideoGen)
+        // Mutex giải phóng SAU KHI lấy được operationId, trước khi poll → các task khác có thể dùng Extension song song với polling
+        sendLog(`[JOBID:${taskId}] Đang gửi lệnh qua Extension — chờ operationId...`, 'info');
+        const { operationId, extAt } = await VeoEngine._withFlowExtMutex(async () => {
+            auth.flowVideoGenResult = null;
+            auth.flowVideoGenTriggered = false;
+            auth.pendingFlowVideoGen = {
+                prompt, aspectCode, modelCode, projectId, duration: dur,
+                atToken: auth.atToken || '', bl: auth.bl || '', fsid: auth.fsid || ''
+            };
+            let waited = 0;
+            while (!auth.flowVideoGenResult && waited < 60000) {
+                await new Promise(r => setTimeout(r, 1000));
+                waited += 1000;
+            }
+            auth.pendingFlowVideoGen = null;
+            auth.flowVideoGenTriggered = false;
+            const res = auth.flowVideoGenResult;
+            auth.flowVideoGenResult = null;
+            if (!res) throw new Error('Extension timeout 60s — không phản hồi YhhmEf trigger');
+            if (res.error) throw new Error(`YhhmEf Extension lỗi: ${res.error}`);
+            const opId = res.operationId;
+            if (!opId) throw new Error(`Extension không trả về operationId. Result: ${JSON.stringify(res).substring(0, 150)}`);
+            sendLog(`[JOBID:${taskId}] YhhmEf OK — operationId: ${opId.substring(0, 24)}... Đang poll jwpduf...`, 'info');
+            return { operationId: opId, extAt: res.at };
+        });
+
+        // Chỉ chờ Extension poll via as29s (Extension có cookie, backend không có → jwpduf 502)
+        let videoUrl = null;
+        const T2V_MAX_POLLS = 120; // 120 × 5s = 600s = 10 phút
+        for (let poll = 0; poll < T2V_MAX_POLLS; poll++) {
+            await new Promise(r => setTimeout(r, 5000));
+
+            if (auth.pendingR2VVideoUrls?.[operationId]) {
+                videoUrl = auth.pendingR2VVideoUrls[operationId];
+                delete auth.pendingR2VVideoUrls[operationId];
+                sendLog(`[JOBID:${taskId}] Extension poll T2V thành công: ${videoUrl.slice(0, 80)}...`, 'info');
+                break;
+            }
+
+            if (poll % 6 === 5) {
+                const pct = Math.min(95, Math.round(poll * 100 / T2V_MAX_POLLS));
+                sendLog(`[JOBID:${taskId}] ${pct}% — Đang render video (Extension đang poll)...`, 'progress');
+            }
+        }
+
+        // Kiểm tra lần cuối Extension poll
+        if (!videoUrl && auth.pendingR2VVideoUrls?.[operationId]) {
+            videoUrl = auth.pendingR2VVideoUrls[operationId];
+            delete auth.pendingR2VVideoUrls[operationId];
+        }
+
+        if (!videoUrl) throw new Error('Video gen timeout 360s — không nhận được URL từ jwpduf');
+        return { videoUrl };
+    }
+
+    // ── R2V (Ingredients) via Flow.google.com: Extension uploads images + triggers MZZa6b, Node.js polls jwpduf ──
+    // ingredientImages: array of local file paths (max 7, confirmed from F12)
+    static async generateR2VViaFlowBatchexecute(prompt, ingredientImages, aspectRatio, modelName, duration, sendLog, taskId, voiceId) {
+        const fs = require('fs');
+        const path = require('path');
+        const auth = global.googleLabsAuth;
+        const projectId = auth.projectId;
+        const aspectCode = this.mapVideoAspectCodeForFlow(aspectRatio);
+        const dur = parseInt((duration || '8s').replace(/[^0-9]/g, '')) || 8;
+        const modelCode = this.mapFlowR2VModelCode(modelName, dur);
+
+        // Omni 1.1 Flash supports up to 7 reference images; Veo 3.1 Lite supports up to 3
+        const MAX_REF = modelName === 'Omni 1.1 Flash' ? 7 : 3;
+        const imgs = (Array.isArray(ingredientImages) ? ingredientImages : [ingredientImages]).slice(0, MAX_REF);
+        sendLog(`[JOBID:${taskId}] Flow R2V via Extension (MZZa6b): ${imgs.length} ảnh | model=${modelCode} dur=${dur}s aspect=${aspectCode}`, 'info');
+
+        const ingredientImagesData = imgs.map(imgPath => ({
+            base64: fs.readFileSync(imgPath).toString('base64'),
+            filename: path.basename(imgPath)
+        }));
+
+        // Mutex: chỉ 1 task được dùng Extension tại một thời điểm (tránh ghi đè pendingFlowR2VGen)
+        // Mutex giải phóng sau khi lấy được operationId, trước khi poll → polling chạy song song
+        sendLog(`[JOBID:${taskId}] Đang upload ảnh + gửi MZZa6b qua Extension — chờ operationId...`, 'info');
+        const { operationId, extAt: r2vExtAt } = await VeoEngine._withFlowExtMutex(async () => {
+            auth.flowR2VGenResult = null;
+            auth.flowR2VGenTriggered = false;
+            auth.pendingFlowR2VGen = {
+                prompt, aspectCode, modelCode, projectId, duration: dur,
+                ingredientImagesData, voiceId: voiceId || null,
+                atToken: auth.atToken || '', bl: auth.bl || '', fsid: auth.fsid || ''
+            };
+            let waited = 0;
+            while (!auth.flowR2VGenResult && waited < 90000) {
+                await new Promise(r => setTimeout(r, 1000));
+                waited += 1000;
+            }
+            auth.pendingFlowR2VGen = null;
+            auth.flowR2VGenTriggered = false;
+            const res = auth.flowR2VGenResult;
+            auth.flowR2VGenResult = null;
+            if (!res) throw new Error('Extension timeout 90s — không phản hồi MZZa6b trigger');
+            if (res.error) throw new Error(`MZZa6b Extension lỗi: ${res.error}`);
+            const opId = res.operationId;
+            if (!opId) throw new Error(`Extension không trả về operationId. Result: ${JSON.stringify(res).substring(0, 150)}`);
+            sendLog(`[JOBID:${taskId}] MZZa6b OK — operationId: ${opId.substring(0, 24)}... Đang poll jwpduf...`, 'info');
+            return { operationId: opId, extAt: res.at };
+        });
+
+        // Poll jwpduf từ Node.js — mutex đã giải phóng, các task khác có thể dùng Extension
+        let currentAt = r2vExtAt || auth.atToken;
+        let videoUrl = null;
+        const MAX_R2V_POLLS = 100; // 500s (~8.3 phút) — R2V với voice cần thêm thời gian
+        for (let poll = 0; poll < MAX_R2V_POLLS; poll++) {
+            await new Promise(r => setTimeout(r, 5000));
+
+            // Kiểm tra Extension đã poll được URL chưa (từ /api/save-flow-r2v-video)
+            if (auth.pendingR2VVideoUrls?.[operationId]) {
+                videoUrl = auth.pendingR2VVideoUrls[operationId];
+                delete auth.pendingR2VVideoUrls[operationId];
+                sendLog(`[JOBID:${taskId}] Extension poll thành công: ${videoUrl.slice(0, 80)}...`, 'info');
+                break;
+            }
+
+            // Refresh AT mỗi 10 polls (~50s) để tránh AT hết hạn
+            if (poll > 0 && poll % 10 === 0) {
+                try { const freshAt = await VeoEngine.fetchFlowAt(auth); if (freshAt) currentAt = freshAt; } catch (_) {}
+            }
+
+            const pollInner = JSON.stringify([operationId]);
+            const pollFreq = JSON.stringify([[['jwpduf', pollInner, null, 'generic']]]);
+
+            let pollRawBody;
+            try {
+                pollRawBody = await VeoEngine.fetchBatchexecute('jwpduf', pollFreq, 30000, currentAt);
+            } catch (e) {
+                sendLog(`[JOBID:${taskId}] Poll R2V ${poll + 1} lỗi: ${(e.message || '').substring(0, 100)}`, 'info');
+                continue;
+            }
+
+            if (!pollRawBody) continue;
+
+            // Match: flow-content.google (R2V voice), storage ais-sandbox, .mp4, .m3u8, lh3 ais
+            const rawUrlMatch = pollRawBody.match(/"(https:(?:\\\/|\/){2}flow-content\.google\/(?:video|image)\/[^"]{10,})"/)
+                || pollRawBody.match(/"(https:(?:\\\/|\/){2}storage\.googleapis\.com\/ais-[^"]{10,})"/)
+                || pollRawBody.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.mp4[^"]{0,800})"/)
+                || pollRawBody.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.m3u8[^"]{0,300})"/)
+                || pollRawBody.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.webm[^"]{0,300})"/)
+                || pollRawBody.match(/"(https:(?:\\\/|\/){2}lh3\.googleusercontent\.com\/ais[^"]{10,})"/);
+            if (rawUrlMatch) {
+                videoUrl = rawUrlMatch[1]
+                    .replace(/\\u003d/g, '=').replace(/\\u0026/g, '&')
+                    .replace(/\\u002f/g, '/').replace(/\\\//g, '/');
+                break;
+            }
+
+            if (poll % 6 === 5) {
+                const pct = Math.min(95, Math.round(poll * 100 / MAX_R2V_POLLS));
+                sendLog(`[JOBID:${taskId}] ${pct}% — Đang render video R2V...`, 'progress');
+            }
+        }
+
+        // Kiểm tra lần cuối Extension poll
+        if (!videoUrl && auth.pendingR2VVideoUrls?.[operationId]) {
+            videoUrl = auth.pendingR2VVideoUrls[operationId];
+            delete auth.pendingR2VVideoUrls[operationId];
+        }
+
+        if (!videoUrl) throw new Error('R2V gen timeout 500s — không nhận được URL từ jwpduf');
+        return { videoUrl };
     }
 
     static mapAspectRatioForVideo(aspectRatio) {
@@ -269,7 +844,7 @@ class VeoEngine {
 
     static mapVideoModelKeyR2V(modelName, duration) {
         // Omni Flash dùng prefix "abra" — r2v có duration suffix
-        if (modelName === 'Omni Flash') {
+        if (modelName === 'Omni 1.1 Flash') {
             const dur = (duration || '8s').replace(/[^0-9]/g, '') || '8';
             return `abra_r2v_${dur}s`;
         }
@@ -283,15 +858,18 @@ class VeoEngine {
         };
         const tier = tierMap[modelName] || 'lite';
         const isLowPriority = modelName.includes('[Lower Priority]');
-        // R2V (Ingredients) endpoint chỉ hỗ trợ 1 tier quality — không có ultra/1080p
-        return `veo_3_1_r2v_${tier}_${isLowPriority ? 'low_priority' : 'relaxed'}`;
+        const prio = isLowPriority ? 'low_priority' : 'relaxed';
+        const dur = (duration || '8s').replace(/[^0-9]/g, '') || '8';
+        // 8s = không có suffix duration; 4s/6s = thêm _s_ và ${dur}s
+        if (dur === '8') return `veo_3_1_r2v_${tier}_${prio}`;
+        return `veo_3_1_r2v_s_${tier}_${dur}s_${prio}`;
     }
 
     static generateIngredientsPayload(prompt, aspectRatio, model, projectId, recaptchaToken, ingredientMediaIds, voiceId = null, duration = '8s') {
         const sessionId = `;${Date.now()}`;
         const finalPrompt = this.applyOmniPrompt(prompt, model);
-        // Veo Ingredients API giới hạn tối đa 6 reference images — cap phòng thủ
-        const MAX_REF = 6;
+        // Omni 1.1 Flash hỗ trợ max 7 ref; Veo 3.1 Lite max 3
+        const MAX_REF = model === 'Omni 1.1 Flash' ? 7 : 3;
         const safeIds = (ingredientMediaIds || []).slice(0, MAX_REF);
         const req = {
             "aspectRatio": this.mapAspectRatioForVideo(aspectRatio),
@@ -334,7 +912,7 @@ class VeoEngine {
     // {dur}s_relaxed  = 720p với duration cụ thể (4s / 6s / 8s)
     static mapVideoModelKey(modelName, duration, isI2V = false, hasEndImage = false, quality = '720p') {
         // Omni Flash dùng prefix "abra" hoàn toàn khác — chỉ hỗ trợ T2V
-        if (modelName === 'Omni Flash') {
+        if (modelName === 'Omni 1.1 Flash') {
             const dur = (duration || '8s').replace(/[^0-9]/g, '') || '8';
             return `abra_t2v_${dur}s`;
         }
@@ -353,15 +931,16 @@ class VeoEngine {
         const prio = isLowPriority ? 'low_priority' : 'relaxed';
 
         if (isI2V) {
+            // 8s = no _s_, no duration suffix; 4s/6s = with _s_, with duration suffix
             if (hasEndImage) {
-                // fl (start+end): 1080p → fl_ultra_*, 720p → {dur}s_fl_*
-                if (is1080p) return `veo_3_1_i2v_s_${tier}_fl_ultra_${prio}`;
-                const dur = (duration || '4s').replace(/[^0-9]/g, '') || '4';
+                if (is1080p) return `veo_3_1_i2v_${tier}_fl_ultra_${prio}`;
+                const dur = (duration || '8s').replace(/[^0-9]/g, '') || '8';
+                if (dur === '8') return `veo_3_1_i2v_${tier}_fl_${prio}`;
                 return `veo_3_1_i2v_s_${tier}_${dur}s_fl_${prio}`;
             }
-            // Start only: 1080p → ultra_*, 720p → {dur}s_*
-            if (is1080p) return `veo_3_1_i2v_s_${tier}_ultra_${prio}`;
-            const dur = (duration || '4s').replace(/[^0-9]/g, '') || '4';
+            if (is1080p) return `veo_3_1_i2v_${tier}_ultra_${prio}`;
+            const dur = (duration || '8s').replace(/[^0-9]/g, '') || '8';
+            if (dur === '8') return `veo_3_1_i2v_${tier}_${prio}`;
             return `veo_3_1_i2v_s_${tier}_${dur}s_${prio}`;
         }
 
@@ -375,7 +954,7 @@ class VeoEngine {
     static OMNI_ANTI_REPEAT = `\n\n[SPEECH INSTRUCTION: Read every word of the dialogue exactly as written, once and only once. Never repeat, stutter, loop, or duplicate any word, syllable, or phrase under any circumstances.]`;
 
     static applyOmniPrompt(prompt, model) {
-        if (model !== 'Omni Flash') return prompt;
+        if (model !== 'Omni 1.1 Flash') return prompt;
         if (prompt.includes('SPEECH:') || prompt.includes('SPEECH INSTRUCTION')) return prompt;
         return prompt + this.OMNI_ANTI_REPEAT;
     }
@@ -515,7 +1094,7 @@ class VeoEngine {
             sendLog('🎬 Khởi động Extend Video Engine...', 'info');
 
             const EXTEND_URL = 'https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoExtendVideo';
-            const MAX_WORKERS = 3;
+            const MAX_WORKERS = 8;
             let activeJobs = 0;
 
             const getSeqNum = (task) => {
@@ -893,7 +1472,6 @@ class VeoEngine {
         return new Promise((resolve) => {
             _extensionUploadLock = _extensionUploadLock.then(async () => {
                 sendLog(`[JOBID:${taskId}] Đang upload ${frameName} qua Extension (MAIN world)...`, 'info');
-                // Reset triggered flag TRƯỚC khi set pendingImageUpload — đảm bảo Extension nhận được lệnh mới
                 global.googleLabsAuth.imageUploadTriggered = false;
                 global.googleLabsAuth.uploadedMediaId = null;
                 global.googleLabsAuth.pendingImageUpload = imgPath;
@@ -975,6 +1553,7 @@ class VeoEngine {
             // Phát hiện lỗi reCAPTCHA từ Extension — throw isRecaptchaExpired để caller tự động retry/reload
             if (/reCAPTCHA|recaptcha|evaluation.failed|UNUSUAL_ACTIVITY/i.test(String(res._extError))) {
                 sendLog(`[JOBID:${taskId}] ⚠️ Extension: reCAPTCHA bị từ chối (UNUSUAL_ACTIVITY) — tự động F5 và thử lại...`, 'info');
+                global.googleLabsAuth.recaptchaToken = null; // xóa token hỏng
                 const e = new Error('RECAPTCHA_EXPIRED');
                 e.isRecaptchaExpired = true;
                 throw e;
@@ -1028,39 +1607,59 @@ class VeoEngine {
         }
     }
 
+    // cache mediaId theo đường dẫn file, tránh upload lại ảnh đã có
+    static _imageUploadCache = new Map();
+
     static async uploadImageAPI(imgPath, sendLog, taskId, frameName) {
         if (!imgPath || !fs.existsSync(imgPath)) return null;
+
+        // reuse mediaId nếu ảnh này đã từng upload trong phiên này
+        if (VeoEngine._imageUploadCache.has(imgPath)) {
+            const cachedId = VeoEngine._imageUploadCache.get(imgPath);
+            sendLog(`[JOBID:${taskId}] ♻️ Dùng lại ${frameName} frame đã upload (${cachedId.slice(-8)})`, 'info');
+            return cachedId;
+        }
+
         sendLog(`[JOBID:${taskId}] Đang upload ${frameName} frame...`, 'info');
 
-        try {
+        const doUpload = async () => {
             const auth = global.googleLabsAuth;
             const fileData = fs.readFileSync(imgPath);
             const base64Image = fileData.toString('base64');
-
             const body = JSON.stringify({
-                "clientContext": {
-                    "projectId": auth.projectId,
-                    "tool": "PINHOLE"
-                },
+                "clientContext": { "projectId": auth.projectId, "tool": "PINHOLE" },
                 "imageBytes": base64Image
             });
-
             const data = await this.fetchAPI('https://aisandbox-pa.googleapis.com/v1/flow/uploadImage', 'POST', body);
-
-            // Response: {"media": {"name": "<uuid>", "projectId": "...", ...}}
-            const imageId = data?.media?.name || data?.name || data?.imageId || data?.id;
+            sendLog(`[JOBID:${taskId}] 🔍 Upload response: ${JSON.stringify(data).substring(0, 300)}`, 'info');
+            const rawId = data?.media?.name || data?.name || data?.imageId || data?.id;
+            // Trích UUID cuối nếu trả về full path như "projects/xxx/media/uuid"
+            const imageId = rawId?.includes('/') ? rawId.split('/').pop() : rawId;
             if (!imageId) throw new Error(`Không lấy được ID từ response: ${JSON.stringify(data).substring(0, 150)}`);
-
-            // Xác nhận projectId trong response khớp với auth.projectId
+            sendLog(`[JOBID:${taskId}] 🆔 Upload mediaId: ${imageId}`, 'info');
             const responseProjectId = data?.media?.projectId;
-            if (responseProjectId && responseProjectId !== auth.projectId) {
-                sendLog(`[JOBID:${taskId}] ⚠️ ProjectId mismatch! upload:${responseProjectId} vs auth:${auth.projectId}`, 'error');
+            if (responseProjectId && responseProjectId !== global.googleLabsAuth.projectId) {
+                sendLog(`[JOBID:${taskId}] ⚠️ ProjectId mismatch! upload:${responseProjectId} vs auth:${global.googleLabsAuth.projectId}`, 'error');
             }
-
+            VeoEngine._imageUploadCache.set(imgPath, imageId);
             sendLog(`[JOBID:${taskId}] ✅ Upload ${frameName} OK`, 'success');
             return imageId;
+        };
+
+        try {
+            return await doUpload();
         } catch (error) {
-            sendLog(`[JOBID:${taskId}] Lỗi Upload ${frameName}: ${error.message}`, 'error');
+            if (error.isBearerExpired) {
+                sendLog(`[JOBID:${taskId}] 🔄 Bearer token hết hạn khi upload ${frameName} — tự động F5 Google Labs...`, 'warn');
+                const ok = await this.reloadLabsAndWait(sendLog, taskId);
+                if (ok) {
+                    try { return await doUpload(); } catch (e2) {
+                        sendLog(`[JOBID:${taskId}] ❌ Upload ${frameName} thất bại sau reload: ${e2.message}`, 'error');
+                        return null;
+                    }
+                }
+            }
+            sendLog(`[JOBID:${taskId}] ❌ Lỗi Upload ${frameName}: ${error.message}`, 'error');
             return null;
         }
     }
@@ -1262,8 +1861,14 @@ class VeoEngine {
 
         const isGCSUrl = url.includes('storage.googleapis.com') || url.includes('lh3.googleusercontent.com');
         const isLabsUrl = url.includes('labs.google');
+        const isFlowContent = url.includes('flow-content.google');
 
-        if (useAuth && !isGCSUrl) {
+        if (isFlowContent) {
+            // Signed CDN URL (Expires+KeyName+Signature) — auth nằm trong URL, không cần cookie/bearer
+            options.headers = {
+                'user-agent': auth?.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            };
+        } else if (useAuth && !isGCSUrl) {
             // Nếu là labs.google URL: dùng full Chrome headers để tránh bị block
             // Nếu là URL khác (flow-content, v.v.): dùng auth cơ bản
             if (isLabsUrl) {
@@ -1306,16 +1911,19 @@ class VeoEngine {
             throw new Error(`Lỗi tải file, Status: ${statusCode}`);
         }
 
-        // Xác định đúng extension từ Content-Type
+        // Luôn lưu ảnh tĩnh dưới dạng .jpg — convert từ webp/png nếu cần
         let finalPath = destPath;
-        if (contentType.includes('image/webp') && !destPath.endsWith('.webp')) {
-            finalPath = destPath.replace(/\.(png|jpg|jpeg)$/i, '.webp');
-        } else if (contentType.includes('image/jpeg') && !destPath.endsWith('.jpg')) {
-            finalPath = destPath.replace(/\.(png|webp)$/i, '.jpg');
+        if (!contentType.includes('video/') && !destPath.endsWith('.jpg')) {
+            finalPath = destPath.replace(/\.(png|webp|bmp|jpeg)$/i, '.jpg');
         }
 
         const fileStream = fs.createWriteStream(finalPath);
         await pipeline(resStream, fileStream);
+
+        // Nếu server trả về WebP/PNG content nhưng đã lưu với tên .jpg → convert
+        if (contentType.includes('image/webp') || contentType.includes('image/png')) {
+            finalPath = convertToJpeg(finalPath);
+        }
 
         // Kiểm tra file hợp lệ (> 1KB, không phải HTML error page)
         const fileSize = fs.statSync(finalPath).size;
@@ -1340,6 +1948,26 @@ class VeoEngine {
         return finalPath;
     }
 
+    // Upscale ảnh bằng ffmpeg sau khi tải về (1K=native, 2K=2048px cạnh dài, 4K=4096px)
+    static async upscaleImage(filePath, quality, aspectRatio) {
+        if (!quality || quality === '1K') return filePath;
+        const targetPx = quality === '4K' ? 4096 : 2048;
+        const isPortrait = aspectRatio === '9:16' || aspectRatio === '3:4';
+        const scaleFilter = isPortrait ? `scale=-2:${targetPx}` : `scale=${targetPx}:-2`;
+        const ext = path.extname(filePath);
+        const tmpPath = filePath.replace(ext, `_up${ext}`);
+        const ffmpegBin = (() => { try { return require('ffmpeg-static'); } catch(_) { return 'ffmpeg'; } })();
+        await new Promise((resolve, reject) => {
+            const { spawn } = require('child_process');
+            const proc = spawn(ffmpegBin, ['-y', '-i', filePath, '-vf', scaleFilter, '-q:v', '2', tmpPath]);
+            proc.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg upscale exit ${code}`)));
+            proc.on('error', reject);
+        });
+        fs.unlinkSync(filePath);
+        fs.renameSync(tmpPath, filePath);
+        return filePath;
+    }
+
     static async run(jobData, sendLog) {
         const { mediaType, tasks, aspectRatio, model, genCount, quality = '1K', outputFolder, duration } = jobData;
         let results = [];
@@ -1351,7 +1979,10 @@ class VeoEngine {
 
             sendLog(`Khởi động động cơ API...`, 'info');
 
-            const MAX_WORKERS = mediaType === 'Image' ? 5 : 1;
+            // _tmplMode dùng API trực tiếp (không qua Extension/ReCaptcha) → cho phép nhiều luồng hơn
+            const hasTmplMode = tasks.some(t => t._tmplMode);
+            const hasIngredients = tasks.some(t => t.ingredientMediaIds?.length || t.ingredientImages?.length);
+            const MAX_WORKERS = 8;
             let activeJobs = 0;
 
             // Trả về số thứ tự 1-based từ task.fileIndex hoặc task.id
@@ -1364,9 +1995,37 @@ class VeoEngine {
                 return 1;
             };
 
+            // Wrapper retry 500/503/429 với exponential backoff (tối đa 4 lần)
+            const fetchWithRetry = async (url, method, body, label, taskId) => {
+                let delay = 5000;
+                for (let attempt = 1; attempt <= 4; attempt++) {
+                    try {
+                        return await VeoEngine.fetchAPI(url, method, body);
+                    } catch (e) {
+                        const code = e.statusCode;
+                        const retryable = code === 500 || code === 503 || code === 429;
+                        if (retryable && attempt < 4) {
+                            const waitSec = code === 429 ? Math.max(delay / 1000, 30) : delay / 1000;
+                            sendLog(`[JOBID:${taskId}] ⚠ ${label} lỗi ${code}${code === 429 ? ' (quota throttle)' : ''} — thử lại sau ${waitSec}s (lần ${attempt}/3)`, 'info');
+                            await new Promise(r => setTimeout(r, waitSec * 1000));
+                            delay = Math.min(delay * 2, 60000);
+                            continue;
+                        }
+                        throw e;
+                    }
+                }
+            };
+
             const processTask = async (task) => {
+                // Nếu đang bị tạm dừng → báo lỗi ngay để waitAllDone resolve sớm
+                if (VeoEngine._paused) {
+                    sendLog(`[JOBID:${task.id}] ⏸ Tạm dừng`, 'error');
+                    sendLog(`[JOBID:${task.id}]`, 'job_fail');
+                    results.push({ id: task.id, isError: true, error: 'paused' });
+                    return;
+                }
                 sendLog(`[JOBID:${task.id}]`, 'job_start');
-                
+
                 try {
                     const auth = global.googleLabsAuth;
 
@@ -1375,124 +2034,141 @@ class VeoEngine {
                             throw new Error("Chưa nhận được mã Workspace ID. Hãy F5 tab Google Labs để Extension quét lại!");
                         }
 
-                        // Upload ảnh tham chiếu TRƯỚC — tránh token hết hạn trong lúc upload
-                        const referenceImageIds = [];
-                        if (task.referenceImages && task.referenceImages.length > 0) {
-                            sendLog(`[JOBID:${task.id}] Đang upload ${task.referenceImages.length} ảnh tham chiếu...`, 'info');
-                            for (const imgPath of task.referenceImages) {
-                                const imgId = await this.uploadReferenceImage(imgPath, sendLog, task.id);
-                                if (imgId) referenceImageIds.push(imgId);
-                            }
-                            if (referenceImageIds.length > 0) {
-                                sendLog(`[JOBID:${task.id}] ✅ Đã upload ${referenceImageIds.length} ảnh tham chiếu`, 'success');
-                            }
-                        }
-
-                        // Lấy token SAU khi upload xong → bắn API ngay, token còn mới
-                        // Tự động retry tối đa 3 lần nếu token hết hạn; nếu vẫn fail → auto F5 rồi retry thêm
-                        const imageApiUrl = `https://aisandbox-pa.googleapis.com/v1/projects/${auth.projectId}/flowMedia:batchGenerateImages`;
-                        let genRes;
-                        let imgAutoReloaded = false;
-                        for (let tokenTry = 1; tokenTry <= 3; tokenTry++) {
-                            const imgRecaptchaToken = await VeoEngine.acquireRecaptcha('IMAGE_GENERATION', task.id, sendLog);
-                            sendLog(`[JOBID:${task.id}] Bắn lệnh tạo ảnh lên AI Sandbox${tokenTry > 1 ? ` (lần ${tokenTry})` : ''}...`, 'info');
-                            const payload = this.generateImagePayload(sanitizeVeoPrompt(task.prompt), aspectRatio, genCount, auth.projectId, imgRecaptchaToken, model, referenceImageIds);
-                            try {
-                                genRes = await this.fetchAPI(imageApiUrl, 'POST', payload);
-                                break; // thành công → thoát loop
-                            } catch (e) {
-                                if (e.isRecaptchaExpired && tokenTry < 3) {
-                                    sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, tự động lấy token mới (${tokenTry}/3)...`, 'info');
-                                    await VeoEngine.randDelay(2000, 4000);
-                                    continue;
-                                }
-                                if (e.isRecaptchaExpired && !imgAutoReloaded) {
-                                    imgAutoReloaded = true;
-                                    const ok = await this.reloadLabsAndWait(sendLog, task.id);
-                                    if (ok) { tokenTry = 0; continue; } // reset → thử lại từ lần 1
-                                }
-                                if (e.isRecaptchaExpired) throw new Error("Token hết hạn — đã tự động F5 Google Labs nhưng vẫn lỗi. Vui lòng thử lại sau.");
-                                throw e;
-                            }
-                        }
-
-                        // Thử nhiều cấu trúc response khác nhau từ API
-                        let generatedMedia = genRes.generatedMedia;
-
-                        if (!generatedMedia || generatedMedia.length === 0) {
-                            if (Array.isArray(genRes.responses)) {
-                                generatedMedia = genRes.responses.flatMap(r => r.generatedMedia || []);
-                            }
-                        }
-                        if (!generatedMedia || generatedMedia.length === 0) {
-                            generatedMedia = genRes.mediaGenerationResult?.generatedMedia || [];
-                        }
-                        if (!generatedMedia || generatedMedia.length === 0) {
-                            generatedMedia = genRes.images || genRes.media || genRes.results || [];
-                        }
-
-                        if (!generatedMedia || generatedMedia.length === 0) {
-                            if (genRes.error) throw new Error(genRes.error.message || "Bị từ chối do vi phạm chính sách");
-                            throw new Error(`API không trả về ảnh. Response keys: [${Object.keys(genRes).join(', ')}]`);
-                        }
-
-                        sendLog(`[JOBID:${task.id}] Nhận thành công ${generatedMedia.length} ảnh, đang tải về...`, 'progress');
-
-                        const downloadedFiles = [];
-                        const mediaGenerationIds = []; // Thu thập UUID gốc để dùng trực tiếp làm Ingredients
-                        // DNA tham chiếu (task.id bắt đầu bằng dna_c) → tên TC_image_N để không trùng ảnh cảnh
-                        const imgPrefix = String(task.id || '').startsWith('dna_c') ? 'TC_image' : 'image';
-                        for (let i = 0; i < generatedMedia.length; i++) {
-                            const imgData = generatedMedia[i];
-                            const suffix = generatedMedia.length > 1 ? `_${i + 1}` : '';
-                            const fileName = `${imgPrefix}_${getSeqNum(task)}${suffix}.png`;
-                            const filePath = path.join(outputFolder, fileName);
-
-                            const causToken = imgData.image?.generatedImage?.mediaGenerationId;
-                            const mediaName = imgData.name;
-                            if (causToken) mediaGenerationIds.push(causToken);
-
-                            // Quét toàn bộ imgData để tìm URL ẩn
-                            const scannedUrls = this.findUrlsInObject(imgData);
-
-                            // Danh sách URL thử theo thứ tự ưu tiên
-                            const attempts = [];
-                            // URL được quét từ response (ưu tiên cao nhất)
-                            scannedUrls.forEach(u => attempts.push({ url: u, auth: u.includes('googleapis.com') }));
-                            // lh3 serving với =s0 (đã hoạt động trước đó)
-                            if (causToken) {
-                                attempts.push({ url: `https://lh3.googleusercontent.com/ais-proxy/${causToken}=s0`, auth: false });
-                            }
-                            if (mediaName) {
-                                attempts.push({ url: `https://aisandbox-pa.googleapis.com/v1/projects/${auth.projectId}/flowMedia/${mediaName}?alt=media`, auth: true });
-                            }
-                            if (causToken) {
-                                attempts.push({ url: `https://aisandbox-pa.googleapis.com/v1/flowMedia/${causToken}:download`, auth: true });
-                            }
-
-                            let downloaded = false;
-                            for (const attempt of attempts) {
+                        if (auth.cookie && (auth.atToken || auth.projectId)) {
+                            // ── FLOW API: flow.google.com batchexecute (ogiZ0b) ────────
+                            // maseQ upload ảnh tham chiếu xảy ra bên trong extension (background.js)
+                            const flowResults = await this.generateImageViaFlow(
+                                sanitizeVeoPrompt(task.prompt), aspectRatio, genCount, model, sendLog, task.id,
+                                task.referenceImages || []
+                            );
+                            const imgPrefixF = String(task.id || '').startsWith('dna_c') ? 'TC_image' : 'image';
+                            const downloadedFiles = [];
+                            const mediaGenerationIds = [];
+                            for (let i = 0; i < flowResults.length; i++) {
+                                const { downloadUrl, uuid2, imageData } = flowResults[i];
+                                const suffix = flowResults.length > 1 ? `_${i + 1}` : '';
+                                const fileName = `${imgPrefixF}_${getSeqNum(task)}${suffix}.jpg`;
+                                let filePath = path.join(outputFolder, fileName);
+                                mediaGenerationIds.push(uuid2);
                                 try {
-                                    const savedPath = await this.downloadMedia(attempt.url, filePath, attempt.auth);
-                                    // downloadMedia trả về path thực tế (có thể đổi extension WebP/JPG)
-                                    const actualFileName = path.basename(savedPath);
-                                    downloadedFiles.push(actualFileName);
-                                    downloaded = true;
+                                    const fss = require('fs');
+                                    fss.mkdirSync(path.dirname(filePath), { recursive: true });
+                                    if (imageData?.fromFilePath && imageData?.filePath && fss.existsSync(imageData.filePath)) {
+                                        // chrome.downloads tải về temp (thường WebP) → copy rồi convert sang jpg
+                                        fss.copyFileSync(imageData.filePath, filePath);
+                                        try { fss.unlinkSync(imageData.filePath); } catch(_) {}
+                                        filePath = convertToJpeg(filePath);
+                                        downloadedFiles.push(path.basename(filePath));
+                                    } else {
+                                        const savedPath = await this.downloadMedia(downloadUrl, filePath, false);
+                                        downloadedFiles.push(path.basename(savedPath));
+                                    }
+                                } catch (e) {
+                                    sendLog(`[JOBID:${task.id}] Không tải được ảnh [${i}]: ${(e.message || '').slice(0, 80)}`, 'info');
+                                }
+                            }
+                            if (downloadedFiles.length === 0) throw new Error('Không tải được ảnh nào từ flow.google.com. Thử lại hoặc đổi model.');
+                            sendLog(`[JOBID:${task.id}] Lưu thành công: ${downloadedFiles.join(', ')}`, 'success');
+                            const _imgFpF = path.join(outputFolder, downloadedFiles[0]);
+                            sendLog(`[JOBID:${task.id}]|PATH:${_imgFpF}`, 'job_success');
+                            results.push({ id: task.id, prompt: task.prompt, filePath: _imgFpF, mediaId: mediaGenerationIds[0] || null });
+
+                        } else {
+                            // ── OLD API: aisandbox-pa.googleapis.com ───────────────────
+                            // Upload ảnh tham chiếu qua Labs API TRƯỚC — tránh token hết hạn
+                            const referenceImageIds = [];
+                            if (task.referenceImages && task.referenceImages.length > 0) {
+                                sendLog(`[JOBID:${task.id}] Đang upload ${task.referenceImages.length} ảnh tham chiếu...`, 'info');
+                                for (const imgPath of task.referenceImages) {
+                                    const imgId = await this.uploadReferenceImage(imgPath, sendLog, task.id);
+                                    if (imgId) referenceImageIds.push(imgId);
+                                }
+                                if (referenceImageIds.length > 0) {
+                                    sendLog(`[JOBID:${task.id}] ✅ Đã upload ${referenceImageIds.length} ảnh tham chiếu`, 'success');
+                                }
+                            }
+                            const imageApiUrl = `https://aisandbox-pa.googleapis.com/v1/projects/${auth.projectId}/flowMedia:batchGenerateImages`;
+                            let genRes;
+                            let imgAutoReloaded = false;
+                            for (let tokenTry = 1; tokenTry <= 3; tokenTry++) {
+                                const imgRecaptchaToken = await VeoEngine.acquireRecaptcha('IMAGE_GENERATION', task.id, sendLog);
+                                sendLog(`[JOBID:${task.id}] Bắn lệnh tạo ảnh lên AI Sandbox${tokenTry > 1 ? ` (lần ${tokenTry})` : ''}...`, 'info');
+                                const payload = this.generateImagePayload(sanitizeVeoPrompt(task.prompt), aspectRatio, genCount, auth.projectId, imgRecaptchaToken, model, referenceImageIds);
+                                try {
+                                    genRes = await this.fetchAPI(imageApiUrl, 'POST', payload);
                                     break;
-                                } catch (_) {}
+                                } catch (e) {
+                                    if (e.isRecaptchaExpired && tokenTry < 3) {
+                                        sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, tự động lấy token mới (${tokenTry}/3)...`, 'info');
+                                        await VeoEngine.randDelay(2000, 4000);
+                                        continue;
+                                    }
+                                    if (e.isRecaptchaExpired && !imgAutoReloaded) {
+                                        imgAutoReloaded = true;
+                                        const ok = await this.reloadLabsAndWait(sendLog, task.id);
+                                        if (ok) { tokenTry = 0; continue; }
+                                    }
+                                    if (e.isRecaptchaExpired) throw new Error("Token hết hạn — đã tự động F5 Google Labs nhưng vẫn lỗi. Vui lòng thử lại sau.");
+                                    throw e;
+                                }
                             }
 
-                            if (!downloaded) {
-                                sendLog(`[JOBID:${task.id}] Không tải được ảnh [${i}] — bỏ qua.`, 'info');
+                            let generatedMedia = genRes.generatedMedia;
+                            if (!generatedMedia || generatedMedia.length === 0) {
+                                if (Array.isArray(genRes.responses)) generatedMedia = genRes.responses.flatMap(r => r.generatedMedia || []);
                             }
+                            if (!generatedMedia || generatedMedia.length === 0) generatedMedia = genRes.mediaGenerationResult?.generatedMedia || [];
+                            if (!generatedMedia || generatedMedia.length === 0) generatedMedia = genRes.images || genRes.media || genRes.results || [];
+                            if (!generatedMedia || generatedMedia.length === 0) {
+                                if (genRes.error) throw new Error(genRes.error.message || "Bị từ chối do vi phạm chính sách");
+                                throw new Error(`API không trả về ảnh. Response keys: [${Object.keys(genRes).join(', ')}]`);
+                            }
+
+                            sendLog(`[JOBID:${task.id}] Nhận thành công ${generatedMedia.length} ảnh, đang tải về...`, 'progress');
+
+                            const downloadedFiles = [];
+                            const mediaGenerationIds = [];
+                            const imgPrefix = String(task.id || '').startsWith('dna_c') ? 'TC_image' : 'image';
+                            for (let i = 0; i < generatedMedia.length; i++) {
+                                const imgData = generatedMedia[i];
+                                const suffix = generatedMedia.length > 1 ? `_${i + 1}` : '';
+                                const fileName = `${imgPrefix}_${getSeqNum(task)}${suffix}.png`;
+                                const filePath = path.join(outputFolder, fileName);
+
+                                const causToken = imgData.image?.generatedImage?.mediaGenerationId;
+                                const mediaName = imgData.name;
+                                const flowMediaUUID = mediaName?.split('/').pop();
+                                if (flowMediaUUID && flowMediaUUID.includes('-')) {
+                                    mediaGenerationIds.push(flowMediaUUID);
+                                } else if (causToken) {
+                                    mediaGenerationIds.push(causToken);
+                                }
+
+                                const scannedUrls = this.findUrlsInObject(imgData);
+                                const attempts = [];
+                                scannedUrls.forEach(u => attempts.push({ url: u, auth: u.includes('googleapis.com') }));
+                                if (causToken) attempts.push({ url: `https://lh3.googleusercontent.com/ais-proxy/${causToken}=s0`, auth: false });
+                                if (mediaName) attempts.push({ url: `https://aisandbox-pa.googleapis.com/v1/projects/${auth.projectId}/flowMedia/${mediaName}?alt=media`, auth: true });
+                                if (causToken) attempts.push({ url: `https://aisandbox-pa.googleapis.com/v1/flowMedia/${causToken}:download`, auth: true });
+
+                                let downloaded = false;
+                                for (const attempt of attempts) {
+                                    try {
+                                        const savedPath = await this.downloadMedia(attempt.url, filePath, attempt.auth);
+                                        downloadedFiles.push(path.basename(savedPath));
+                                        downloaded = true;
+                                        break;
+                                    } catch (_) {}
+                                }
+                                if (!downloaded) sendLog(`[JOBID:${task.id}] Không tải được ảnh [${i}] — bỏ qua.`, 'info');
+                            }
+
+                            if (downloadedFiles.length === 0) throw new Error("Không tải được ảnh nào từ server. Thử lại hoặc đổi model.");
+                            sendLog(`[JOBID:${task.id}] Lưu thành công: ${downloadedFiles.join(', ')}`, 'success');
+                            const _imgFp = path.join(outputFolder, downloadedFiles[0]);
+                            sendLog(`[JOBID:${task.id}]|PATH:${_imgFp}`, 'job_success');
+                            results.push({ id: task.id, prompt: task.prompt, filePath: _imgFp, mediaId: mediaGenerationIds[0] || null });
                         }
-
-                        if (downloadedFiles.length === 0) throw new Error("Không tải được ảnh nào từ server. Thử lại hoặc đổi model.");
-
-                        sendLog(`[JOBID:${task.id}] Lưu thành công: ${downloadedFiles.join(', ')}`, 'success');
-                        const _imgFp = path.join(outputFolder, downloadedFiles[0]);
-                        sendLog(`[JOBID:${task.id}]|PATH:${_imgFp}`, 'job_success');
-                        results.push({ id: task.id, prompt: task.prompt, filePath: _imgFp, mediaId: mediaGenerationIds[0] || null });
 
                     } else {
                         // LUỒNG TẠO VIDEO
@@ -1507,21 +2183,61 @@ class VeoEngine {
                             let ingredientMediaIds = [];
                             const INGRED_URL = 'https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoReferenceImages';
 
-                            if (task.ingredientMediaIds && task.ingredientMediaIds.length > 0) {
-                                // UUID từ batchGenerateImages (Electron) — gọi Ingredients gen trực tiếp qua Electron
-                                // Không cần Extension vì UUID đã thuộc project, auth token hợp lệ là đủ
+                            if (auth.cookie && auth.projectId && task.ingredientImages && task.ingredientImages.length > 0 && !task._tmplMode) {
+                                // === FLOW API PATH (MZZa6b) — dùng Chrome session, không cần Labs token ===
+                                // MZZa6b hỗ trợ voice natively: task[7] = [[voiceId]]
+                                const imgNames = task.ingredientImages.map(p => p?.split(/[\\/]/).pop() || '?').join(', ');
+                                sendLog(`[JOBID:${task.id}] Flow R2V (MZZa6b): [${imgNames}] | model=${model} ${duration} | ${aspectRatio}${task.voiceId ? ' | voice=' + task.voiceId : ''}`, 'info');
+                                const { videoUrl: r2vFlowUrl } = await this.generateR2VViaFlowBatchexecute(
+                                    sanitizeVeoPrompt(task.prompt), task.ingredientImages, aspectRatio, model, duration, sendLog, task.id, task.voiceId
+                                );
+                                genRes = { _flowVideoUrl: r2vFlowUrl };
+                            } else if (task._tmplMode && task.ingredientImages && task.ingredientImages.length > 0) {
+                                // === TEMPLATE MODE: upload via API (bearer token, cached) → gen via fetchAPI trực tiếp ===
+                                // Dùng cho TemplateVideoPanel — tránh Extension lock bottleneck khi 79 task song song
+                                sendLog(`[JOBID:${task.id}] [Template] Upload ${task.ingredientImages.length} ảnh qua API...`, 'info');
+                                for (let iIdx = 0; iIdx < task.ingredientImages.length; iIdx++) {
+                                    const imgPath = task.ingredientImages[iIdx];
+                                    const fname = imgPath?.split(/[\\/]/).pop() || '?';
+                                    const mediaId = await this.uploadImageAPI(imgPath, sendLog, task.id, `Frame${iIdx + 1}(${fname})`);
+                                    if (mediaId) ingredientMediaIds.push(mediaId);
+                                }
+                                if (ingredientMediaIds.length === 0) throw new Error('Không upload được ảnh nào.');
+                                let tmplAutoReloaded = false;
+                                for (let tokenTry = 1; tokenTry <= 3; tokenTry++) {
+                                    const ingredRecaptcha = await VeoEngine.acquireRecaptcha('VIDEO_GENERATION', task.id, sendLog);
+                                    const ingredPayload = this.generateIngredientsPayload(sanitizeVeoPrompt(task.prompt), aspectRatio, model, auth.projectId, ingredRecaptcha, ingredientMediaIds, null, duration);
+                                    try {
+                                        genRes = await this.generateVideoViaExtension(INGRED_URL, ingredPayload, sendLog, task.id);
+                                        if (!genRes) throw new Error('Template Ingredients gen thất bại');
+                                        break;
+                                    } catch (e) {
+                                        if (e.isRecaptchaExpired && tokenTry < 3) {
+                                            sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, lấy token mới (${tokenTry}/3)...`, 'info');
+                                            await VeoEngine.randDelay(2000, 4000); continue;
+                                        }
+                                        if (e.isRecaptchaExpired && !tmplAutoReloaded) {
+                                            tmplAutoReloaded = true;
+                                            const ok = await this.reloadLabsAndWait(sendLog, task.id);
+                                            if (ok) { tokenTry = 0; continue; }
+                                        }
+                                        sendLog(`[JOBID:${task.id}] ❌ lỗi (lần ${tokenTry}): ${(e.message||'unknown').slice(0, 150)}`, 'error');
+                                        throw e;
+                                    }
+                                }
+                            } else if (task.ingredientMediaIds && task.ingredientMediaIds.length > 0) {
+                                // UUID có sẵn — upload đã được thực hiện trước, gen qua Extension
                                 ingredientMediaIds = task.ingredientMediaIds;
-                                sendLog(`[JOBID:${task.id}] Dùng ${ingredientMediaIds.length} ảnh DNA từ project (UUID sẵn có)...`, 'info');
+                                sendLog(`[JOBID:${task.id}] Dùng ${ingredientMediaIds.length} ảnh DNA (UUID sẵn có)...`, 'info');
                                 if (task.voiceId) sendLog(`[JOBID:${task.id}] 🎙️ Giọng: ${task.voiceId}`, 'info');
+                                const _sanitizedPrompt = sanitizeVeoPrompt(task.prompt);
                                 let ingr1AutoReloaded = false;
                                 for (let tokenTry = 1; tokenTry <= 3; tokenTry++) {
                                     const ingredRecaptcha = await VeoEngine.acquireRecaptcha('VIDEO_GENERATION', task.id, sendLog);
-                                    const ingredPayload = this.generateIngredientsPayload(sanitizeVeoPrompt(task.prompt), aspectRatio, model, auth.projectId, ingredRecaptcha, ingredientMediaIds, task.voiceId || null, duration);
-                                    sendLog(`[JOBID:${task.id}] Gửi lệnh Ingredients Video qua API${tokenTry > 1 ? ` (lần ${tokenTry})` : ''}...`, 'info');
+                                    const ingredPayload = this.generateIngredientsPayload(_sanitizedPrompt, aspectRatio, model, auth.projectId, ingredRecaptcha, ingredientMediaIds, task.voiceId || null, duration);
                                     try {
-                                        genRes = await this.fetchAPI(INGRED_URL, 'POST', ingredPayload);
+                                        genRes = await this.generateVideoViaExtension(INGRED_URL, ingredPayload, sendLog, task.id);
                                         if (!genRes) throw new Error('Ingredients gen thất bại');
-                                        sendLog(`[JOBID:${task.id}] ✅ Ingredients gen API OK`, 'success');
                                         break;
                                     } catch (e) {
                                         if (e.isRecaptchaExpired && tokenTry < 3) {
@@ -1543,7 +2259,7 @@ class VeoEngine {
                                 for (let iIdx = 0; iIdx < task.ingredientImages.length; iIdx++) {
                                     const imgPathForLog = task.ingredientImages[iIdx]?.split(/[\\/]/).pop() || '?';
                                     sendLog(`[JOBID:${task.id}] → Ingredient ${iIdx + 1}: ${imgPathForLog}`, 'info');
-                                    const mediaId = await this.uploadImageViaExtension(task.ingredientImages[iIdx], sendLog, task.id, `Ingredient ${iIdx + 1}`);
+                                    const mediaId = await this.uploadImageAPI(task.ingredientImages[iIdx], sendLog, task.id, `Ingredient${iIdx + 1}`);
                                     if (mediaId) ingredientMediaIds.push(mediaId);
                                 }
                                 if (ingredientMediaIds.length === 0) throw new Error("Không có ảnh Ingredient hợp lệ.");
@@ -1553,7 +2269,7 @@ class VeoEngine {
                                     const ingredRecaptcha = await VeoEngine.acquireRecaptcha('VIDEO_GENERATION', task.id, sendLog);
                                     const ingredPayload = this.generateIngredientsPayload(sanitizeVeoPrompt(task.prompt), aspectRatio, model, auth.projectId, ingredRecaptcha, ingredientMediaIds, task.voiceId || null, duration);
                                     try {
-                                        // Gọi qua Extension MAIN world (cùng session với upload) — tránh Media not found
+                                        // Gọi qua Extension MAIN world — tránh Media not found
                                         genRes = await this.generateVideoViaExtension(INGRED_URL, ingredPayload, sendLog, task.id);
                                         if (!genRes) throw new Error('Extension Ingredients gen thất bại');
                                         break;
@@ -1595,8 +2311,7 @@ class VeoEngine {
                             }
 
                             if (isI2V) {
-                                // I2V: gọi trực tiếp qua fetchAPI (Node.js https, cùng bearer token + cookie)
-                                // Không qua Extension lock → nhiều task I2V chạy song song được
+                                // I2V: gọi qua Extension MAIN world (Chrome session đầy đủ) — tránh 500 do session validation
                                 sendLog(`[JOBID:${task.id}] Gửi lệnh Render I2V API...`, 'info');
                                 let i2vRetry = 0;
                                 let i2vAutoReloaded = false;
@@ -1604,8 +2319,8 @@ class VeoEngine {
                                     try {
                                         const videoRecaptchaToken = await VeoEngine.acquireRecaptcha('VIDEO_GENERATION', task.id, sendLog);
                                         const videoPayload = this.generateVideoPayload(sanitizeVeoPrompt(task.prompt), aspectRatio, model, duration, auth.projectId, videoRecaptchaToken, startImageId, endImageId, quality);
-                                        genRes = await this.fetchAPI(VIDEO_GEN_URL, 'POST', videoPayload);
-                                        if (!genRes) throw new Error('I2V gen thất bại');
+                                        genRes = await this.generateVideoViaExtension(VIDEO_GEN_URL, videoPayload, sendLog, task.id);
+                                        if (!genRes) throw new Error('I2V gen thất bại hoặc timeout');
                                         break;
                                     } catch (e) {
                                         const msg = e.message || '';
@@ -1619,39 +2334,62 @@ class VeoEngine {
                                         if ((msg.includes('500') || msg.includes('503') || msg.includes('timeout')) && i2vRetry < 2) {
                                             i2vRetry++;
                                             sendLog(`[JOBID:${task.id}] ⚠️ Server lỗi, thử lại ${i2vRetry}/2 (lấy mã mới)...`, 'info');
-                                            await new Promise(r => setTimeout(r, 12000));
+                                            await new Promise(r => setTimeout(r, 5000));
                                         } else { throw e; }
                                     }
                                 }
                             } else {
-                                // T2V: gọi qua Extension MAIN world (Chrome session đầy đủ) — tránh 500 do session validation
-                                sendLog(`[JOBID:${task.id}] Gửi lệnh Render Video API...`, 'info');
-                                let t2vRetry = 0;
-                                let t2vAutoReloaded = false;
-                                while (t2vRetry < 3) {
-                                    try {
-                                        const freshToken = await VeoEngine.acquireRecaptcha('VIDEO_GENERATION', task.id, sendLog);
-                                        const freshPayload = this.generateVideoPayload(sanitizeVeoPrompt(task.prompt), aspectRatio, model, duration, auth.projectId, freshToken, startImageId, endImageId, quality);
-                                        genRes = await this.generateVideoViaExtension(VIDEO_GEN_URL, freshPayload, sendLog, task.id);
-                                        if (!genRes) throw new Error('Extension T2V gen thất bại hoặc timeout');
-                                        break;
-                                    } catch (e) {
-                                        const msg = e.message || '';
-                                        if (e.isRecaptchaExpired && !t2vAutoReloaded) {
-                                            t2vAutoReloaded = true;
-                                            sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, tự động lấy token mới...`, 'info');
-                                            const ok = await this.reloadLabsAndWait(sendLog, task.id);
-                                            if (ok) { t2vRetry = 0; continue; }
+                                // T2V
+                                const isFlowVideoMode = !auth.bearerToken && auth.cookie && auth.projectId;
+                                if (isFlowVideoMode) {
+                                    // flow.google.com batchexecute path (YhhmEf → jwpduf)
+                                    sendLog(`[JOBID:${task.id}] Tạo video qua flow.google.com batchexecute...`, 'info');
+                                    const { videoUrl: flowVideoUrl } = await VeoEngine.generateVideoViaFlowBatchexecute(
+                                        sanitizeVeoPrompt(task.prompt), aspectRatio, model, duration, sendLog, task.id
+                                    );
+                                    genRes = { _flowVideoUrl: flowVideoUrl };
+                                } else {
+                                    // aisandbox-pa path via Extension (needs Bearer token)
+                                    sendLog(`[JOBID:${task.id}] Gửi lệnh Render Video API...`, 'info');
+                                    let t2vRetry = 0;
+                                    let t2vAutoReloaded = false;
+                                    while (t2vRetry < 3) {
+                                        try {
+                                            const freshToken = await VeoEngine.acquireRecaptcha('VIDEO_GENERATION', task.id, sendLog);
+                                            const freshPayload = this.generateVideoPayload(sanitizeVeoPrompt(task.prompt), aspectRatio, model, duration, auth.projectId, freshToken, startImageId, endImageId, quality);
+                                            genRes = await this.generateVideoViaExtension(VIDEO_GEN_URL, freshPayload, sendLog, task.id);
+                                            if (!genRes) throw new Error('Extension T2V gen thất bại hoặc timeout');
+                                            break;
+                                        } catch (e) {
+                                            const msg = e.message || '';
+                                            if (e.isRecaptchaExpired && !t2vAutoReloaded) {
+                                                t2vAutoReloaded = true;
+                                                sendLog(`[JOBID:${task.id}] ⚠️ Token hết hạn, tự động lấy token mới...`, 'info');
+                                                const ok = await this.reloadLabsAndWait(sendLog, task.id);
+                                                if (ok) { t2vRetry = 0; continue; }
+                                            }
+                                            if (e.isRecaptchaExpired) throw new Error("Token hết hạn — đã tự động F5 Google Labs nhưng vẫn lỗi.");
+                                            if ((msg.includes('500') || msg.includes('503') || msg.includes('timeout')) && t2vRetry < 2) {
+                                                t2vRetry++;
+                                                sendLog(`[JOBID:${task.id}] ⚠️ Server lỗi, thử lại ${t2vRetry}/2 (lấy mã mới)...`, 'info');
+                                                await new Promise(r => setTimeout(r, 12000));
+                                            } else { throw e; }
                                         }
-                                        if (e.isRecaptchaExpired) throw new Error("Token hết hạn — đã tự động F5 Google Labs nhưng vẫn lỗi.");
-                                        if ((msg.includes('500') || msg.includes('503') || msg.includes('timeout')) && t2vRetry < 2) {
-                                            t2vRetry++;
-                                            sendLog(`[JOBID:${task.id}] ⚠️ Server lỗi, thử lại ${t2vRetry}/2 (lấy mã mới)...`, 'info');
-                                            await new Promise(r => setTimeout(r, 12000));
-                                        } else { throw e; }
                                     }
                                 }
                             }
+                        }
+
+                        // Flow batchexecute video — already has final URL, download directly
+                        if (genRes && genRes._flowVideoUrl) {
+                            const vfn = `video_${getSeqNum(task)}.mp4`;
+                            const vfp = path.join(outputFolder, vfn);
+                            sendLog(`[JOBID:${task.id}] 100% — Đang tải Video từ flow.google.com...`, 'progress');
+                            await VeoEngine.downloadMedia(genRes._flowVideoUrl, vfp, false);
+                            sendLog(`[JOBID:${task.id}] Lưu thành công: ${vfn}`, 'success');
+                            sendLog(`[JOBID:${task.id}]|PATH:${vfp}`, 'job_success');
+                            results.push({ id: task.id, prompt: task.prompt, filePath: vfp });
+                            return;
                         }
 
                         // Trích generationIds — I2V dùng media[].name (UUID), T2V dùng operations[].operation.name
@@ -1824,11 +2562,15 @@ class VeoEngine {
                                     }
                                     isDone = true;
                                 } else if (st === 'FAILED' || st === 'ERROR' || st === 'CANCELLED') {
-                                    const errMsg = firstItem.error?.message || firstItem.errorMessage
+                                    const errDetail = firstItem.error?.message || firstItem.errorMessage
                                         || firstItem.mediaMetadata?.mediaStatus?.errorMessage
                                         || firstItem.mediaMetadata?.errorMessage
-                                        || JSON.stringify(firstItem).substring(0, 200)
-                                        || "Server từ chối render.";
+                                        || firstItem.mediaMetadata?.mediaStatus?.statusDetail
+                                        || '';
+                                    sendLog(`[JOBID:${task.id}] 🔍 Raw FAILED: ${JSON.stringify(firstItem).substring(0, 300)}`, 'warn');
+                                    const errMsg = errDetail
+                                        ? `Veo render thất bại (${st}): ${errDetail.substring(0, 150)}`
+                                        : `Veo render thất bại — trạng thái: ${st}. Có thể do prompt vi phạm chính sách hoặc ảnh không hợp lệ.`;
                                     throw new Error(errMsg);
                                 } else {
                                     const pct = firstItem.progressPercent || firstItem.progress || Math.floor((pollCount / 36) * 100);
@@ -1911,70 +2653,59 @@ class VeoEngine {
                     }
 
                 } catch (error) {
-                    sendLog(`[JOBID:${task.id}] Lỗi: ${error.message}`, 'error');
+                    const rawMsg = error.message || '';
+                    let friendlyMsg = rawMsg;
+                    // Bắt lỗi CAE (Content Advisory Error) — Veo từ chối nội dung
+                    try {
+                        const parsed = typeof rawMsg === 'string' && rawMsg.includes('workflowStepId') ? JSON.parse(rawMsg) : null;
+                        if (parsed?.workflowStepId === 'CAE') {
+                            friendlyMsg = '⚠️ Veo từ chối nội dung (CAE) — ảnh hoặc prompt vi phạm chính sách. Bỏ qua nhóm này.';
+                        } else if (parsed?.workflowStepId) {
+                            friendlyMsg = `⚠️ Veo báo lỗi nội dung [${parsed.workflowStepId}] — bỏ qua nhóm này.`;
+                        }
+                    } catch (_) {}
+                    if (!friendlyMsg || friendlyMsg === rawMsg) {
+                        if (/401|403|unauthorized|forbidden/i.test(rawMsg)) friendlyMsg = '🔒 Token hết hạn hoặc không có quyền — cần F5 Google Labs.';
+                        else if (/timeout|ETIMEDOUT/i.test(rawMsg)) friendlyMsg = '⏱️ Quá thời gian chờ — mạng chậm hoặc Veo bận.';
+                        else if (/policy|safety/i.test(rawMsg)) friendlyMsg = '⚠️ Vi phạm chính sách nội dung — bỏ qua nhóm này.';
+                        else friendlyMsg = rawMsg.slice(0, 120);
+                    }
+                    sendLog(`[JOBID:${task.id}] ❌ ${friendlyMsg}`, 'error');
                     sendLog(`[JOBID:${task.id}]`, 'job_fail');
-                    // Truyền error.message về renderer để detect policy violation
-                    results.push({ id: task.id, prompt: task.prompt, isError: true, error: error.message || '' });
+                    results.push({ id: task.id, prompt: task.prompt, isError: true, error: rawMsg });
+                }
+            };
+
+            // Fail tất cả task chưa dispatch (khi bị pause) → event job_fail đến renderer → waitAllDone resolve
+            const failRemaining = (fromIndex) => {
+                for (let j = fromIndex; j < tasks.length; j++) {
+                    const t = tasks[j];
+                    sendLog(`[JOBID:${t.id}] ⏸ Tạm dừng`, 'error');
+                    sendLog(`[JOBID:${t.id}]`, 'job_fail');
+                    results.push({ id: t.id, isError: true, error: 'paused' });
                 }
             };
 
             const executeWorkers = async () => {
-                if (mediaType === 'Image') {
-                    // Ảnh: chạy 5 task song song (như cũ)
-                    const workers = [];
-                    for (let i = 0; i < tasks.length; i++) {
-                        const task = tasks[i];
-                        while (activeJobs >= MAX_WORKERS) await new Promise(r => setTimeout(r, 1000));
-                        activeJobs++;
-                        if (i > 0) await VeoEngine.randDelay(8000, 18000);
-                        const w = processTask(task).finally(() => { activeJobs--; });
-                        workers.push(w);
+                // 8 workers song song cho cả ảnh lẫn video
+                const workers = [];
+                for (let i = 0; i < tasks.length; i++) {
+                    // Nếu đang bị pause → fail toàn bộ task còn lại và thoát ngay
+                    if (VeoEngine._paused) { failRemaining(i); break; }
+
+                    // Chờ slot trống, kiểm tra pause mỗi 500ms
+                    while (activeJobs >= MAX_WORKERS) {
+                        if (VeoEngine._paused) { failRemaining(i); return Promise.all(workers); }
+                        await new Promise(r => setTimeout(r, 500));
                     }
-                    await Promise.all(workers);
-                } else {
-                    // Video: batch 5 task song song → chờ cả batch xong (download) → retry task lỗi → batch tiếp
-                    const BATCH_SIZE = 5;
-                    // Internal retry = 3 (chỉ để phục hồi lỗi mạng thoáng qua)
-                    // Retry strategy thực sự do AutoAnimation.jsx điều khiển (5 lần → global 20 lần)
-                    const MAX_RETRIES = 3;
-                    for (let batchStart = 0; batchStart < tasks.length; batchStart += BATCH_SIZE) {
-                        const batch = tasks.slice(batchStart, batchStart + BATCH_SIZE);
-                        let pendingTasks = [...batch];
+                    if (VeoEngine._paused) { failRemaining(i); break; }
 
-                        for (let attempt = 1; attempt <= MAX_RETRIES && pendingTasks.length > 0; attempt++) {
-                            sendLog(`📦 Batch ${Math.floor(batchStart / BATCH_SIZE) + 1} — chạy ${pendingTasks.length} task${attempt > 1 ? ` (retry ${attempt}/${MAX_RETRIES})` : ''}...`, 'info');
-                            const prevLen = results.length;
-
-                            // Chạy tất cả pending task song song, chờ hết batch
-                            await Promise.all(pendingTasks.map(task => processTask(task)));
-
-                            // Tìm task thành công / lỗi
-                            const newResults = results.slice(prevLen);
-                            const succeededIds = new Set(newResults.filter(r => !r.isError).map(r => r.id));
-                            const failedTasks = pendingTasks.filter(t => !succeededIds.has(t.id));
-
-                            if (failedTasks.length > 0) {
-                                // Xóa kết quả lỗi của các task sẽ retry
-                                const failedIds = new Set(failedTasks.map(t => t.id));
-                                for (let j = results.length - 1; j >= prevLen; j--) {
-                                    if (failedIds.has(results[j]?.id) && results[j]?.isError) {
-                                        results.splice(j, 1);
-                                    }
-                                }
-                                if (attempt < MAX_RETRIES) {
-                                    sendLog(`🔁 ${failedTasks.length} task lỗi — thử lại ${attempt + 1}/${MAX_RETRIES} sau 5s...`, 'warn');
-                                    await new Promise(r => setTimeout(r, 5000));
-                                } else {
-                                    sendLog(`⏭️ ${failedTasks.length} task lỗi sau ${MAX_RETRIES} lần — trả về AutoAnimation để xử lý tiếp`, 'warn');
-                                    for (const t of failedTasks) {
-                                        results.push({ id: t.id, prompt: t.prompt, isError: true });
-                                    }
-                                }
-                            }
-                            pendingTasks = failedTasks;
-                        }
-                    }
+                    activeJobs++;
+                    if (i > 0) await new Promise(r => setTimeout(r, 1500));
+                    const w = processTask(tasks[i]).finally(() => { activeJobs--; });
+                    workers.push(w);
                 }
+                await Promise.all(workers);
             };
 
             await executeWorkers();

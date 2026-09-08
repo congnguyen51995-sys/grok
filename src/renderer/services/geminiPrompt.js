@@ -1,7 +1,8 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { retryWithKeyRotation } from './keyRotation.js';
 
-const GEMINI_MODEL = 'gemini-2.5-flash';
+let GEMINI_MODEL = 'gemini-3.5-flash';
+export function setGeminiPromptModel(model) { if (model) GEMINI_MODEL = model; }
 const SCENE_CHUNK = 8; // base chunk size — adaptive splitter handles larger batches safely
 
 // Maps style display names → detailed image-generation keywords
@@ -70,10 +71,8 @@ async function geminiJSON(apiKeys, prompt, schema, maxTokens = 32768, onSwitch) 
   }, apiKeys, { onSwitch });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PHASE 1 — Extract full DNA from the script
-// ─────────────────────────────────────────────────────────────────────────────
-async function extractScriptDNA(apiKeys, config, onSwitch) {
+// ─── Exported prompt builders — identical prompts reused by claudePrompt.js ──
+export function buildDNAPrompt(config) {
   const assetHint = [];
   if (config.characters?.length) {
     assetHint.push('USER-PROVIDED CHARACTERS:');
@@ -83,20 +82,32 @@ async function extractScriptDNA(apiKeys, config, onSwitch) {
     assetHint.push('USER-PROVIDED ENVIRONMENTS:');
     config.environments.forEach(e => assetHint.push(`${e.id} | ${e.name} | ${e.description}`));
   }
-
   const noDialogue = config.language === 'no-dialogue';
-  const prompt = `Read the following script VERY CAREFULLY and extract every entity needed to maintain perfect visual consistency across all scenes.
+  return `You are a master filmmaker and story analyst. Read the following script/audio transcript VERY CAREFULLY as a COMPLETE STORY, then extract everything needed to craft a cohesive, cinematic film.
 
-${assetHint.length ? assetHint.join('\n') + '\n\n' : ''}SCRIPT:
+${assetHint.length ? assetHint.join('\n') + '\n\n' : ''}SCRIPT / AUDIO TRANSCRIPT:
 ${config.subject}
 
 STYLE: ${expandStyle(config.style)}
 DIALOGUE MODE: ${noDialogue ? 'NO DIALOGUE — all scenes are completely silent, no voice, no speech' : `DIALOGUE LANGUAGE: ${config.language}`}
 
+═══ PHASE 1: HOLISTIC STORY ANALYSIS ═══
+
+Read the ENTIRE script first. Understand:
+- What is the CORE EMOTIONAL JOURNEY? (What does the audience feel by the end?)
+- What is the THEMATIC SPINE? (The central idea/message driving every scene)
+- What STORY ARC is being told? (Setup → Conflict → Climax → Resolution)
+- How does each CHARACTER CHANGE or reveal themselves through what they SAY?
+- What VISUAL MOTIFS recur and connect scenes?
+
+═══ PHASE 2: EXTRACT DNA ═══
+
 TASK — Create DNA reference sheets for:
-1. ALL CHARACTERS (main + every supporting character that appears). Code names: char_1, char_2, char_3... in order of importance.
-2. ALL ENVIRONMENTS/SETTINGS (every distinct location that appears).
-3. ALL KEY OBJECTS/PROPS repeated across scenes (NOT living beings — weapons, vehicles, magical items, etc.).
+1. MAIN CHARACTERS ONLY — maximum 5 characters total, ordered by importance. Only include characters who appear in multiple scenes. Skip minor/background characters. Code names: char_1, char_2, char_3... in order of importance.
+2. KEY ENVIRONMENTS — maximum 3 distinct locations (most important only).
+3. KEY OBJECTS/PROPS — maximum 5 objects total (NOT living beings — weapons, vehicles, magical items, etc.). Only objects that repeat across multiple scenes.
+
+⚠️ STRICT LIMIT: characters array MAX 5 items. key_objects array MAX 5 items. environments array MAX 3 items.
 
 ⚠️ CRITICAL LANGUAGE RULE: ALL output fields MUST be 100% ENGLISH ONLY.
 - NO Vietnamese, NO Japanese, NO Chinese, NO Korean, NO any non-English text in ANY field.
@@ -115,109 +126,76 @@ RULES:
 - style_lock: MUST copy EXACTLY this style string and nothing else: "${expandStyle(config.style)}". Do NOT paraphrase, shorten, or add words.
 - voice_lock: ${noDialogue ? '"no voice — silent film, no dialogue, no narration"' : 'voice character for dialogue (tone, accent, language code only)'}.
 
-⚠️ NO TEXT ON SCREEN RULE (ABSOLUTE): NEVER include text overlays, captions, subtitles, watermarks, titles, labels, or any written text rendered on the visual frame in ANY prompt. Images/video frames must be completely clean of text. End every dna_prompt with "no text, no captions, no watermarks, no on-screen text".`;
+═══ PHASE 3: STORY ARC MAPPING ═══
 
-  const schema = {
-    type: Type.OBJECT,
-    required: ['topic_content', 'characters', 'environments', 'key_objects', 'master_dna'],
-    properties: {
-      topic_content: { type: Type.STRING },
-      characters: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          required: ['id', 'name', 'role', 'gender', 'age', 'nationality', 'appearance', 'outfit', 'dna_prompt'],
-          properties: {
-            id: { type: Type.STRING }, name: { type: Type.STRING }, role: { type: Type.STRING },
-            gender: { type: Type.STRING }, age: { type: Type.STRING }, nationality: { type: Type.STRING },
-            appearance: { type: Type.STRING }, outfit: { type: Type.STRING }, dna_prompt: { type: Type.STRING }
-          }
-        }
-      },
-      environments: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          required: ['id', 'name', 'description', 'dna_prompt'],
-          properties: {
-            id: { type: Type.STRING }, name: { type: Type.STRING },
-            description: { type: Type.STRING }, dna_prompt: { type: Type.STRING }
-          }
-        }
-      },
-      key_objects: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          required: ['id', 'name', 'description', 'dna_prompt'],
-          properties: {
-            id: { type: Type.STRING }, name: { type: Type.STRING },
-            description: { type: Type.STRING }, dna_prompt: { type: Type.STRING }
-          }
-        }
-      },
-      master_dna: {
-        type: Type.OBJECT,
-        required: ['style_lock', 'voice_lock'],
-        properties: {
-          style_lock: { type: Type.STRING },
-          voice_lock: { type: Type.STRING }
-        }
-      }
-    }
-  };
+Analyze the COMPLETE NARRATIVE ARC and map it to scenes. For story_arc field:
+- theme: The single core thematic statement of this story (1 sentence)
+- emotional_journey: The complete emotional arc from first to last scene (e.g. "hope → doubt → despair → redemption")
+- acts: Array of 3 acts. Each act has: act_number (1/2/3), name (e.g. "Setup", "Confrontation", "Resolution"), scene_range (e.g. "1-5"), description (what happens), dominant_emotion, visual_tone
+- narrative_beats: Array of KEY story beats (turning points, emotional peaks). Each beat: scene_number (which scene), beat_type ("inciting_incident"|"rising_action"|"midpoint"|"dark_moment"|"climax"|"resolution"), description, dialogue_anchor (the EXACT line of dialogue from the script that triggers/marks this beat — empty string if none)
+- character_arcs: Object mapping char_id → { arc: "character's journey in 1 sentence", starts_as: "emotional/psychological state at scene 1", ends_as: "state at final scene", key_moment_scene: scene number where their arc turns }
+- visual_motifs: Array of recurring visual symbols/themes that should appear across scenes (max 3). Each: motif, meaning, how_to_show
 
-  try {
-    return await geminiJSON(apiKeys, prompt, schema, 8192, onSwitch);
-  } catch (err) {
-    if (err.isMaxTokens) {
-      // Script too long → retry with truncated input (keep first 3000 chars for DNA)
-      const truncated = config.subject.length > 3000
-        ? config.subject.substring(0, 3000) + '\n...[truncated for DNA extraction]'
-        : config.subject;
-      if (truncated === config.subject) throw err;
-      const truncatedPrompt = prompt.replace(config.subject, truncated);
-      return await geminiJSON(apiKeys, truncatedPrompt, schema, 8192, onSwitch);
-    }
-    throw err;
-  }
+⚠️ NO TEXT ON SCREEN RULE (ABSOLUTE): NEVER include text overlays, captions, subtitles, watermarks, titles, labels, or any written text rendered on the visual frame in ANY prompt. End every dna_prompt with "no text, no captions, no watermarks, no on-screen text".
+
+Return ONLY valid JSON with this exact structure (no markdown, no extra text):
+{"topic_content":"...","characters":[{"id":"char_1","name":"...","role":"...","gender":"...","age":"...","nationality":"...","appearance":"...","outfit":"...","dna_prompt":"..."}],"environments":[{"id":"env_1","name":"...","description":"...","dna_prompt":"..."}],"key_objects":[{"id":"obj_1","name":"...","description":"...","dna_prompt":"..."}],"master_dna":{"style_lock":"...","voice_lock":"..."},"story_arc":{"theme":"...","emotional_journey":"...","acts":[{"act_number":1,"name":"...","scene_range":"...","description":"...","dominant_emotion":"...","visual_tone":"..."}],"narrative_beats":[{"scene_number":1,"beat_type":"inciting_incident","description":"...","dialogue_anchor":"..."}],"character_arcs":{"char_1":{"arc":"...","starts_as":"...","ends_as":"...","key_moment_scene":1}},"visual_motifs":[{"motif":"...","meaning":"...","how_to_show":"..."}]}}`;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PHASE 2 — Generate scene prompts in chunks
-// ─────────────────────────────────────────────────────────────────────────────
-function extractSceneSection(script, fromScene, toScene) {
-  // Try to find [CẢNH n:] or [SCENE n:] markers to extract only relevant portion
-  const startRe = new RegExp(`\\[(?:CẢNH|SCENE|Cảnh)\\s+${fromScene}[\\s:\\-—]`, 'i');
-  const endRe   = new RegExp(`\\[(?:CẢNH|SCENE|Cảnh)\\s+${toScene + 1}[\\s:\\-—]`, 'i');
-  const fromIdx = script.search(startRe);
-  if (fromIdx === -1) return script; // fallback: full script
-  const toIdx = script.search(endRe);
-  return toIdx === -1 ? script.substring(fromIdx) : script.substring(fromIdx, toIdx);
-}
-
-async function generateScenesBatch(apiKeys, config, dna, fromScene, toScene, onSwitch) {
-  const charDNA = dna.characters.map(c => `${c.id} (${c.name}): ${c.dna_prompt}`).join('\n');
-  const envDNA  = dna.environments.map(e => `${e.id} (${e.name}): ${e.dna_prompt}`).join('\n');
-  const objDNA  = dna.key_objects.map(o => `${o.id} (${o.name}): ${o.dna_prompt}`).join('\n');
-  const styleLock = dna.master_dna?.style_lock || expandStyle(config.style);
-  const voiceLock = dna.master_dna?.voice_lock || 'natural voice';
+export function buildScenesPrompt(config, dna, fromScene, toScene) {
+  const charDNA    = dna.characters.map(c => `${c.id} (${c.name}): ${c.dna_prompt}`).join('\n');
+  const envDNA     = dna.environments.map(e => `${e.id} (${e.name}): ${e.dna_prompt}`).join('\n');
+  const objDNA     = dna.key_objects.map(o => `${o.id} (${o.name}): ${o.dna_prompt}`).join('\n');
+  const styleLock  = dna.master_dna?.style_lock || expandStyle(config.style);
+  const voiceLock  = dna.master_dna?.voice_lock || 'natural voice';
   const noDialogue = config.language === 'no-dialogue';
+
+  // Build story arc context block
+  const arc = dna.story_arc;
+  let storyArcBlock = '';
+  if (arc) {
+    const currentAct = arc.acts?.find(a => {
+      const [s, e] = (a.scene_range || '').split('-').map(Number);
+      return fromScene >= s && fromScene <= (e || s);
+    }) || arc.acts?.find(a => {
+      const [s] = (a.scene_range || '').split('-').map(Number);
+      return fromScene >= s;
+    });
+    const beatsInRange = arc.narrative_beats?.filter(b => b.scene_number >= fromScene && b.scene_number <= toScene) || [];
+    const motifs = arc.visual_motifs || [];
+
+    storyArcBlock = `
+══ STORY ARC (FILM CONTINUITY — MANDATORY) ══
+THEME: ${arc.theme || ''}
+EMOTIONAL JOURNEY: ${arc.emotional_journey || ''}
+${currentAct ? `CURRENT ACT: Act ${currentAct.act_number} — "${currentAct.name}" | Emotion: ${currentAct.dominant_emotion} | Visual tone: ${currentAct.visual_tone}
+Act description: ${currentAct.description}` : ''}
+${beatsInRange.length ? `NARRATIVE BEATS IN THIS BATCH:
+${beatsInRange.map(b => `  Scene ${b.scene_number} [${b.beat_type.toUpperCase()}]: ${b.description}${b.dialogue_anchor ? `\n    → Dialogue anchor: "${b.dialogue_anchor}"` : ''}`).join('\n')}` : ''}
+${motifs.length ? `VISUAL MOTIFS TO WEAVE IN (where appropriate):
+${motifs.map(m => `  • ${m.motif}: ${m.meaning} → show as: ${m.how_to_show}`).join('\n')}` : ''}
+CHARACTER ARCS:
+${dna.characters.map(c => {
+  const a = arc.character_arcs?.[c.id];
+  return a ? `  ${c.id} (${c.name}): ${a.arc} | Now at scene ${fromScene}: ${fromScene <= (a.key_moment_scene || 999) ? a.starts_as : a.ends_as}` : `  ${c.id} (${c.name}): consistent across all scenes`;
+}).join('\n')}
+
+⚠️ FILM CONTINUITY LAW:
+- Every scene must SERVE the story arc above. The visual content must EXPRESS the emotional state of the characters at that story moment.
+- When a character says something in dialogue, the VISUALS must ILLUSTRATE or CONTRAST what they mean — not just show them talking. Show the SUBTEXT.
+- Scenes must feel CONNECTED: lighting and color should reflect the current act's visual tone. Characters should show their arc state (are they hopeful? desperate? transformed?).
+- Transitions matter: each scene should feel like it GROWS FROM the previous one and LEADS INTO the next.`;
+  }
   const LANG_NAME_MAP = {
-    'vi-VN': 'Vietnamese', vi: 'Vietnamese',
-    'en-US': 'English',    en: 'English',
-    'ja-JP': 'Japanese',   ja: 'Japanese',
-    'zh-CN': 'Chinese',    zh: 'Chinese',
-    'ko-KR': 'Korean',     ko: 'Korean',
-    'fr-FR': 'French',     fr: 'French',
-    'es-ES': 'Spanish',    es: 'Spanish',
-    'de-DE': 'German',     de: 'German',
+    'vi-VN': 'Vietnamese', vi: 'Vietnamese', 'en-US': 'English', en: 'English',
+    'ja-JP': 'Japanese',   ja: 'Japanese',   'zh-CN': 'Chinese', zh: 'Chinese',
+    'ko-KR': 'Korean',     ko: 'Korean',     'fr-FR': 'French',  fr: 'French',
+    'es-ES': 'Spanish',    es: 'Spanish',    'de-DE': 'German',  de: 'German',
     'th-TH': 'Thai',       th: 'Thai',
   };
-  const langLabel = LANG_NAME_MAP[config.language] || LANG_NAME_MAP[config.language?.split('-')[0]] || config.language;
-
-  // Extract only the relevant script section to save tokens
+  const langLabel     = LANG_NAME_MAP[config.language] || LANG_NAME_MAP[config.language?.split('-')[0]] || config.language;
   const scriptSection = extractSceneSection(config.subject, fromScene, toScene);
+  const count         = toScene - fromScene + 1;
 
   const dialogueRules = noDialogue ? `
 ⚠️ DIALOGUE MODE: NO DIALOGUE (ABSOLUTE — NO EXCEPTIONS):
@@ -235,8 +213,8 @@ RULE C — "final_prompt" audio rules — TWO CASES, apply based on whether dial
 RULE D — "audio_prompt": MUST end with "— ${langLabel} (${config.language}) voice synthesis".
 RULE E — NEVER translate dialogue to English. The text inside "character speaks ${langLabel}: ..." MUST be BYTE-FOR-BYTE IDENTICAL to the dialogue field. Any English translation is automatically WRONG.`;
 
-  const prompt = `You are an expert Veo 3.1 prompt engineer. Convert script scenes into Veo 3.1 prompts.
-
+  return `You are a master filmmaker AND Veo 3.1 prompt engineer. Your job is to convert this script into a COHESIVE FILM — not a series of disconnected clips, but scenes that flow together with narrative depth, consistent characters, and visuals that honor what the dialogue truly means.
+${storyArcBlock}
 ══ PROJECT DNA (IMMUTABLE — USE EXACTLY AS GIVEN) ══
 STYLE LOCK: ${styleLock}
 VOICE LOCK: ${noDialogue ? 'no voice — silent film, no dialogue, no narration' : voiceLock}
@@ -255,7 +233,7 @@ ${objDNA || '(none)'}
 ${scriptSection}
 
 ══ TASK ══
-Generate EXACTLY ${toScene - fromScene + 1} scene objects for scenes ${fromScene} to ${toScene}.
+Generate EXACTLY ${count} scene objects for scenes ${fromScene} to ${toScene}.
 Scene ${fromScene} timestamp starts at ${(fromScene - 1) * config.sceneDuration}s. Each scene = ${config.sceneDuration}s.
 ${dialogueRules}
 
@@ -272,31 +250,103 @@ RULE H — Every final_prompt MUST be UNIQUE and VISUALLY DISTINCT from every ot
 
 REQUIREMENTS:
 1. 100% FAITHFUL REPRODUCTION — ABSOLUTE LAW: Each output scene MUST correspond exactly to the same-numbered scene in the script, in the same order. Copy VERBATIM: exact characters, exact setting, exact camera angles (as listed in the script's Shot list), exact action sequence, exact dialogue. Do NOT invent content not in the script. Do NOT combine two script scenes into one. Do NOT omit any scene. The LAST scene in your output MUST preserve the script's exact final emotional beat, final action, and final dialogue — never substitute a different ending.
-2. shots[]: list each Shot from the script. Fields camera_angle, background, action MUST BE IN ENGLISH.
-3. characters_in_scene / objects_in_scene: ONLY list IDs of entities that actually appear in this scene.
-4. camera_angle: main camera angle for this scene in English (e.g. "Low angle wide shot", "Close-up", "Over-the-shoulder").
-5. final_prompt: ONE SINGLE LINE, mostly English for Veo 3.1. Two structures based on dialogue:
-   ${noDialogue ? `NO DIALOGUE: [STYLE LOCK], [CAMERA ANGLE], [SETTING from ENV DNA], [CHARACTER DNA for chars in scene], [ACTION from script], [LIGHTING/MOOD], natural ambient sounds only, no speech, no voice narration, no text, no captions, no subtitles, no watermarks, no on-screen text
-   — NO language prefix. NO "character speaks". NO "spoken audio only".` : `If dialogue ≠ "":  [${langLabel} voice], [STYLE LOCK], [CAMERA ANGLE], [SETTING from ENV DNA], [CHARACTER DNA for chars in scene], [ACTION from script], [LIGHTING/MOOD], character speaks ${langLabel}: "[VERBATIM dialogue IN ${langLabel} — BYTE-FOR-BYTE IDENTICAL to dialogue field, NEVER English]", spoken audio only, no text, no captions, no subtitles, no watermarks, no on-screen text, no dialogue text overlay, spoken audio only
-   If dialogue = "":  [STYLE LOCK], [CAMERA ANGLE], [SETTING from ENV DNA], [CHARACTER DNA for chars in scene], [ACTION from script], [LIGHTING/MOOD], natural ambient sounds only, no speech, no voice narration, no text, no captions, no subtitles, no watermarks, no on-screen text
-   ⚠️ CRITICAL: If dialogue = "" → absolutely NO "[${langLabel} voice]," prefix, NO "character speaks", NO "spoken audio only". Adding "spoken audio only" to silent scenes causes Veo to invent random speech.`}
-6. audio_prompt: ${noDialogue ? 'describe ONLY SFX, BGM, ambient sounds in English. NO voice, NO speech, NO narration.' : `describe SFX, BGM, voice tone in English. MUST end with "— ${langLabel} (${config.language}) voice synthesis".`}
-7. sfx_bgm: sound effects and background music description in English.
-8. dialogue: ${noDialogue ? 'ALWAYS empty string "".' : `copy the EXACT dialogue from the script in ${langLabel}. NEVER translate. Empty string "" if no dialogue.`}
-9. character_dna: object mapping each char_id present in scene → their FULL DNA prompt string (copy exactly from CHARACTER DNA above).
-10. environment_dna: full DNA prompt string of the scene's environment (copy from ENVIRONMENT DNA above, matching environment_id).
-11. objects_dna: object mapping each obj_id present in scene → their full DNA prompt string.
-12. style_lock: copy the STYLE LOCK string exactly as given above.
-13. title, location, setting_detail MUST BE IN ENGLISH.
 
-Return a JSON array of exactly ${toScene - fromScene + 1} objects.`;
+2. VISUAL-DIALOGUE ALIGNMENT (CINEMATIC LAW — THIS IS WHAT MAKES A REAL FILM):
+   When a character speaks, ask: "What does this line of dialogue MEAN emotionally? What does the speaker REALLY want? What does the listener FEEL?"
+   Then encode THAT meaning into the visuals:
+   • If dialogue = declaration of love → show intimate closeness, warm light, soft focus on eyes
+   • If dialogue = a lie → show the liar avoiding eye contact, tight close-up on subtle tension
+   • If dialogue = grief → environment reflects sadness (rain, cold light, empty space)
+   • If dialogue = determination → low angle shot empowering the character, strong harsh lighting
+   • If dialogue = revelation/twist → wide shot showing new spatial relationship, jarring camera angle
+   The visual prompt must SHOW what the dialogue MEANS — not just describe talking heads.
+
+3. SCENE CONTINUITY: Each scene's visual_tone, lighting, and character emotional state must reflect:
+   a) WHERE in the story arc this scene falls (which act, which narrative beat)
+   b) Character arc state — if char is in despair at this point, show it in their posture, environment, lighting
+   c) Visual motifs — weave in the story's recurring symbols where they fit naturally
+
+4. shots[]: list each Shot from the script. Fields camera_angle, background, action MUST BE IN ENGLISH.
+5. characters_in_scene / objects_in_scene: ONLY list IDs of entities that actually appear in this scene.
+6. camera_angle: main camera angle for this scene in English (e.g. "Low angle wide shot", "Close-up", "Over-the-shoulder"). Choose angles that EXPRESS the emotional state of the scene, not just describe position.
+7. final_prompt: ONE SINGLE LINE, mostly English for Veo 3.1. Two structures based on dialogue:
+   ${noDialogue ? `NO DIALOGUE: [STORY ARC VISUAL TONE], [STYLE LOCK], [CAMERA ANGLE expressing scene emotion], [SETTING from ENV DNA], [CHARACTER DNA for chars in scene showing their arc state], [ACTION from script], [LIGHTING/MOOD matching current act], natural ambient sounds only, no speech, no voice narration, no text, no captions, no subtitles, no watermarks, no on-screen text
+   — NO language prefix. NO "character speaks". NO "spoken audio only".` : `If dialogue ≠ "":  [${langLabel} voice], [STYLE LOCK], [CAMERA ANGLE expressing emotion], [SETTING from ENV DNA], [CHARACTER DNA for chars in scene showing their arc state], [ACTION from script — show what dialogue MEANS visually], [LIGHTING/MOOD matching current act], character speaks ${langLabel}: "[VERBATIM dialogue IN ${langLabel} — BYTE-FOR-BYTE IDENTICAL to dialogue field, NEVER English]", spoken audio only, no text, no captions, no subtitles, no watermarks, no on-screen text, no dialogue text overlay, spoken audio only
+   If dialogue = "":  [STORY ARC VISUAL TONE], [STYLE LOCK], [CAMERA ANGLE], [SETTING from ENV DNA], [CHARACTER DNA for chars in scene], [ACTION from script], [LIGHTING/MOOD matching current act and character emotional state], natural ambient sounds only, no speech, no voice narration, no text, no captions, no subtitles, no watermarks, no on-screen text
+   ⚠️ CRITICAL: If dialogue = "" → absolutely NO "[${langLabel} voice]," prefix, NO "character speaks", NO "spoken audio only". Adding "spoken audio only" to silent scenes causes Veo to invent random speech.`}
+8. audio_prompt: ${noDialogue ? 'describe ONLY SFX, BGM, ambient sounds in English. NO voice, NO speech, NO narration.' : `describe SFX, BGM, voice tone in English. MUST end with "— ${langLabel} (${config.language}) voice synthesis".`}
+9. sfx_bgm: sound effects and background music description in English. Music mood must match the current act's dominant emotion.
+10. dialogue: ${noDialogue ? 'ALWAYS empty string "".' : `copy the EXACT dialogue from the script in ${langLabel}. NEVER translate. Empty string "" if no dialogue.`}
+11. character_dna: object mapping each char_id present in scene → their FULL DNA prompt string (copy exactly from CHARACTER DNA above).
+12. environment_dna: full DNA prompt string of the scene's environment (copy from ENVIRONMENT DNA above, matching environment_id).
+13. objects_dna: object mapping each obj_id present in scene → their full DNA prompt string.
+14. style_lock: copy the STYLE LOCK string exactly as given above.
+15. narrative_context: ONE sentence (English) explaining WHERE this scene sits in the story arc and WHAT EMOTIONAL/NARRATIVE PURPOSE it serves. (e.g. "Act 2 rising action — char_1 confronts their fear for the first time, setting up the dark moment in scene 12")
+16. title, location, setting_detail MUST BE IN ENGLISH.
+
+Return a JSON array of exactly ${count} objects. No markdown fences, no extra text.`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 1 — Extract full DNA from the script
+// ─────────────────────────────────────────────────────────────────────────────
+async function extractScriptDNA(apiKeys, config, onSwitch) {
+  const prompt = buildDNAPrompt(config);
+  try {
+    return await geminiJSON(apiKeys, prompt, {
+      type: Type.OBJECT,
+      required: ['topic_content', 'characters', 'environments', 'key_objects', 'master_dna'],
+      properties: {
+        topic_content: { type: Type.STRING },
+        characters: { type: Type.ARRAY, items: { type: Type.OBJECT, required: ['id','name','role','gender','age','nationality','appearance','outfit','dna_prompt'], properties: { id:{type:Type.STRING},name:{type:Type.STRING},role:{type:Type.STRING},gender:{type:Type.STRING},age:{type:Type.STRING},nationality:{type:Type.STRING},appearance:{type:Type.STRING},outfit:{type:Type.STRING},dna_prompt:{type:Type.STRING} } } },
+        environments: { type: Type.ARRAY, items: { type: Type.OBJECT, required: ['id','name','description','dna_prompt'], properties: { id:{type:Type.STRING},name:{type:Type.STRING},description:{type:Type.STRING},dna_prompt:{type:Type.STRING} } } },
+        key_objects:  { type: Type.ARRAY, items: { type: Type.OBJECT, required: ['id','name','description','dna_prompt'], properties: { id:{type:Type.STRING},name:{type:Type.STRING},description:{type:Type.STRING},dna_prompt:{type:Type.STRING} } } },
+        master_dna: { type: Type.OBJECT, required: ['style_lock','voice_lock'], properties: { style_lock:{type:Type.STRING},voice_lock:{type:Type.STRING} } },
+        story_arc: { type: Type.OBJECT, properties: {
+          theme: { type: Type.STRING },
+          emotional_journey: { type: Type.STRING },
+          acts: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { act_number:{type:Type.INTEGER}, name:{type:Type.STRING}, scene_range:{type:Type.STRING}, description:{type:Type.STRING}, dominant_emotion:{type:Type.STRING}, visual_tone:{type:Type.STRING} } } },
+          narrative_beats: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { scene_number:{type:Type.INTEGER}, beat_type:{type:Type.STRING}, description:{type:Type.STRING}, dialogue_anchor:{type:Type.STRING} } } },
+          character_arcs: { type: Type.OBJECT, additionalProperties: { type: Type.OBJECT, properties: { arc:{type:Type.STRING}, starts_as:{type:Type.STRING}, ends_as:{type:Type.STRING}, key_moment_scene:{type:Type.INTEGER} } } },
+          visual_motifs: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { motif:{type:Type.STRING}, meaning:{type:Type.STRING}, how_to_show:{type:Type.STRING} } } }
+        } }
+      }
+    }, 12288, onSwitch);
+  } catch (err) {
+    if (err.isMaxTokens) {
+      const truncated = config.subject.length > 3000
+        ? config.subject.substring(0, 3000) + '\n...[truncated for DNA extraction]'
+        : config.subject;
+      if (truncated === config.subject) throw err;
+      const truncatedConfig = { ...config, subject: truncated };
+      return await geminiJSON(apiKeys, buildDNAPrompt(truncatedConfig), {
+        type: Type.OBJECT, required: ['topic_content','characters','environments','key_objects','master_dna'],
+        properties: { topic_content:{type:Type.STRING}, characters:{type:Type.ARRAY,items:{type:Type.OBJECT,required:['id','name','role','gender','age','nationality','appearance','outfit','dna_prompt'],properties:{id:{type:Type.STRING},name:{type:Type.STRING},role:{type:Type.STRING},gender:{type:Type.STRING},age:{type:Type.STRING},nationality:{type:Type.STRING},appearance:{type:Type.STRING},outfit:{type:Type.STRING},dna_prompt:{type:Type.STRING}}}}, environments:{type:Type.ARRAY,items:{type:Type.OBJECT,required:['id','name','description','dna_prompt'],properties:{id:{type:Type.STRING},name:{type:Type.STRING},description:{type:Type.STRING},dna_prompt:{type:Type.STRING}}}}, key_objects:{type:Type.ARRAY,items:{type:Type.OBJECT,required:['id','name','description','dna_prompt'],properties:{id:{type:Type.STRING},name:{type:Type.STRING},description:{type:Type.STRING},dna_prompt:{type:Type.STRING}}}}, master_dna:{type:Type.OBJECT,required:['style_lock','voice_lock'],properties:{style_lock:{type:Type.STRING},voice_lock:{type:Type.STRING}}}, story_arc:{type:Type.OBJECT,properties:{theme:{type:Type.STRING},emotional_journey:{type:Type.STRING},acts:{type:Type.ARRAY,items:{type:Type.OBJECT,properties:{act_number:{type:Type.INTEGER},name:{type:Type.STRING},scene_range:{type:Type.STRING},description:{type:Type.STRING},dominant_emotion:{type:Type.STRING},visual_tone:{type:Type.STRING}}}},narrative_beats:{type:Type.ARRAY,items:{type:Type.OBJECT,properties:{scene_number:{type:Type.INTEGER},beat_type:{type:Type.STRING},description:{type:Type.STRING},dialogue_anchor:{type:Type.STRING}}}},character_arcs:{type:Type.OBJECT,additionalProperties:{type:Type.OBJECT,properties:{arc:{type:Type.STRING},starts_as:{type:Type.STRING},ends_as:{type:Type.STRING},key_moment_scene:{type:Type.INTEGER}}}},visual_motifs:{type:Type.ARRAY,items:{type:Type.OBJECT,properties:{motif:{type:Type.STRING},meaning:{type:Type.STRING},how_to_show:{type:Type.STRING}}}}}} }
+      }, 12288, onSwitch);
+    }
+    throw err;
+  }
+}
+
+function extractSceneSection(script, fromScene, toScene) {
+  // Try to find [CẢNH n:] or [SCENE n:] markers to extract only relevant portion
+  const startRe = new RegExp(`\\[(?:CẢNH|SCENE|Cảnh)\\s+${fromScene}[\\s:\\-—]`, 'i');
+  const endRe   = new RegExp(`\\[(?:CẢNH|SCENE|Cảnh)\\s+${toScene + 1}[\\s:\\-—]`, 'i');
+  const fromIdx = script.search(startRe);
+  if (fromIdx === -1) return script; // fallback: full script
+  const toIdx = script.search(endRe);
+  return toIdx === -1 ? script.substring(fromIdx) : script.substring(fromIdx, toIdx);
+}
+
+async function generateScenesBatch(apiKeys, config, dna, fromScene, toScene, onSwitch) {
+  const prompt = buildScenesPrompt(config, dna, fromScene, toScene);
 
   const sceneSchema = {
     type: Type.OBJECT,
     required: ['scene_number', 'title', 'timestamp', 'location', 'setting_detail',
                'camera_angle', 'characters_in_scene', 'objects_in_scene', 'environment_id',
                'shots', 'dialogue', 'sfx_bgm', 'final_prompt', 'audio_prompt',
-               'character_dna', 'environment_dna', 'objects_dna', 'style_lock'],
+               'character_dna', 'environment_dna', 'objects_dna', 'style_lock', 'narrative_context'],
     properties: {
       scene_number:        { type: Type.INTEGER },
       title:               { type: Type.STRING },
@@ -321,14 +371,15 @@ Return a JSON array of exactly ${toScene - fromScene + 1} objects.`;
           }
         }
       },
-      dialogue:        { type: Type.STRING },
-      sfx_bgm:         { type: Type.STRING },
-      final_prompt:    { type: Type.STRING },
-      audio_prompt:    { type: Type.STRING },
-      character_dna:   { type: Type.OBJECT, additionalProperties: { type: Type.STRING } },
-      environment_dna: { type: Type.STRING },
-      objects_dna:     { type: Type.OBJECT, additionalProperties: { type: Type.STRING } },
-      style_lock:      { type: Type.STRING }
+      dialogue:          { type: Type.STRING },
+      sfx_bgm:           { type: Type.STRING },
+      final_prompt:      { type: Type.STRING },
+      audio_prompt:      { type: Type.STRING },
+      character_dna:     { type: Type.OBJECT, additionalProperties: { type: Type.STRING } },
+      environment_dna:   { type: Type.STRING },
+      objects_dna:       { type: Type.OBJECT, additionalProperties: { type: Type.STRING } },
+      style_lock:        { type: Type.STRING },
+      narrative_context: { type: Type.STRING }
     }
   };
 
@@ -499,6 +550,7 @@ export async function generateCinematicPrompts(apiKeys, config, onProgress) {
   }));
 
   // ── Build analysis object (for UI display) ──
+  const arc = dna.story_arc || {};
   const analysis = {
     topic_content:         dna.topic_content,
     characters:            dna.characters,
@@ -506,6 +558,7 @@ export async function generateCinematicPrompts(apiKeys, config, onProgress) {
     overall_background:    dna.environments.map(e => e.description).join(' | '),
     visual_style_lighting: dna.master_dna?.style_lock || expandStyle(config.style),
     aspect_ratio_resolution: '16:9',
+    story_arc: arc,
     master_dna: {
       character_locks:  {},
       object_locks:     {},
@@ -517,6 +570,8 @@ export async function generateCinematicPrompts(apiKeys, config, onProgress) {
       total_duration: `${allScenes.length * config.sceneDuration}s`,
       pacing:         `${config.sceneDuration}s / cảnh`,
       total_scenes:   String(allScenes.length),
+      theme:          arc.theme || '',
+      emotional_journey: arc.emotional_journey || '',
     },
     rules: { style: expandStyle(config.style), scene_location: 'Từ kịch bản', action: 'Từ kịch bản', sound: 'Từ kịch bản', dialogue: config.language },
     character_lock:   {},

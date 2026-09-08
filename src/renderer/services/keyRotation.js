@@ -11,6 +11,10 @@
  *  503 / UNAVAILABLE / overloaded
  *    → Retry chính key đó với backoff, xoay key mỗi 3 lần
  *
+ *  403 / PERMISSION_DENIED (key leaked / revoked / invalid)
+ *    → Đánh dấu key đó là dead, bỏ qua vĩnh viễn, xoay sang key tiếp theo
+ *    → Nếu tất cả key đều dead → throw lỗi ngay
+ *
  *  Lỗi khác (500, SAFETY, network, v.v.)
  *    → Ném ra ngay, KHÔNG retry
  *
@@ -26,7 +30,8 @@ export async function retryWithKeyRotation(fn, apiKeys, { onSwitch, maxCycles = 
     throw new Error('Chưa có API Key hợp lệ. Vui lòng nhập Gemini API Key tại mục quản lý keys.');
   }
 
-  let keyIdx      = 0;
+  // Bắt đầu từ key ngẫu nhiên — tránh nhiều user cùng dùng key #0 một lúc
+  let keyIdx      = Math.floor(Math.random() * keys.length);
   let cycles      = 0;
   let retries503  = 0;
   let lastError;
@@ -34,7 +39,26 @@ export async function retryWithKeyRotation(fn, apiKeys, { onSwitch, maxCycles = 
   // Số key đã được thử liên tiếp mà không thành công trong vòng hiện tại
   let keysTriedThisCycle = 0;
 
+  // Set lưu index các key bị lỗi vĩnh viễn (leaked/revoked/invalid) — bỏ qua hoàn toàn
+  const deadKeys = new Set();
+
+  // Hàm lấy key tiếp theo không phải dead
+  const nextLiveKeyIdx = (fromIdx) => {
+    for (let i = 1; i <= keys.length; i++) {
+      const idx = (fromIdx + i) % keys.length;
+      if (!deadKeys.has(idx)) return idx;
+    }
+    return -1; // tất cả đều dead
+  };
+
   while (cycles < maxCycles) {
+    // Nếu key hiện tại đã bị đánh dead, tìm key tiếp theo
+    if (deadKeys.has(keyIdx)) {
+      const live = nextLiveKeyIdx(keyIdx);
+      if (live === -1) break; // hết key sống
+      keyIdx = live;
+    }
+
     const key = keys[keyIdx];
     try {
       const result = await fn(key);
@@ -42,7 +66,7 @@ export async function retryWithKeyRotation(fn, apiKeys, { onSwitch, maxCycles = 
     } catch (error) {
       lastError = error;
 
-      const { is429, is503, reason } = classifyError(error);
+      const { is429, is503, is403_permanent, reason } = classifyError(error);
 
       // ── HẾT TOKEN / QUOTA / RATE LIMIT ──────────────────────────────────────
       if (is429) {
@@ -62,12 +86,9 @@ export async function retryWithKeyRotation(fn, apiKeys, { onSwitch, maxCycles = 
           keysTriedThisCycle = 0;
 
           if (cycles < maxCycles) {
-            // Chờ rồi thử lại từ đầu — cho phép rate-limit per-minute reset
-            const waitMs = 15000 + 10000 * (cycles - 1); // 15s, 25s, 35s, 45s
-            console.warn(
-              `[KeyRotation] Đã thử ${keys.length} keys, tất cả bị giới hạn. ` +
-              `Chờ ${waitMs / 1000}s trước vòng ${cycles + 1}/${maxCycles}...`
-            );
+            // Chờ rồi thử lại — Gemini RPM reset sau ~60s
+            const waitMs = 62000 + 10000 * (cycles - 1); // 62s, 72s, 82s, 92s
+            onSwitch?.({ fromIdx: keyIdx, toIdx: keyIdx, total: keys.length, reason: `all_quota — đợi ${Math.round(waitMs/1000)}s để reset RPM (vòng ${cycles+1}/${maxCycles})` });
             await sleep(waitMs);
           }
         }
@@ -78,11 +99,12 @@ export async function retryWithKeyRotation(fn, apiKeys, { onSwitch, maxCycles = 
       if (is503) {
         retries503++;
         if (retries503 > 12) {
-          // Xoay key và reset đếm 503
+          // Xoay key và reset đếm 503; nếu chỉ 1 key thì tính 1 cycle để tránh loop vô hạn
           const nextIdx = (keyIdx + 1) % keys.length;
           onSwitch?.({ fromIdx: keyIdx, toIdx: nextIdx, total: keys.length, reason: 'server_overloaded' });
           keyIdx = nextIdx;
           retries503 = 0;
+          if (keys.length === 1) { cycles++; } // 1 key → phải tính cycle, không thì loop mãi
           continue;
         }
         const waitMs = Math.min(45000, 3000 * Math.pow(1.5, retries503 - 1));
@@ -100,16 +122,42 @@ export async function retryWithKeyRotation(fn, apiKeys, { onSwitch, maxCycles = 
         continue;
       }
 
+      // ── 403 VĨNH VIỄN (leaked / revoked / invalid / permission denied) ─────────
+      if (is403_permanent) {
+        console.warn(`[KeyRotation] Key ${keyIdx + 1} bị vô hiệu hóa vĩnh viễn (${reason}) — bỏ qua key này.`);
+        deadKeys.add(keyIdx);
+        const live = nextLiveKeyIdx(keyIdx);
+        if (live === -1) {
+          // Tất cả key đều dead
+          throw new Error(
+            `Tất cả ${keys.length} API key đều không hợp lệ (bị leaked, bị thu hồi hoặc không có quyền). ` +
+            `Vui lòng kiểm tra và thay thế API key trong Settings.`
+          );
+        }
+        onSwitch?.({ fromIdx: keyIdx, toIdx: live, total: keys.length, reason });
+        keyIdx = live;
+        keysTriedThisCycle++;
+        // Không tính vào cycles — lỗi 403 là lỗi key, không phải quota
+        if (keysTriedThisCycle >= keys.length - deadKeys.size) {
+          // Đã thử hết key sống → báo lỗi
+          throw new Error(
+            `Tất cả ${keys.length} API key đều không hợp lệ hoặc đã hết quota. ` +
+            `Vui lòng thêm API key mới trong Settings.`
+          );
+        }
+        continue;
+      }
+
       // ── LỖI KHÁC → NÉM RA NGAY ──────────────────────────────────────────────
       throw error;
     }
   }
 
   // Đã hết tất cả vòng thử → báo lỗi rõ ràng
-  const keyCount = keys.length;
+  const liveCount = keys.length - deadKeys.size;
   throw new Error(
-    `Tất cả ${keyCount} API key đã hết quota hoặc bị giới hạn. ` +
-    `Vui lòng kiểm tra hạn mức tại console.cloud.google.com hoặc thêm API key mới.`
+    `Tất cả ${liveCount > 0 ? liveCount : keys.length} API key đã hết quota hoặc bị giới hạn rate-limit. ` +
+    `Vui lòng đợi ~1 phút rồi thử lại, hoặc thêm API key mới.`
   );
 }
 
@@ -160,15 +208,43 @@ function classifyError(error) {
   // với 1 key sẽ vòng lặp vô tận (rotate về key cũ, retries503 reset về 0).
   // Để nó là "lỗi khác" → keyRotation ném ngay → retryOnError (max 2 lần) xử lý.
 
+  // ── 401 / 403 Vĩnh viễn (key không hợp lệ / bị thu hồi / sai loại token) ────
+  const is403_permanent =
+    raw.includes('"code":403')                      ||
+    raw.includes('"code": 403')                     ||
+    status === '403'                                ||
+    status === 'permission_denied'                  ||
+    raw.includes('permission_denied')               ||
+    // 401 UNAUTHENTICATED — key sai hoặc là OAuth token thay vì API key
+    raw.includes('"code":401')                      ||
+    raw.includes('"code": 401')                     ||
+    status === '401'                                ||
+    status === 'unauthenticated'                    ||
+    raw.includes('unauthenticated')                 ||
+    raw.includes('access_token_type_unsupported')   ||
+    raw.includes('invalid_credentials')             ||
+    msg.includes('api key was reported as leaked')  ||
+    msg.includes('api_key_invalid')                 ||
+    msg.includes('invalid api key')                 ||
+    msg.includes('api key not valid')               ||
+    msg.includes('key has been revoked')            ||
+    msg.includes('key expired')                     ||
+    msg.includes('unauthorized')                    ||
+    (msg.includes('403') && msg.includes('permission'));
+
   // Xác định lý do để hiển thị thông báo rõ hơn
   let reason = 'rate_limit';
-  if (msg.includes('quota') || msg.includes('daily') || msg.includes('billing') || msg.includes('exceeded')) {
+  if (is403_permanent) {
+    if (msg.includes('leaked'))   reason = 'key_leaked';
+    else if (msg.includes('rev')) reason = 'key_revoked';
+    else                          reason = 'key_invalid';
+  } else if (msg.includes('quota') || msg.includes('daily') || msg.includes('billing') || msg.includes('exceeded')) {
     reason = 'quota_exhausted';
   } else if (msg.includes('tokens per') || msg.includes('requests per')) {
     reason = 'rate_limit_per_minute';
   }
 
-  return { is429, is503, reason };
+  return { is429, is503, is403_permanent, reason };
 }
 
 function sleep(ms) {

@@ -46,7 +46,7 @@ export default function VideoStudio({ dark = true }) {
 
     useEffect(() => {
         if (window.electronAPI.onVideoLog) {
-            window.electronAPI.onVideoLog((data) => setLogs(prev => [...prev, data]));
+            window.electronAPI.onVideoLog((data) => setLogs(prev => [...prev.slice(-299), data]));
         }
     }, []);
 
@@ -58,10 +58,10 @@ export default function VideoStudio({ dark = true }) {
         setLogs([{ time: new Date().toLocaleTimeString(), text: 'Bắt đầu khởi tạo cắt video...', type: 'info' }]);
         const result = await window.electronAPI.cutVideo({ inputPath: inputFile, segmentTime, outputFolder: cutOutputFolder });
         if (result.success) {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: '✅ Hoàn tất cắt video!', type: 'success' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: '✅ Hoàn tất cắt video!', type: 'success' }]);
             if (result.files) setOutputVideos(result.files);
         } else {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${result.error}`, type: 'error' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${result.error}`, type: 'error' }]);
         }
         setIsCutting(false);
     };
@@ -76,7 +76,7 @@ export default function VideoStudio({ dark = true }) {
     };
 
     const loadMergeFiles = async (folder) => {
-        setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `Đang quét thư mục: ${folder}...`, type: 'info' }]);
+        setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `Đang quét thư mục: ${folder}...`, type: 'info' }]);
         const files = await window.electronAPI.readVideoFolder(folder);
         setMergeFiles(files);
         setSelectedMergeFiles(new Set(files.map(f => f.path)));
@@ -107,10 +107,10 @@ export default function VideoStudio({ dark = true }) {
         });
 
         if (result.success) {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: '✅ Hoàn tất ghép video!', type: 'success' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: '✅ Hoàn tất ghép video!', type: 'success' }]);
             window.electronAPI.openFile(result.path);
         } else {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${result.error}`, type: 'error' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${result.error}`, type: 'error' }]);
         }
         setIsMerging(false);
     };
@@ -130,10 +130,10 @@ export default function VideoStudio({ dark = true }) {
         });
 
         if (result.success) {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `✅ Đã trích xuất thành công ${result.files.length} ảnh!`, type: 'success' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `✅ Đã trích xuất thành công ${result.files.length} ảnh!`, type: 'success' }]);
             if (result.files) setExtractedImages(result.files);
         } else {
-            setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${result.error}`, type: 'error' }]);
+            setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: `❌ Lỗi: ${result.error}`, type: 'error' }]);
         }
         setIsExtracting(false);
     };

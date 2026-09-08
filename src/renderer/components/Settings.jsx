@@ -7,10 +7,9 @@ import {
 
 // ─── Sections available in Settings ─────────────────────────────────────────
 const SECTIONS = [
-    { id: 'extension', label: 'Extension',   sub: 'Cài vào Chrome',     icon: '🧩' },
-    { id: 'apikey',    label: 'API Key',      sub: 'Gemini & ElevenLabs', icon: '🔑' },
-    { id: 'proxy',     label: 'Proxy Xoay',  sub: 'Cấu hình proxy IP',  icon: '🔄' },
-    { id: 'stockvideo',label: 'Stock Video',  sub: 'Pexels & Pixabay',   icon: '🎬' },
+    { id: 'extension', label: 'Extension',   sub: 'Cài vào Chrome',              icon: '🧩' },
+    { id: 'apikey',    label: 'API Key',      sub: 'Gemini, Claude & ElevenLabs', icon: '🔑' },
+    { id: 'stockvideo',label: 'Stock Video',  sub: 'Pexels & Pixabay',            icon: '🎬' },
 ];
 
 export default function Settings({ dark = true }) {
@@ -37,18 +36,29 @@ export default function Settings({ dark = true }) {
     }, []);
 
     // ── API Key (Gemini) ──────────────────────────────────────────────────────
-    const LS_KEYS = 'fluxy_gemini_api_keys';
+    const DB_GEMINI = 'fluxy_gemini_api_keys';
     const [geminiKeys, setGeminiKeys]     = useState([]);
     const [geminiInput, setGeminiInput]   = useState('');
     const [geminiSaved, setGeminiSaved]   = useState(false);
 
+    const DEFAULT_GEMINI_KEYS = [];
+
     useEffect(() => {
-        const raw = localStorage.getItem(LS_KEYS);
-        try { setGeminiKeys(JSON.parse(raw) || []); } catch { setGeminiKeys([]); }
+        window.electronAPI?.getSetting?.(DB_GEMINI, '[]').then(raw => {
+            try {
+                const saved = JSON.parse(raw) || [];
+                const merged = saved.length > 0 ? [...new Set([...DEFAULT_GEMINI_KEYS, ...saved])] : DEFAULT_GEMINI_KEYS;
+                setGeminiKeys(merged);
+            } catch { setGeminiKeys(DEFAULT_GEMINI_KEYS); }
+        }).catch(() => {
+            const raw = localStorage.getItem(DB_GEMINI);
+            try { const keys = JSON.parse(raw) || []; const merged = [...new Set([...DEFAULT_GEMINI_KEYS, ...keys])]; setGeminiKeys(merged); if (merged.length) window.electronAPI?.setSetting?.(DB_GEMINI, JSON.stringify(merged)); } catch { setGeminiKeys(DEFAULT_GEMINI_KEYS); }
+        });
     }, []);
 
     const saveGeminiKeys = (keys) => {
-        localStorage.setItem(LS_KEYS, JSON.stringify(keys));
+        window.electronAPI?.setSetting?.(DB_GEMINI, JSON.stringify(keys));
+        localStorage.setItem(DB_GEMINI, JSON.stringify(keys)); // keep in sync as backup
         setGeminiKeys(keys);
         setGeminiSaved(true);
         setTimeout(() => setGeminiSaved(false), 2000);
@@ -63,20 +73,180 @@ export default function Settings({ dark = true }) {
 
     const removeGeminiKey = (k) => saveGeminiKeys(geminiKeys.filter(x => x !== k));
 
+    // ── Groq API keys ─────────────────────────────────────────────────────────
+    const DB_GROQ_KEYS  = 'fluxy_groq_api_keys';
+    const DB_GROQ_MODEL = 'fluxy_groq_model';
+    const LS_GROQ_KEYS  = DB_GROQ_KEYS;
+    const LS_GROQ_MODEL = DB_GROQ_MODEL;
+    const GROQ_MODELS_LIST = [
+        { id: 'llama-3.3-70b-versatile',               label: 'Llama 3.3 70B (Tốt nhất)' },
+        { id: 'llama-3.1-8b-instant',                  label: 'Llama 3.1 8B (Siêu nhanh)' },
+        { id: 'moonshotai/kimi-k2-instruct',            label: 'Kimi K2 (Dài & mạnh)' },
+        { id: 'meta-llama/llama-4-scout-17b-16e-instruct', label: 'Llama 4 Scout 17B' },
+    ];
+    const [groqKeys,      setGroqKeys]      = useState([]);
+    const [groqInput,     setGroqInput]     = useState('');
+    const [groqSaved,     setGroqSaved]     = useState(false);
+    const [groqModel,     setGroqModel]     = useState('llama-3.3-70b-versatile');
+    const [groqVerifying, setGroqVerifying] = useState(false);
+    const [groqVerifyResult, setGroqVerifyResult] = useState(null);
+
+    useEffect(() => {
+        window.electronAPI?.getSetting?.(DB_GROQ_KEYS, '[]').then(raw => {
+            try { setGroqKeys(JSON.parse(raw) || []); } catch { setGroqKeys([]); }
+        }).catch(() => {
+            const raw = localStorage.getItem(DB_GROQ_KEYS);
+            try { const keys = JSON.parse(raw) || []; setGroqKeys(keys); if (keys.length) window.electronAPI?.setSetting?.(DB_GROQ_KEYS, JSON.stringify(keys)); } catch { setGroqKeys([]); }
+        });
+        window.electronAPI?.getSetting?.(DB_GROQ_MODEL, 'llama-3.3-70b-versatile').then(m => setGroqModel(m || 'llama-3.3-70b-versatile')).catch(() => {
+            setGroqModel(localStorage.getItem(DB_GROQ_MODEL) || 'llama-3.3-70b-versatile');
+        });
+    }, []);
+
+    const saveGroqKeysList = (keys) => {
+        window.electronAPI?.setSetting?.(DB_GROQ_KEYS, JSON.stringify(keys));
+        localStorage.setItem(DB_GROQ_KEYS, JSON.stringify(keys));
+        setGroqKeys(keys);
+        setGroqSaved(true);
+        setTimeout(() => setGroqSaved(false), 2000);
+    };
+    const handleGroqApply = () => {
+        const lines = groqInput.split('\n').map(l => l.trim()).filter(Boolean);
+        const merged = [...new Set([...groqKeys, ...lines])];
+        saveGroqKeysList(merged);
+        setGroqInput('');
+    };
+    const removeGroqKey  = (k) => saveGroqKeysList(groqKeys.filter(x => x !== k));
+    const saveGroqModelFn = (m) => { window.electronAPI?.setSetting?.(DB_GROQ_MODEL, m); localStorage.setItem(DB_GROQ_MODEL, m); setGroqModel(m); };
+    const verifyGroqKeyFn = async () => {
+        const k = groqKeys[0];
+        if (!k) return;
+        setGroqVerifying(true); setGroqVerifyResult(null);
+        try {
+            const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${k}` },
+                body: JSON.stringify({ model: 'llama-3.1-8b-instant', messages: [{ role: 'user', content: 'Hi' }], max_tokens: 5 }),
+            });
+            setGroqVerifyResult(res.ok ? 'ok' : 'fail');
+        } catch { setGroqVerifyResult('fail'); }
+        setGroqVerifying(false);
+    };
+
+    // ── Claude API key ────────────────────────────────────────────────────────
+    const DB_CLAUDE      = 'fluxy_claude_api_key';
+    const DB_CLAUDE_MDL  = 'fluxy_claude_model';
+    const LS_CLAUDE      = DB_CLAUDE;
+    const LS_CLAUDE_MDL  = DB_CLAUDE_MDL;
+    const CLAUDE_MODELS_LIST = [
+      { id: 'claude-sonnet-4-6',          label: 'Claude Sonnet 4.6 (Cân bằng)' },
+      { id: 'claude-haiku-4-5-20251001',  label: 'Claude Haiku 4.5 (Nhanh & Rẻ)' },
+      { id: 'claude-opus-4-8',            label: 'Claude Opus 4.8 (Mạnh nhất)' },
+      { id: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet (Ổn định)' },
+      { id: 'claude-3-haiku-20240307',    label: 'Claude 3 Haiku (Nhẹ & Nhanh)' },
+    ];
+    const [claudeKey,        setClaudeKey]        = useState('');
+    const [claudeInput,      setClaudeInput]      = useState('');
+    const [claudeModel,      setClaudeModel]      = useState('claude-sonnet-4-6');
+    const [claudeSaved,      setClaudeSaved]      = useState(false);
+    const [claudeVerifying,  setClaudeVerifying]  = useState(false);
+    const [claudeVerifyResult, setClaudeVerifyResult] = useState(null); // null | 'ok' | 'fail'
+    const [claudeVerifyMsg,    setClaudeVerifyMsg]    = useState('');
+
+    useEffect(() => {
+        window.electronAPI?.getSetting?.(DB_CLAUDE, '').then(k => setClaudeKey(k || '')).catch(() => setClaudeKey(localStorage.getItem(DB_CLAUDE) || ''));
+        window.electronAPI?.getSetting?.(DB_CLAUDE_MDL, 'claude-sonnet-4-6').then(m => setClaudeModel(m || 'claude-sonnet-4-6')).catch(() => setClaudeModel(localStorage.getItem(DB_CLAUDE_MDL) || 'claude-sonnet-4-6'));
+    }, []);
+
+    const saveClaudeKey = () => {
+        const k = claudeInput.trim();
+        if (!k) return;
+        window.electronAPI?.setSetting?.(DB_CLAUDE, k);
+        localStorage.setItem(DB_CLAUDE, k);
+        setClaudeKey(k);
+        setClaudeInput('');
+        setClaudeSaved(true);
+        setClaudeVerifyResult(null);
+        setTimeout(() => setClaudeSaved(false), 2000);
+    };
+    const saveClaudeModel = (m) => {
+        window.electronAPI?.setSetting?.(DB_CLAUDE_MDL, m);
+        localStorage.setItem(DB_CLAUDE_MDL, m);
+        setClaudeModel(m);
+    };
+    const removeClaudeKey = () => {
+        window.electronAPI?.setSetting?.(DB_CLAUDE, '');
+        localStorage.removeItem(DB_CLAUDE);
+        setClaudeKey('');
+        setClaudeVerifyResult(null);
+    };
+    const verifyClaudeKey = async () => {
+        const k = claudeKey || claudeInput.trim();
+        if (!k) return;
+        setClaudeVerifying(true);
+        setClaudeVerifyResult(null);
+        setClaudeVerifyMsg('');
+        try {
+            const res = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-key': k,
+                    'anthropic-version': '2023-06-01',
+                    'anthropic-dangerous-direct-browser-access': 'true',
+                },
+                body: JSON.stringify({
+                    model: 'claude-3-haiku-20240307',
+                    max_tokens: 10,
+                    messages: [{ role: 'user', content: 'Hi' }],
+                }),
+            });
+            if (res.ok) {
+                setClaudeVerifyResult('ok');
+                setClaudeVerifyMsg('');
+            } else {
+                const errData = await res.json().catch(() => ({}));
+                const msg = errData?.error?.message || `HTTP ${res.status}`;
+                // credit_balance_too_low / 529 → key hợp lệ, chỉ hết tiền
+                const isLowCredit = res.status === 529
+                    || msg.toLowerCase().includes('credit')
+                    || msg.toLowerCase().includes('balance')
+                    || msg.toLowerCase().includes('quota');
+                if (isLowCredit) {
+                    setClaudeVerifyResult('ok');
+                    setClaudeVerifyMsg('Hết credits — nạp thêm tại console.anthropic.com');
+                } else {
+                    setClaudeVerifyResult('fail');
+                    setClaudeVerifyMsg(msg);
+                }
+            }
+        } catch (e) {
+            setClaudeVerifyResult('fail');
+            setClaudeVerifyMsg(e?.message || 'Lỗi kết nối mạng');
+        }
+        setClaudeVerifying(false);
+    };
+
     // ── ElevenLabs API keys (same storage as VoiceStudio: elevenlabs_api_keys_v3) ──
-    const LS_EL = 'elevenlabs_api_keys_v3';
+    const DB_EL = 'elevenlabs_api_keys_v3';
+    const LS_EL = DB_EL;
     const [elKeys, setElKeys]     = useState([]); // [{key, status, remaining, limit, used}]
     const [elInput, setElInput]   = useState('');
     const [elSaved, setElSaved]   = useState(false);
     const [elChecking, setElChecking] = useState(false);
 
     useEffect(() => {
-        const raw = localStorage.getItem(LS_EL);
-        try { setElKeys(JSON.parse(raw) || []); } catch { setElKeys([]); }
+        window.electronAPI?.getSetting?.(DB_EL, '[]').then(raw => {
+            try { setElKeys(JSON.parse(raw) || []); } catch { setElKeys([]); }
+        }).catch(() => {
+            const raw = localStorage.getItem(DB_EL);
+            try { const keys = JSON.parse(raw) || []; setElKeys(keys); if (keys.length) window.electronAPI?.setSetting?.(DB_EL, JSON.stringify(keys)); } catch { setElKeys([]); }
+        });
     }, []);
 
     const saveElKeys = (keys) => {
-        localStorage.setItem(LS_EL, JSON.stringify(keys));
+        window.electronAPI?.setSetting?.(DB_EL, JSON.stringify(keys));
+        localStorage.setItem(DB_EL, JSON.stringify(keys));
         setElKeys(keys);
         setElSaved(true);
         setTimeout(() => setElSaved(false), 2000);
@@ -102,202 +272,26 @@ export default function Settings({ dark = true }) {
 
     const removeElKey = (k) => saveElKeys(elKeys.filter(x => x.key !== k));
 
-    // ── TopProxy / KiotProxy Rotating Proxy ──────────────────────────────────
-    const [tpEnabled,      setTpEnabled]      = useState(false);
-    const [tpProvider,     setTpProvider]     = useState('topproxy'); // 'topproxy'|'kiotproxy'
-    const [tpApiKey,       setTpApiKey]       = useState('');
-    const [tpApiKeyInput,  setTpApiKeyInput]  = useState('');
-    const [tpGateway,      setTpGateway]      = useState('160.250.166.11:10059');
-    const [tpType,         setTpType]         = useState('http');
-    const [tpInterval,     setTpInterval]     = useState(1);        // minutes (saved)
-    const [tpIntervalInput,setTpIntervalInput]= useState('1');      // input draft
-    const [tpOnlyOn403,    setTpOnlyOn403]    = useState(false);
-    const [tpRotateUrl,    setTpRotateUrl]    = useState('');    // custom rotate API URL
-    const [tpRotateUrlInput, setTpRotateUrlInput] = useState('');
-    const [tpSaving,       setTpSaving]       = useState(false);
-    const [tpRotating,     setTpRotating]     = useState(false);
-    const [tpRotatePhase,  setTpRotatePhase]  = useState(null);  // null|'calling'|'waiting'|'success'|'unchanged'
-    const [tpRotateMsg,    setTpRotateMsg]    = useState('');
-    const [showRotateUrl,  setShowRotateUrl]  = useState(false); // expand advanced
-
-    // CapSolver API key (dùng để giải captcha qua proxy IP)
-    const [capsolverKey,      setCapsolverKey]      = useState('');
-    const [capsolverKeyInput, setCapsolverKeyInput] = useState('');
-    const [capsolverSaved,    setCapsolverSaved]    = useState(false);
-
     // Stock Video API keys (Pexels / Pixabay)
-    const [pexelsKey,      setPexelsKey]      = useState('');
+    const [pexelsKey,      setPexelsKey]      = useState(''); // eslint-disable-line no-unused-vars
     const [pexelsInput,    setPexelsInput]    = useState('');
     const [pexelsSaved,    setPexelsSaved]    = useState(false);
+    const [pexelsCopied,   setPexelsCopied]   = useState(false);
     const [pixabayKey,     setPixabayKey]     = useState('');
     const [pixabayInput,   setPixabayInput]   = useState('');
     const [pixabaySaved,   setPixabaySaved]   = useState(false);
+    const [pixabayCopied,  setPixabayCopied]  = useState(false);
     const [stockTesting,   setStockTesting]   = useState(null); // 'pexels'|'pixabay'|null
     const [stockTestResult,setStockTestResult]= useState({}); // { pexels: 'ok'|'fail', pixabay: ... }
 
-    // Live IP status
-    const [tpIpInfo,       setTpIpInfo]       = useState(null);  // {ip,isp,region,city}
-    const [tpIpChecking,   setTpIpChecking]   = useState(false);
-    const [tpIpError,      setTpIpError]      = useState('');
-
-    // Countdown tracking
-    const [lastRotateMs,   setLastRotateMs]   = useState(null); // Date.now() of last rotate
-    const [rotateSecsLeft, setRotateSecsLeft] = useState(null);
-    const [aliveSecsLeft,  setAliveSecsLeft]  = useState(null);
-    const PROXY_LIFETIME_SECS = 25 * 60; // 25 min hard limit
-
     // Load saved config on mount
     useEffect(() => {
-        window.electronAPI?.topProxyGetConfig?.().then(cfg => {
-            if (!cfg) return;
-            setTpEnabled(!!cfg.enabled);
-            setTpProvider(cfg.provider || 'topproxy');
-            setTpApiKey(cfg.apiKey || '');
-            setTpApiKeyInput(cfg.apiKey || '');
-            setTpGateway(cfg.gateway || '160.250.166.11:10059');
-            setTpType(cfg.type || 'http');
-            setTpInterval(cfg.rotateInterval || 1);
-            setTpIntervalInput(String(cfg.rotateInterval || 1));
-            setTpOnlyOn403(!!cfg.onlyOn403);
-            if (cfg.lastRotateMs) setLastRotateMs(cfg.lastRotateMs);
-            if (cfg.rotateUrl) { setTpRotateUrl(cfg.rotateUrl); setTpRotateUrlInput(cfg.rotateUrl); }
-        }).catch(() => {});
-        // Load CapSolver key
-        window.electronAPI?.getSetting?.('capsolver_api_key', '').then(k => {
-            if (k) { setCapsolverKey(k); setCapsolverKeyInput(k); }
-        }).catch(() => {});
-        // Load Stock Video keys
-        window.electronAPI?.getSetting?.('pexels_api_key', '').then(k => { if (k) { setPexelsKey(k); setPexelsInput(k); } }).catch(() => {});
-        window.electronAPI?.getSetting?.('pixabay_api_key', '').then(k => { if (k) { setPixabayKey(k); setPixabayInput(k); } }).catch(() => {});
+        // Load Stock Video keys (fallback to built-in defaults)
+        const DEFAULT_PEXELS  = 'WKTsaxocXMQX4dzC71CCsMmqgVulpD69gWgrMb1KKEoa568zPtWWgnCg';
+        const DEFAULT_PIXABAY = '56053263-d50fe3d92779b295085043216';
+        window.electronAPI?.getSetting?.('pexels_api_key', '').then(k => { const v = k || DEFAULT_PEXELS; setPexelsKey(v); setPexelsInput(v); }).catch(() => { setPexelsKey(DEFAULT_PEXELS); setPexelsInput(DEFAULT_PEXELS); });
+        window.electronAPI?.getSetting?.('pixabay_api_key', '').then(k => { const v = k || DEFAULT_PIXABAY; setPixabayKey(v); setPixabayInput(v); }).catch(() => { setPixabayKey(DEFAULT_PIXABAY); setPixabayInput(DEFAULT_PIXABAY); });
     }, []);
-
-    // Auto-update gateway when provider changes
-    useEffect(() => {
-        if (tpProvider === 'topproxy') setTpGateway('160.250.166.11:10059');
-        // KiotProxy: user fills their own gateway
-    }, [tpProvider]);
-
-    // Countdown timer tick (every second)
-    useEffect(() => {
-        if (!tpEnabled || !lastRotateMs) { setRotateSecsLeft(null); setAliveSecsLeft(null); return; }
-        const tick = () => {
-            const now = Date.now();
-            const elapsed = Math.floor((now - lastRotateMs) / 1000);
-            const rotateTotal = tpInterval * 60;
-            setRotateSecsLeft(Math.max(0, rotateTotal - elapsed));
-            setAliveSecsLeft(Math.max(0, PROXY_LIFETIME_SECS - elapsed));
-        };
-        tick();
-        const t = setInterval(tick, 1000);
-        return () => clearInterval(t);
-    }, [tpEnabled, lastRotateMs, tpInterval]);
-
-    // Auto-rotate when countdown hits 0 (and not onlyOn403)
-    useEffect(() => {
-        if (rotateSecsLeft === 0 && tpEnabled && !tpOnlyOn403 && !tpRotating) {
-            handleTpRotate();
-        }
-    }, [rotateSecsLeft]);
-
-    const _tpSaveConfig = async (patch) => {
-        setTpSaving(true);
-        try {
-            const cfg = {
-                enabled: tpEnabled, provider: tpProvider, apiKey: tpApiKey,
-                gateway: tpGateway, type: tpType, rotateInterval: tpInterval,
-                onlyOn403: tpOnlyOn403, lastRotateMs,
-                ...patch,
-            };
-            await window.electronAPI?.topProxySaveConfig?.(cfg);
-        } finally { setTpSaving(false); }
-    };
-
-    const handleTpSaveKey = async () => {
-        const key = tpApiKeyInput.trim();
-        if (!key) return;
-        setTpApiKey(key);
-        await _tpSaveConfig({ apiKey: key });
-    };
-
-    const handleTpToggle = async (val) => {
-        setTpEnabled(val);
-        await window.electronAPI?.topProxyToggle?.(val);
-        if (val && tpApiKey && !tpIpInfo) setTimeout(() => handleTpCheckIp(), 800);
-    };
-
-    const handleTpApplyInterval = async () => {
-        const v = Math.max(1, parseInt(tpIntervalInput) || 1);
-        setTpInterval(v);
-        setTpIntervalInput(String(v));
-        await _tpSaveConfig({ rotateInterval: v });
-    };
-
-    const handleTpCheckIp = async () => {
-        setTpIpChecking(true);
-        setTpIpError('');
-        const res = await window.electronAPI?.topProxyCheckIp?.() || { success: false, error: 'API không khả dụng' };
-        setTpIpChecking(false);
-        if (res.success) { setTpIpInfo(res); setTpIpError(''); }
-        else { setTpIpError(res.error || 'Lỗi không xác định'); setTpIpInfo(null); }
-    };
-
-    const handleTpRotate = async () => {
-        const oldIp = tpIpInfo?.ip || null;
-        setTpRotating(true);
-        setTpRotatePhase('calling');
-        setTpRotateMsg('Đang gọi API xoay...');
-
-        // Call rotate API (pass custom URL if set)
-        await window.electronAPI?.topProxyRotate?.() || { success: false };
-
-        // Reset last-rotate timestamp
-        const now = Date.now();
-        setLastRotateMs(now);
-        _tpSaveConfig({ lastRotateMs: now }); // fire-and-forget
-
-        // Poll for new IP (up to 5 tries × 4s = 20s max)
-        setTpRotatePhase('waiting');
-        let found = false;
-        for (let attempt = 1; attempt <= 5; attempt++) {
-            setTpRotateMsg(`Đang chờ IP mới... (${attempt}/5)`);
-            await new Promise(r => setTimeout(r, 4000));
-            const ipRes = await window.electronAPI?.topProxyCheckIp?.() || { success: false };
-            if (ipRes.success) {
-                setTpIpInfo(ipRes);
-                setTpIpError('');
-                if (!oldIp || ipRes.ip !== oldIp) {
-                    found = true;
-                    setTpRotatePhase('success');
-                    setTpRotateMsg(`✅ IP mới: ${ipRes.ip}`);
-                    break;
-                }
-            } else {
-                setTpIpError(ipRes.error || '');
-            }
-        }
-
-        if (!found) {
-            setTpRotatePhase('unchanged');
-            setTpRotateMsg('⚠ IP chưa đổi — Proxy xoay theo thời gian, thử "Xoay ngay" lại sau');
-        }
-
-        setTpRotating(false);
-        setTimeout(() => { setTpRotatePhase(null); setTpRotateMsg(''); }, 6000);
-    };
-
-    const handleTpSaveRotateUrl = async () => {
-        const url = tpRotateUrlInput.trim();
-        setTpRotateUrl(url);
-        await _tpSaveConfig({ rotateUrl: url });
-    };
-
-    const handleCapsolverSave = async () => {
-        const k = capsolverKeyInput.trim();
-        setCapsolverKey(k);
-        await window.electronAPI?.setSetting?.('capsolver_api_key', k);
-        setCapsolverSaved(true);
-        setTimeout(() => setCapsolverSaved(false), 2500);
-    };
 
     const handleStockSave = async (provider) => {
         if (provider === 'pexels') {
@@ -330,21 +324,6 @@ export default function Settings({ dark = true }) {
         setStockTestResult(r => ({ ...r, [provider]: res?.success && res.results?.length > 0 ? 'ok' : 'fail' }));
     };
 
-    const handleTpDelete = async () => {
-        setTpEnabled(false);
-        setTpApiKey('');
-        setTpApiKeyInput('');
-        setTpIpInfo(null);
-        setLastRotateMs(null);
-        await _tpSaveConfig({ enabled: false, apiKey: '', lastRotateMs: null });
-    };
-
-    const fmtCountdown = (secs) => {
-        if (secs === null || secs === undefined) return '--:--';
-        const m = Math.floor(secs / 60);
-        const s = secs % 60;
-        return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-    };
 
     return (
         <div className="flex w-full h-full bg-[#0a0f18] text-slate-300">
@@ -393,11 +372,6 @@ export default function Settings({ dark = true }) {
                         {extConnected ? <Wifi size={10}/> : <WifiOff size={10}/>}
                         {extConnected ? 'Extension: Kết nối' : 'Extension: Chờ...'}
                     </div>
-                    {tpEnabled && tpApiKey && (
-                        <div className="flex items-center gap-2 text-[10px] font-bold px-2 py-1 rounded-lg bg-cyan-500/10 text-cyan-400 mt-1">
-                            🔄 {tpIpInfo ? `${tpIpInfo.ip}` : 'Proxy: BẬT'}
-                        </div>
-                    )}
                 </div>
             </div>
 
@@ -450,8 +424,8 @@ export default function Settings({ dark = true }) {
                                     ['1', 'Click nút bên dưới để mở thư mục Extension'],
                                     ['2', 'Mở Chrome → vào địa chỉ: chrome://extensions'],
                                     ['3', 'Bật công tắc "Developer mode" (góc trên bên phải)'],
-                                    ['4', 'Click "Load unpacked" → chọn thư mục Extension vừa mở'],
-                                    ['5', 'Mở trang labs.google trong Chrome → tool tự kết nối'],
+                                    ['4', 'Click "Load unpacked" → chọn thư mục Extension vừa mở (nếu đã cài rồi thì nhấn nút ↺ Reload)'],
+                                    ['5', 'Mở trang flow.google.com trong Chrome → đợi trang tải → tool tự kết nối'],
                                 ].map(([n, txt]) => (
                                     <li key={n} className="flex items-start gap-3">
                                         <span className="w-5 h-5 bg-amber-500/20 text-amber-400 text-[10px] font-black rounded-full flex items-center justify-center flex-shrink-0 mt-0.5">{n}</span>
@@ -459,7 +433,7 @@ export default function Settings({ dark = true }) {
                                     </li>
                                 ))}
                             </ol>
-                            <div className="flex gap-3">
+                            <div className="flex gap-3 flex-wrap">
                                 <button
                                     onClick={async () => {
                                         const res = await window.electronAPI?.openExtensionFolder?.();
@@ -474,6 +448,12 @@ export default function Settings({ dark = true }) {
                                     className="flex-1 py-2.5 bg-slate-700/50 hover:bg-slate-700 border border-slate-600 text-slate-300 text-sm font-bold rounded-xl transition-colors flex items-center justify-center gap-2"
                                 >
                                     <Globe size={14}/> Mở chrome://extensions
+                                </button>
+                                <button
+                                    onClick={() => window.electronAPI?.openExternal?.('https://flow.google.com')}
+                                    className="flex-1 py-2.5 bg-blue-500/20 hover:bg-blue-500/30 border border-blue-500/40 text-blue-300 text-sm font-bold rounded-xl transition-colors flex items-center justify-center gap-2"
+                                >
+                                    <Globe size={14}/> Mở flow.google.com
                                 </button>
                             </div>
                         </div>
@@ -527,15 +507,28 @@ export default function Settings({ dark = true }) {
 
                                 {geminiKeys.length > 0 && (
                                     <div className="space-y-2 mt-2">
-                                        <label className="text-xs font-semibold text-slate-400">Keys hiện có ({geminiKeys.length})</label>
+                                        <div className="flex items-center justify-between">
+                                            <label className="text-xs font-semibold text-slate-400">Keys hiện có ({geminiKeys.length})</label>
+                                            <button
+                                                onClick={() => { navigator.clipboard.writeText(geminiKeys.join('\n')); }}
+                                                className="flex items-center gap-1 text-xs px-2 py-1 bg-blue-500/20 hover:bg-blue-500/40 text-blue-300 rounded-lg transition-colors"
+                                                title="Sao chép tất cả keys"
+                                            >
+                                                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                                                Copy All
+                                            </button>
+                                        </div>
                                         <div className="space-y-1.5 max-h-48 overflow-y-auto custom-scrollbar">
                                             {geminiKeys.map((k, i) => (
                                                 <div key={i} className="flex items-center gap-2 bg-[#0f172a] border border-slate-700/60 rounded-lg px-3 py-2">
                                                     <CheckCircle2 size={12} className="text-emerald-400 shrink-0"/>
-                                                    <span className="flex-1 text-xs font-mono text-slate-300 truncate">
-                                                        {k.slice(0, 12)}{'*'.repeat(Math.max(0, k.length - 20))}{k.slice(-8)}
+                                                    <span className="flex-1 text-xs font-mono text-slate-300 select-all break-all">
+                                                        {k}
                                                     </span>
-                                                    <button onClick={() => removeGeminiKey(k)} className="text-slate-600 hover:text-red-400 transition-colors">
+                                                    <button onClick={() => navigator.clipboard.writeText(k)} className="text-slate-600 hover:text-blue-400 transition-colors shrink-0" title="Sao chép key này">
+                                                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                                                    </button>
+                                                    <button onClick={() => removeGeminiKey(k)} className="text-slate-600 hover:text-red-400 transition-colors shrink-0">
                                                         <X size={13}/>
                                                     </button>
                                                 </div>
@@ -559,6 +552,204 @@ export default function Settings({ dark = true }) {
                                         >
                                             aistudio.google.com
                                         </button>
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* ── Claude ── */}
+                        <div className="bg-[#1a2535] border border-slate-700/60 rounded-xl overflow-hidden">
+                            <div className="px-5 py-4 border-b border-slate-700/40 flex items-center justify-between">
+                                <div className="flex items-center gap-3">
+                                    <div className="w-8 h-8 rounded-lg bg-orange-500/20 flex items-center justify-center text-base">🤖</div>
+                                    <div>
+                                        <p className="text-sm font-bold text-white">Claude API Key</p>
+                                        <p className="text-xs text-slate-500">Anthropic — dùng cho tạo prompt, phân tích nội dung</p>
+                                    </div>
+                                </div>
+                                <span className={`text-xs font-bold px-2 py-1 rounded-lg ${
+                                    claudeKey
+                                        ? 'bg-orange-500/15 text-orange-400 border border-orange-500/20'
+                                        : 'bg-slate-700/50 text-slate-400 border border-slate-600'
+                                }`}>
+                                    {claudeKey ? '✓ Đã có key' : 'Chưa có key'}
+                                </span>
+                            </div>
+                            <div className="p-5 space-y-3">
+                                {/* Key input */}
+                                <div>
+                                    <label className="text-xs font-semibold text-slate-400 mb-1.5 block">API Key</label>
+                                    <div className="flex gap-2">
+                                        <input
+                                            type="password"
+                                            value={claudeInput}
+                                            onChange={e => setClaudeInput(e.target.value)}
+                                            onKeyDown={e => e.key === 'Enter' && saveClaudeKey()}
+                                            placeholder="sk-ant-api03-..."
+                                            className="flex-1 bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-slate-300 font-mono focus:outline-none focus:border-orange-500 placeholder-slate-600"
+                                        />
+                                        <button
+                                            onClick={saveClaudeKey}
+                                            disabled={!claudeInput.trim()}
+                                            className="px-4 py-2 bg-orange-600 hover:bg-orange-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-bold rounded-lg transition-colors flex items-center gap-1.5"
+                                        >
+                                            <Plus size={14}/> Lưu
+                                        </button>
+                                    </div>
+                                </div>
+
+                                {/* Current key status */}
+                                {claudeKey && (
+                                    <div className="flex items-center gap-2 bg-[#0f172a] border border-slate-700/60 rounded-lg px-3 py-2">
+                                        <div className={`w-2 h-2 rounded-full shrink-0 ${
+                                            claudeVerifyResult === 'ok' ? 'bg-emerald-500' :
+                                            claudeVerifyResult === 'fail' ? 'bg-red-500' : 'bg-orange-400'
+                                        }`}/>
+                                        <span className="flex-1 text-xs font-mono text-slate-300 truncate">
+                                            {claudeKey.slice(0, 14)}{'*'.repeat(Math.max(0, claudeKey.length - 22))}{claudeKey.slice(-8)}
+                                        </span>
+                                        {claudeVerifyResult === 'ok' && (
+                                            <span className={`text-xs font-bold shrink-0 ${claudeVerifyMsg ? 'text-amber-400' : 'text-emerald-400'}`}>
+                                                {claudeVerifyMsg ? '⚠ Hết credits' : '✓ Hợp lệ'}
+                                            </span>
+                                        )}
+                                        {claudeVerifyResult === 'fail' && (
+                                            <span className="text-xs text-red-400 font-bold shrink-0" title={claudeVerifyMsg}>
+                                                ✗ {claudeVerifyMsg ? claudeVerifyMsg.slice(0, 35) : 'Key sai'}
+                                            </span>
+                                        )}
+                                        <button
+                                            onClick={verifyClaudeKey}
+                                            disabled={claudeVerifying}
+                                            className="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2.5 py-1 rounded-lg transition-colors flex items-center gap-1 shrink-0 disabled:opacity-50"
+                                        >
+                                            {claudeVerifying ? <Loader2 size={11} className="animate-spin"/> : <Shield size={11}/>}
+                                            {claudeVerifying ? 'Đang xác minh...' : 'Xác minh'}
+                                        </button>
+                                        <button onClick={removeClaudeKey} className="text-slate-600 hover:text-red-400 transition-colors shrink-0">
+                                            <X size={13}/>
+                                        </button>
+                                    </div>
+                                )}
+
+                                {/* Model selector */}
+                                <div>
+                                    <label className="text-xs font-semibold text-slate-400 mb-1.5 block">Model</label>
+                                    <select
+                                        value={claudeModel}
+                                        onChange={e => saveClaudeModel(e.target.value)}
+                                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-slate-300 focus:outline-none focus:border-orange-500"
+                                    >
+                                        {CLAUDE_MODELS_LIST.map(m => (
+                                            <option key={m.id} value={m.id}>{m.label}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {claudeSaved && (
+                                    <p className="text-xs text-orange-400 flex items-center gap-1">
+                                        <CheckCircle2 size={12}/> Đã lưu!
+                                    </p>
+                                )}
+
+                                <div className="pt-2 border-t border-slate-700/30">
+                                    <p className="text-xs text-slate-500">
+                                        Lấy API key tại{' '}
+                                        <button
+                                            onClick={() => window.electronAPI?.openExternal?.('https://console.anthropic.com/settings/keys')}
+                                            className="text-orange-400 hover:text-orange-300 underline decoration-dotted"
+                                        >
+                                            console.anthropic.com
+                                        </button>
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* ── Groq ── */}
+                        <div className="bg-[#1a2535] border border-slate-700/60 rounded-xl overflow-hidden">
+                            <div className="px-5 py-4 border-b border-slate-700/40 flex items-center justify-between">
+                                <div className="flex items-center gap-3">
+                                    <div className="w-8 h-8 rounded-lg bg-green-500/20 flex items-center justify-center text-base">⚡</div>
+                                    <div>
+                                        <p className="text-sm font-bold text-white">Groq API Key</p>
+                                        <p className="text-xs text-slate-500">Groq — Llama, Kimi, miễn phí, siêu nhanh</p>
+                                    </div>
+                                </div>
+                                <span className={`text-xs font-bold px-2 py-1 rounded-lg ${groqKeys.length > 0 ? 'bg-green-500/15 text-green-400 border border-green-500/20' : 'bg-slate-700/50 text-slate-400 border border-slate-600'}`}>
+                                    {groqKeys.length > 0 ? `${groqKeys.length} key` : 'Chưa có key'}
+                                </span>
+                            </div>
+                            <div className="p-5 space-y-3">
+                                <div>
+                                    <label className="text-xs font-semibold text-slate-400 mb-1.5 block">Thêm key mới (mỗi dòng 1 key)</label>
+                                    <textarea
+                                        value={groqInput} onChange={e => setGroqInput(e.target.value)}
+                                        placeholder={'gsk_xxxx...\ngsk_yyyy...\n(Lấy key miễn phí tại console.groq.com)'}
+                                        rows={3}
+                                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-slate-300 font-mono focus:outline-none focus:border-green-500 resize-none placeholder-slate-600"
+                                    />
+                                </div>
+                                <button onClick={handleGroqApply} disabled={!groqInput.trim()}
+                                    className="px-4 py-2 bg-green-600 hover:bg-green-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-bold rounded-lg transition-colors flex items-center gap-2">
+                                    <Plus size={14}/> Thêm key
+                                </button>
+
+                                {groqKeys.length > 0 && (
+                                    <div className="space-y-2 mt-2">
+                                        <div className="flex items-center justify-between">
+                                            <label className="text-xs font-semibold text-slate-400">Keys hiện có ({groqKeys.length})</label>
+                                            <div className="flex gap-2">
+                                                <button
+                                                    onClick={() => navigator.clipboard.writeText(groqKeys.join('\n'))}
+                                                    className="flex items-center gap-1 text-xs px-2 py-1 bg-blue-500/20 hover:bg-blue-500/40 text-blue-300 rounded-lg transition-colors"
+                                                    title="Sao chép tất cả keys"
+                                                >
+                                                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                                                    Copy All
+                                                </button>
+                                                <button onClick={verifyGroqKeyFn} disabled={groqVerifying}
+                                                    className="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2.5 py-1 rounded-lg transition-colors flex items-center gap-1 disabled:opacity-50">
+                                                    {groqVerifying ? <Loader2 size={11} className="animate-spin"/> : <Shield size={11}/>}
+                                                    {groqVerifying ? 'Đang xác minh...' : 'Test key #1'}
+                                                </button>
+                                            </div>
+                                        </div>
+                                        {groqVerifyResult === 'ok'   && <p className="text-xs text-green-400 flex items-center gap-1"><CheckCircle2 size={12}/> Key hợp lệ!</p>}
+                                        {groqVerifyResult === 'fail' && <p className="text-xs text-red-400 flex items-center gap-1"><AlertCircle size={12}/> Key lỗi</p>}
+                                        <div className="space-y-1.5 max-h-48 overflow-y-auto custom-scrollbar">
+                                            {groqKeys.map((k, i) => (
+                                                <div key={i} className="flex items-center gap-2 bg-[#0f172a] border border-slate-700/60 rounded-lg px-3 py-2">
+                                                    <CheckCircle2 size={12} className="text-green-400 shrink-0"/>
+                                                    <span className="flex-1 text-xs font-mono text-slate-300 select-all break-all">
+                                                        {k}
+                                                    </span>
+                                                    <button onClick={() => navigator.clipboard.writeText(k)} className="text-slate-600 hover:text-blue-400 transition-colors shrink-0" title="Sao chép key này">
+                                                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                                                    </button>
+                                                    <button onClick={() => removeGroqKey(k)} className="text-slate-600 hover:text-red-400 transition-colors shrink-0"><X size={13}/></button>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+
+                                <div>
+                                    <label className="text-xs font-semibold text-slate-400 mb-1.5 block">Model</label>
+                                    <select value={groqModel} onChange={e => saveGroqModelFn(e.target.value)}
+                                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-slate-300 focus:outline-none focus:border-green-500">
+                                        {GROQ_MODELS_LIST.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+                                    </select>
+                                </div>
+
+                                {groqSaved && <p className="text-xs text-green-400 flex items-center gap-1"><CheckCircle2 size={12}/> Đã lưu!</p>}
+
+                                <div className="pt-2 border-t border-slate-700/30">
+                                    <p className="text-xs text-slate-500">
+                                        Lấy key miễn phí tại{' '}
+                                        <button onClick={() => window.electronAPI?.openExternal?.('https://console.groq.com/keys')}
+                                            className="text-green-400 hover:text-green-300 underline decoration-dotted">console.groq.com</button>
+                                        {' '}— Free tier: 14.400 req/ngày/key, thêm nhiều key để tăng giới hạn.
                                     </p>
                                 </div>
                             </div>
@@ -645,7 +836,6 @@ export default function Settings({ dark = true }) {
                     </div>
                 )}
 
-                {/* ════════════ PROXY XOAY ════════════ */}
                 {activeSection === 'proxy' && (
                     <div className="max-w-2xl">
                         {/* ── Title bar ── */}
@@ -656,7 +846,7 @@ export default function Settings({ dark = true }) {
                                     <h1 className="text-base font-bold text-white leading-tight">
                                         Proxy Xoay ({tpProvider === 'topproxy' ? 'TopProxy' : 'KiotProxy'})
                                     </h1>
-                                    <p className="text-xs text-slate-500">Định tuyến traffic Veo Studio qua proxy xoay IP</p>
+                                    <p className="text-xs text-slate-500">Định tuyến traffic Veo Studio &amp; ElevenLabs TTS qua proxy xoay IP</p>
                                 </div>
                             </div>
                             {/* ON/OFF toggle */}
@@ -1073,6 +1263,13 @@ export default function Settings({ dark = true }) {
                                             Key hiện tại: <span className="text-slate-300 font-mono">{pexelsKey.slice(0, 8)}{'•'.repeat(Math.min(16, pexelsKey.length - 8))}…</span>
                                         </div>
                                         <button
+                                            onClick={() => { navigator.clipboard.writeText(pexelsKey); setPexelsCopied(true); setTimeout(() => setPexelsCopied(false), 2000); }}
+                                            className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 border border-slate-600/50 text-xs text-white font-bold rounded-lg transition-colors"
+                                            title="Sao chép key"
+                                        >
+                                            {pexelsCopied ? '✓ Đã copy' : '📋 Copy'}
+                                        </button>
+                                        <button
                                             onClick={() => handleStockTest('pexels')}
                                             disabled={stockTesting === 'pexels'}
                                             className="px-4 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 border border-slate-600/50 text-xs text-white font-bold rounded-lg transition-colors flex items-center gap-1.5"
@@ -1129,6 +1326,13 @@ export default function Settings({ dark = true }) {
                                             Key hiện tại: <span className="text-slate-300 font-mono">{pixabayKey.slice(0, 8)}{'•'.repeat(Math.min(16, pixabayKey.length - 8))}…</span>
                                         </div>
                                         <button
+                                            onClick={() => { navigator.clipboard.writeText(pixabayKey); setPixabayCopied(true); setTimeout(() => setPixabayCopied(false), 2000); }}
+                                            className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 border border-slate-600/50 text-xs text-white font-bold rounded-lg transition-colors"
+                                            title="Sao chép key"
+                                        >
+                                            {pixabayCopied ? '✓ Đã copy' : '📋 Copy'}
+                                        </button>
+                                        <button
                                             onClick={() => handleStockTest('pixabay')}
                                             disabled={stockTesting === 'pixabay'}
                                             className="px-4 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 border border-slate-600/50 text-xs text-white font-bold rounded-lg transition-colors flex items-center gap-1.5"
@@ -1156,6 +1360,7 @@ export default function Settings({ dark = true }) {
                         </div>
                     </div>
                 )}
+
 
             </div>
         </div>

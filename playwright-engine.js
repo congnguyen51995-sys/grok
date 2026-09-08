@@ -19,7 +19,6 @@ class PlaywrightEngine {
   constructor(options) {
     this.downloadsDir    = options.downloadsDir;
     this.profilesBaseDir = options.profilesBaseDir;
-    this.debugDir        = path.join(path.dirname(this.downloadsDir), 'debug_screenshots');
     this.db              = options.db;
     this.onProgress      = options.onProgress || (() => {});
     this.onComplete      = options.onComplete || (() => {});
@@ -29,7 +28,6 @@ class PlaywrightEngine {
     this.initPromises    = new Map(); 
 
     if (!fs.existsSync(this.downloadsDir)) fs.mkdirSync(this.downloadsDir, { recursive: true });
-    if (!fs.existsSync(this.debugDir)) fs.mkdirSync(this.debugDir, { recursive: true });
   }
 
   _buildFileName(job, type, ext) {

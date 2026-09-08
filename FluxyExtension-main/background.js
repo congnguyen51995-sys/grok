@@ -765,7 +765,10 @@ async function ensureR2VPoller() {
         for (const cap of unclaimedCaptures) {
             if (!cap.url.includes('flow-content.google')) continue;
             for (const [opId, p] of _pendingR2V) {
-                if (!cap.url.includes(opId) || cap.claimedBy) continue;
+                if (cap.claimedBy) continue;
+                // URL chứa mediaId (không phải operationId) → dùng p.mid để match
+                const matchKey = p.mid || opId;
+                if (!cap.url.includes(matchKey)) continue;
                 cap.claimedBy = opId;
                 if (cap.url.includes('/video/')) {
                     // Video URL trực tiếp → tải về ngay

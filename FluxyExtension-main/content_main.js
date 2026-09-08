@@ -23,7 +23,7 @@ function _fluxyCapture(txt) {
                 .replace(/\\{1,2}u0026/g,'&')
                 .replace(/\\{1,2}u002f/g,'/')
                 .replace(/\\+$/, '');
-            if (!raw.includes('?')) continue;
+            // Không lọc '?' — flow-content.google/video/ URLs thường không có query string
             if (!window._fluxyCapturedUrls) window._fluxyCapturedUrls = [];
             if (!window._fluxyCapturedUrls.some(c => c.url === raw)) {
                 window._fluxyCapturedUrls.push({ url: raw, ts: Date.now() });

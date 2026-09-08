@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Fluxy Extension - Thành Công Media",
-  "version": "4.1",
+  "version": "4.2",
   "description": "Kết nối Veo Studio với Fluxy Tool",
   "permissions": [
     "scripting",

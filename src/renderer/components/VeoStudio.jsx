@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Play, Square, Pause, FolderOpen, RefreshCw, CheckCircle2, Key, Image as ImageIcon, Film, CreditCard, Trash2, Loader2, X, AlertCircle, Settings2, Layers, Cpu, ImagePlus, FileImage, Plus, FolderPlus, FileText, Trash, Wifi, WifiOff, Maximize2, Edit3, CheckCircle, Download, HelpCircle, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Terminal, Ban, Mic, Volume2, VolumeX } from 'lucide-react';
-import AudioMixerPanel from './AudioMixerPanel.jsx';
 
 const VOICE_LIST = [
   { id: '',              gender: '',  label: 'Không có giọng' },
@@ -838,9 +837,6 @@ export default function VeoStudio({ dark = true }) {
                         </div>
                     </div>
 
-                    {/* AUDIO MIXER */}
-                    <AudioMixerPanel collapsed={true} />
-
                     {/* VÙNG NHẬP LIỆU THEO CHẾ ĐỘ */}
                     {inputMode === 'Ingredients' ? (
                         <div className="flex flex-col gap-3 flex-1">
@@ -1600,13 +1596,6 @@ function VeoJobGrid({ jobs, outputFolder, getFileUrl, removeJob, onSetPrompt, on
                                 </div>
                             )}
                         </div>
-
-                        {/* Audio Mixer — hiển thị khi video đã xong */}
-                        {liveSelectedJob.status === 'done' && liveSelectedJob.files?.[0]?.endsWith('.mp4') && (
-                            <div className="px-3 pt-3">
-                                <AudioMixerPanel collapsed={false} />
-                            </div>
-                        )}
 
                         {/* Prompt */}
                         <div className="px-5 py-3 border-t border-slate-800">

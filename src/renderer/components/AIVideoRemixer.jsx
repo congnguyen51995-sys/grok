@@ -1,5 +1,6 @@
 ﻿import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { GoogleGenAI } from '@google/genai';
+import AudioMixerPanel from './AudioMixerPanel.jsx';
 import {
   TOOL_DECLARATIONS, executeTool, buildEditPlan,
   buildSystemPrompt, isVideoRequest,
@@ -1735,6 +1736,11 @@ export default function AIVideoRemixer() {
                   </div>
                 </div>
               )}
+
+              {/* Audio Mixer — luôn hiển thị ở cuối right panel */}
+              <div style={{borderTop:'1px solid #0d1728',padding:'8px',flexShrink:0}}>
+                <AudioMixerPanel collapsed={true} />
+              </div>
             </div>
 
           </div>

@@ -9,6 +9,7 @@
  */
 import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI } from '@google/genai';
+import AudioMixerPanel from './AudioMixerPanel.jsx';
 import { retryWithKeyRotation } from '../services/keyRotation.js';
 import {
   Sparkles, Play, Code2, Terminal, FolderOpen, Video,
@@ -1004,6 +1005,9 @@ export default function RemotionStudio() {
               </button>
             )}
           </div>
+
+          {/* Audio Mixer — luôn hiển thị trong left panel */}
+          <AudioMixerPanel collapsed={true} />
 
           {/* Done */}
           {isDone && videoPath && (

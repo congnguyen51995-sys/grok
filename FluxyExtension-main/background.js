@@ -766,6 +766,19 @@ async function ensureR2VPoller() {
             if (!cap.url.includes('flow-content.google')) continue;
             for (const [opId, p] of _pendingR2V) {
                 if (cap.claimedBy) continue;
+                // FIX: T2V với p.mid=null → extract mediaId từ /video/<uuid>/ URL
+                if (p.isT2V && !p.mid && cap.url.includes('/video/')) {
+                    const uuidM = cap.url.match(/\/video\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+                    if (uuidM) {
+                        p.mid = uuidM[1];
+                        cap.claimedBy = opId;
+                        console.log(`[T2V ${opId.substring(0,8)}] ✅ A-webRequest extracted mediaId=${p.mid.substring(0,8)} URL=${cap.url.substring(0,70)}`);
+                        _pendingR2V.delete(opId);
+                        fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: cap.url }) }).catch(()=>{});
+                        break;
+                    }
+                    continue;
+                }
                 // URL chứa mediaId (không phải operationId) → dùng p.mid để match
                 const matchKey = p.mid || opId;
                 if (!cap.url.includes(matchKey)) continue;
@@ -900,9 +913,9 @@ async function ensureR2VPoller() {
                                         return u;
                                     };
 
-                                    // T2V: thử jwpduf + WuwhI song song (cả 2 đều cần cookie → gọi từ Extension)
+                                    // T2V: jwpduf → as29s (R2V-style) → WuwhI fallback
                                     if (p.isT2V) {
-                                        // Attempt 1: jwpduf — khi video done sẽ có URL
+                                        // Attempt 1: jwpduf — khi video done có thể trả URL trực tiếp
                                         const jfreq = JSON.stringify([[['jwpduf', JSON.stringify([p.opId]), null, 'generic']]]);
                                         const jresp = await fetch(`${BASE}?${mkUsp('jwpduf')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(jfreq)}&at=${encodeURIComponent(liveAt)}` });
                                         const jtxt = await jresp.text();
@@ -912,28 +925,48 @@ async function ensureR2VPoller() {
                                             return { opId: p.opId, url: jUrl, method: 'T2V_jwpduf', debug: null };
                                         }
 
-                                        // Attempt 2: WuwhI với mediaId — download endpoint (nếu có mediaId)
+                                        // Attempt 2: Parse workflowId từ jwpduf response → gọi as29s (giống R2V)
+                                        const jm = jtxt.match(/\\"([0-9a-f-]{36})\\",\\"[0-9a-f-]{36}\\",\\"([0-9a-f-]{36})\\",\\"CAE\\"/i)
+                                                 || jtxt.match(/"([0-9a-f-]{36})","[0-9a-f-]{36}","([0-9a-f-]{36})","CAE"/i);
+                                        if (jm) {
+                                            try {
+                                                const extractedWid = jm[2];
+                                                if (!window._fluxyWorkflowIds) window._fluxyWorkflowIds = {};
+                                                window._fluxyWorkflowIds[p.opId] = extractedWid;
+                                                const af = JSON.stringify([[['as29s', JSON.stringify([p.opId, p.pid, extractedWid, 'CAE']), null, 'generic']]]);
+                                                const aresp = await fetch(`${BASE}?${mkUsp('as29s')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(af)}&at=${encodeURIComponent(liveAt)}` });
+                                                const atxt = await aresp.text();
+                                                const aUrl = _extractVideoUrl(atxt);
+                                                if (aUrl) {
+                                                    window._fluxyOpClaimed[p.opId] = aUrl;
+                                                    return { opId: p.opId, url: aUrl, method: 'T2V_as29s', debug: null };
+                                                }
+                                            } catch(_) {}
+                                        }
+
+                                        // Attempt 3: WuwhI với mediaId (thử nhiều payload formats)
                                         if (p.mid) {
                                             try {
-                                                const wPayload = JSON.stringify([
-                                                    ['FLOW_DOWNLOAD', [null, null, null, 'MEDIA_ID', p.mid, 'VIDEO_DOWNLOAD_RESOLUTION', 'ORIGINAL_VIDEO']],
-                                                    ['ASSET_DOWNLOAD', [null, null, null, 'MEDIA_ID', p.mid]]
-                                                ]);
-                                                const wfreq = JSON.stringify([[['WuwhI', wPayload, null, 'generic']]]);
-                                                const wresp = await fetch(`${BASE}?${mkUsp('WuwhI')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(wfreq)}&at=${encodeURIComponent(liveAt)}` });
-                                                const wtxt = await wresp.text();
-                                                const wUrl = _extractVideoUrl(wtxt);
-                                                if (wUrl) {
-                                                    window._fluxyOpClaimed[p.opId] = wUrl;
-                                                    return { opId: p.opId, url: wUrl, method: 'T2V_WuwhI', debug: null };
+                                                let wUrl = null;
+                                                for (const wPayload of [
+                                                    JSON.stringify([p.mid]),
+                                                    JSON.stringify([p.pid, p.mid]),
+                                                    JSON.stringify([p.mid, 'VIDEO']),
+                                                    JSON.stringify([p.mid, 'ORIGINAL_VIDEO']),
+                                                ]) {
+                                                    const wfreq = JSON.stringify([[['WuwhI', wPayload, null, 'generic']]]);
+                                                    const wresp = await fetch(`${BASE}?${mkUsp('WuwhI')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(wfreq)}&at=${encodeURIComponent(liveAt)}` });
+                                                    const wtxt = await wresp.text();
+                                                    wUrl = _extractVideoUrl(wtxt);
+                                                    if (wUrl) {
+                                                        window._fluxyOpClaimed[p.opId] = wUrl;
+                                                        return { opId: p.opId, url: wUrl, method: 'T2V_WuwhI', debug: `payload=${wPayload.substring(0,40)}` };
+                                                    }
                                                 }
-                                                const wErrM = wtxt.match(/\["e",(\d+)/);
-                                                const wDebug = `WuwhI http=${wresp.status} err=${wErrM?wErrM[1]:'?'} resp=${wtxt.substring(0,100)}`;
                                                 const jErrM = jtxt.match(/\["e",(\d+)/);
-                                                return { opId: p.opId, url: null, method: 'T2V_null', debug: `jwpduf_err=${jErrM?jErrM[1]:'?'} ${wDebug}` };
+                                                return { opId: p.opId, url: null, method: 'T2V_null', debug: `jwpduf_err=${jErrM?jErrM[1]:'?'} WuwhI_no_url mid=${p.mid.substring(0,8)}` };
                                             } catch(we) {
-                                                const jErrM = jtxt.match(/\["e",(\d+)/);
-                                                return { opId: p.opId, url: null, method: 'T2V_null', debug: `jwpduf_err=${jErrM?jErrM[1]:'?'} WuwhI_err=${we.message}` };
+                                                return { opId: p.opId, url: null, method: 'T2V_null', debug: `WuwhI_err=${we.message}` };
                                             }
                                         }
 

@@ -893,13 +893,22 @@ async function ensureR2VPoller() {
                                 .replace(/\\{1,2}u002f/g,'/')
                                 .replace(/\\+$/, '');
                             const _extractVideoUrl = txt => {
-                                const m = txt.match(/"(https:(?:\\\/|\/){2}flow-content\.google\/(?:video|image)\/[^"]{10,})"/)
+                                // Single-encoded: "https://..." (URL is a direct JSON value)
+                                const m1 = txt.match(/"(https:(?:\\\/|\/){2}flow-content\.google\/(?:video|image)\/[^"]{10,})"/)
                                     || txt.match(/"(https:(?:\\\/|\/){2}storage\.googleapis\.com\/ais-[^"]{10,})"/)
                                     || txt.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.mp4[^"]{0,800})"/)
                                     || txt.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.m3u8[^"]{0,300})"/)
                                     || txt.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.webm[^"]{0,300})"/)
                                     || txt.match(/"(https:(?:\\\/|\/){2}lh3\.googleusercontent\.com\/ais[^"]{10,})"/);
-                                return m ? _decodeUrl(m[1]) : null;
+                                if (m1) return _decodeUrl(m1[1]);
+                                // Double-encoded: \"https:...\" (URL inside JSON-string inside JSON-string)
+                                const m2 = txt.match(/\\"(https:(?:\\\/|\/){2}flow-content\.google\/(?:video|image)\/[^\\"]{10,})\\"/)
+                                    || txt.match(/\\"(https:(?:\\\/|\/){2}storage\.googleapis\.com\/ais-[^\\"]{10,})\\"/)
+                                    || txt.match(/\\"(https:(?:\\\/|\/){2}[^\\"]{5,}\.mp4[^\\"]{0,800})\\"/)
+                                    || txt.match(/\\"(https:(?:\\\/|\/){2}[^\\"]{5,}\.m3u8[^\\"]{0,300})\\"/)
+                                    || txt.match(/\\"(https:(?:\\\/|\/){2}lh3\.googleusercontent\.com\/ais[^\\"]{10,})\\"/);
+                                if (m2) return _decodeUrl(m2[1]);
+                                return null;
                             };
                             const pollOne = async (p) => {
                                 try {

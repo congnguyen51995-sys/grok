@@ -971,7 +971,7 @@ async function ensureR2VPoller() {
                                         }
 
                                         const errM = jtxt.match(/\["e",(\d+)/);
-                                        return { opId: p.opId, url: null, method: 'T2V_jwpduf_null', debug: `err=${errM?errM[1]:'?'} http=${jresp.status} resp=${jtxt.substring(0,150)}` };
+                                        return { opId: p.opId, url: null, method: 'T2V_jwpduf_null', debug: `err=${errM?errM[1]:'?'} http=${jresp.status} resp=${jtxt.substring(0,150)}`, rawResp: jtxt.substring(0,3000) };
                                     }
 
                                     // R2V: lấy workflowId rồi gọi as29s
@@ -1030,6 +1030,9 @@ async function ensureR2VPoller() {
                     } else if (result?.debug) {
                         // Log as29s response vào SW console để debug
                         console.log(`[R2V ${opId.substring(0,8)}] ❌ ${result.method}: ${result.debug}`);
+                        if (result.rawResp) {
+                            fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'jwpduf_response', freq: result.rawResp, ts: Date.now() }) }).catch(()=>{});
+                        }
                     }
                 }
             } catch(e) {

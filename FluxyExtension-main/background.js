@@ -906,10 +906,10 @@ async function ensureR2VPoller() {
         const now = Date.now();
         console.log(`[Poller] ▶ iter=${_pollIter} pending=${_pendingR2V.size}`);
 
-        // Timeout: loại ops quá 10 phút
+        // Timeout: loại ops quá 20 phút
         for (const [opId, p] of _pendingR2V) {
-            if (now - p.startTime > 600000) {
-                console.log(`[R2V ${opId.substring(0,8)}] ❌ Timeout 10 phút`);
+            if (now - p.startTime > 1200000) {
+                console.log(`[R2V ${opId.substring(0,8)}] ❌ Timeout 20 phút`);
                 _pendingR2V.delete(opId);
             }
         }
@@ -1210,9 +1210,9 @@ async function ensureR2VPoller() {
                                                 const wfreq = JSON.stringify([[['WuwhI', JSON.stringify(wInner), null, 'generic']]]);
                                                 const wresp = await fetch(`${BASE}?${mkUsp('WuwhI')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(wfreq)}&at=${encodeURIComponent(liveAt)}` });
                                                 const wtxt = await wresp.text();
-                                                // Only capture: first 2 polls (to verify WuwhI is running), OR when non-empty / interesting
+                                                // Capture: first poll (<7s), every 60s heartbeat, OR when non-empty/interesting
                                                 const wIsEmpty = wtxt.includes('"WuwhI",\\"[]"') || wtxt.includes('"WuwhI","[]"');
-                                                if (!wIsEmpty || wtxt.includes('GENERATION_COMPLETE') || wtxt.includes('flow-content.google') || p.elapsedMs < 7000) {
+                                                if (!wIsEmpty || wtxt.includes('GENERATION_COMPLETE') || wtxt.includes('flow-content.google') || p.elapsedMs < 7000 || p.elapsedMs % 60000 < 4000) {
                                                     try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'WuwhI_resp', freq: wtxt.substring(0,6000), ts: Date.now(), http: wresp.status, t: Math.round(p.elapsedMs/1000)+'s', hasComplete: wtxt.includes('GENERATION_COMPLETE'), hasFlowContent: wtxt.includes('flow-content.google'), isEmpty: wIsEmpty }) }); } catch(_) {}
                                                 }
                                                 const wUrl = _extractVideoUrl(wtxt);
@@ -1275,13 +1275,19 @@ async function ensureR2VPoller() {
                                                         return { opId: p.opId, url: null, method: 'T2V_WuwhI_wait', debug: `state=${stM2?stM2[1]||stM2[0]:'?'} http=${wresp.status} t=${Math.round(p.elapsedMs/1000)}s`, extractedMid: midFb, extractedPid: pidFb, extractedWid: widFb };
                                                     }
                                                 } catch(_) {}
-                                                // Direct URL fallback: ONLY when WuwhI returned non-[] content (video confirmed done)
-                                                // Do NOT trigger on elapsed time — video may not be ready yet at 180s → 403
+                                                // Direct URL fallback case 1: WuwhI returned non-[] (video confirmed done)
                                                 if (p.mid && !wIsEmpty) {
                                                     const directUrl = 'https://flow-content.google/video/' + p.mid;
                                                     try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: 'wuwhi_nonempty', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now(), wtxtPre: wtxt.substring(0,200) }) }); } catch(_) {}
                                                     window._fluxyOpClaimed[p.opId] = directUrl;
                                                     return { opId: p.opId, url: directUrl, method: 'T2V_direct_mid_wuwhi_done' };
+                                                }
+                                                // Direct URL fallback case 2: 900s+ elapsed — video must be done by now even if WuwhI still []
+                                                if (p.mid && p.elapsedMs > 900000) {
+                                                    const directUrl = 'https://flow-content.google/video/' + p.mid;
+                                                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: 'timeout_900s', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now() }) }); } catch(_) {}
+                                                    window._fluxyOpClaimed[p.opId] = directUrl;
+                                                    return { opId: p.opId, url: directUrl, method: 'T2V_direct_mid_900s' };
                                                 }
                                                 const stM = wtxt.match(/"GENERATION_COMPLETE"|"state"[^:]*:[^"]*"([A-Z_]+)"/);
                                                 return { opId: p.opId, url: null, method: 'T2V_WuwhI_wait', debug: `state=${stM?stM[1]||stM[0]:'?'} http=${wresp.status} t=${Math.round(p.elapsedMs/1000)}s resp=${wtxt.substring(0,100)}` };

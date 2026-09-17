@@ -692,7 +692,7 @@ class VeoEngine {
 
         // Poll auth.pendingR2VVideoUrls[operationId] — Extension (background.js) điền vào khi video xong
         let videoUrl = null;
-        const T2V_MAX_POLLS = 120; // 120 × 5s = 600s = 10 phút
+        const T2V_MAX_POLLS = 240; // 240 × 5s = 1200s = 20 phút
         for (let poll = 0; poll < T2V_MAX_POLLS; poll++) {
             await new Promise(r => setTimeout(r, 5000));
 
@@ -714,7 +714,7 @@ class VeoEngine {
             delete auth.pendingR2VVideoUrls[operationId];
         }
 
-        if (!videoUrl) throw new Error('Video gen timeout 600s — không nhận được URL từ Extension poll');
+        if (!videoUrl) throw new Error('Video gen timeout 1200s — không nhận được URL từ Extension poll');
         return { videoUrl };
     }
 

@@ -1147,23 +1147,15 @@ async function ensureR2VPoller() {
                                         const _cap = window._fluxyCapturedUrls || [];
                                         // Log _fluxyCapturedUrls every ~30s for diagnosis
                                         if (p.elapsedMs < 8000 || p.elapsedMs % 30000 < 4000) {
-                                            try { fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_cap_urls', count: _cap.length, urls: _cap.slice(-3).map(c=>c&&c.url?c.url.substring(0,80):'?'), ts: Date.now(), t: Math.round(p.elapsedMs/1000)+'s', intercepted: !!window._fluxyFetchIntercepted }) }); } catch(_) {}
+                                            try { fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_cap_urls', count: _cap.length, urls: _cap.slice(-3).map(c=>c&&c.url?c.url.substring(0,100):'?'), ts: Date.now(), t: Math.round(p.elapsedMs/1000)+'s', intercepted: !!window._fluxyFetchIntercepted, mid8: (p.mid||'').substring(0,8), hasMatch: !!(p.mid && _cap.some(c=>c&&c.url&&c.url.includes(p.mid))) }) }); } catch(_) {}
                                         }
-                                        if (_cap.length > 0) {
-                                            // Try match by mediaId first (most specific)
+                                        if (_cap.length > 0 && p.mid) {
+                                            // ONLY match by mediaId — "intercepted_any" removed (causes wrong library URL)
                                             for (const cu of _cap) {
                                                 if (!cu || !cu.url) continue;
-                                                if (p.mid && cu.url.includes(p.mid) && (cu.url.includes('flow-content.google') || cu.url.includes('storage.googleapis.com') || cu.url.match(/\.mp4/))) {
+                                                if (cu.url.includes(p.mid) && (cu.url.includes('flow-content.google') || cu.url.includes('storage.googleapis.com') || cu.url.match(/\.mp4/))) {
                                                     window._fluxyOpClaimed[p.opId] = cu.url;
                                                     return { opId: p.opId, url: cu.url, method: 'T2V_intercepted_mid' };
-                                                }
-                                            }
-                                            // Any video URL (when only one T2V is pending)
-                                            for (const cu of _cap) {
-                                                if (!cu || !cu.url) continue;
-                                                if (cu.url.includes('flow-content.google/video/') && !window._fluxyOpClaimed[p.opId]) {
-                                                    window._fluxyOpClaimed[p.opId] = cu.url;
-                                                    return { opId: p.opId, url: cu.url, method: 'T2V_intercepted_any' };
                                                 }
                                             }
                                         }
@@ -1985,10 +1977,15 @@ async function downloadFlowContentVideo(videoUrl, operationId, saveVideoUrl, tab
         }
     }
 
-    // === All methods failed → gửi HTTPS URL về Electron (sẽ retry qua pendingFlowVideoDownload) ===
-    _dlLog(`❌ [FlowDL] ALL methods failed, sending HTTPS URL back`, operationId);
+    // === All methods failed → gửi HTTPS URL + flow-content.google cookies về Electron ===
+    _dlLog(`❌ [FlowDL] ALL methods failed, sending HTTPS URL + cookies back`, operationId);
+    let fcCookieStr = '';
+    try {
+        const fcCookies = await new Promise(resolve => chrome.cookies.getAll({ domain: 'flow-content.google' }, resolve));
+        fcCookieStr = (fcCookies || []).map(c => `${c.name}=${c.value}`).join('; ');
+    } catch(_) {}
     fetch(saveVideoUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ operationId, videoUrl }) }).catch(() => {});
+        body: JSON.stringify({ operationId, videoUrl, flowContentCookie: fcCookieStr || undefined }) }).catch(() => {});
 }
 
 // TẢI VIDEO 1080P QUA CHROME.DOWNLOADS (Chrome native — xử lý flow-content.google đúng cách)

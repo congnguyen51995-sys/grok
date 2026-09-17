@@ -258,10 +258,14 @@ expressApp.post('/api/save-flow-r2v-result', (req, res) => {
 });
 // Extension poll jwpduf thành công → lưu videoUrl để veo-engine lấy
 expressApp.post('/api/save-flow-r2v-video', (req, res) => {
-    const { operationId, videoUrl } = req.body || {};
+    const { operationId, videoUrl, flowContentCookie } = req.body || {};
     if (operationId && videoUrl) {
         if (!global.googleLabsAuth.pendingR2VVideoUrls) global.googleLabsAuth.pendingR2VVideoUrls = {};
         global.googleLabsAuth.pendingR2VVideoUrls[operationId] = videoUrl;
+        if (flowContentCookie) {
+            global.googleLabsAuth.flowContentCookie = flowContentCookie;
+            console.log(`[R2V] flow-content.google cookie captured (${flowContentCookie.length} chars)`);
+        }
         console.log(`[R2V] Extension poll → videoUrl saved for opId ${operationId.substring(0, 16)}...`);
     }
     res.json({ ok: true });

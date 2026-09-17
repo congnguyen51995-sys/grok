@@ -659,14 +659,12 @@ class VeoEngine {
     static async generateVideoViaFlowBatchexecute(prompt, aspectRatio, modelName, duration, sendLog, taskId) {
         const auth = global.googleLabsAuth;
         const projectId = auth.projectId;
-        const aspectCode = this.mapVideoAspectCodeForFlow(aspectRatio); // video-specific: 16:9=2, 9:16=1
+        const aspectCode = this.mapVideoAspectCodeForFlow(aspectRatio);
         const dur = parseInt((duration || '8s').replace(/[^0-9]/g, '')) || 8;
-        const modelCode = this.mapFlowVideoModelCode(modelName, dur); // dur baked into model code
+        const modelCode = this.mapFlowVideoModelCode(modelName, dur);
 
         sendLog(`[JOBID:${taskId}] Flow video via Extension: model=${modelCode} dur=${dur}s aspect=${aspectCode}`, 'info');
 
-        // Mutex: chỉ 1 task được dùng Extension tại một thời điểm (tránh ghi đè pendingFlowVideoGen)
-        // Mutex giải phóng SAU KHI lấy được operationId, trước khi poll → các task khác có thể dùng Extension song song với polling
         sendLog(`[JOBID:${taskId}] Đang gửi lệnh qua Extension — chờ operationId...`, 'info');
         const { operationId, extAt } = await VeoEngine._withFlowExtMutex(async () => {
             auth.flowVideoGenResult = null;
@@ -692,7 +690,7 @@ class VeoEngine {
             return { operationId: opId, extAt: res.at };
         });
 
-        // Chỉ chờ Extension poll via as29s (Extension có cookie, backend không có → jwpduf 502)
+        // Poll auth.pendingR2VVideoUrls[operationId] — Extension (background.js) điền vào khi video xong
         let videoUrl = null;
         const T2V_MAX_POLLS = 120; // 120 × 5s = 600s = 10 phút
         for (let poll = 0; poll < T2V_MAX_POLLS; poll++) {
@@ -711,13 +709,12 @@ class VeoEngine {
             }
         }
 
-        // Kiểm tra lần cuối Extension poll
         if (!videoUrl && auth.pendingR2VVideoUrls?.[operationId]) {
             videoUrl = auth.pendingR2VVideoUrls[operationId];
             delete auth.pendingR2VVideoUrls[operationId];
         }
 
-        if (!videoUrl) throw new Error('Video gen timeout 360s — không nhận được URL từ jwpduf');
+        if (!videoUrl) throw new Error('Video gen timeout 600s — không nhận được URL từ Extension poll');
         return { videoUrl };
     }
 
@@ -773,17 +770,21 @@ class VeoEngine {
         // Poll jwpduf từ Node.js — mutex đã giải phóng, các task khác có thể dùng Extension
         let currentAt = r2vExtAt || auth.atToken;
         let videoUrl = null;
+        let downloadRequested = false; // đã nhờ Extension download flow-content.google URL chưa
         const MAX_R2V_POLLS = 100; // 500s (~8.3 phút) — R2V với voice cần thêm thời gian
         for (let poll = 0; poll < MAX_R2V_POLLS; poll++) {
             await new Promise(r => setTimeout(r, 5000));
 
-            // Kiểm tra Extension đã poll được URL chưa (từ /api/save-flow-r2v-video)
+            // Extension đã download xong → file:// path sẵn sàng
             if (auth.pendingR2VVideoUrls?.[operationId]) {
                 videoUrl = auth.pendingR2VVideoUrls[operationId];
                 delete auth.pendingR2VVideoUrls[operationId];
-                sendLog(`[JOBID:${taskId}] Extension poll thành công: ${videoUrl.slice(0, 80)}...`, 'info');
+                sendLog(`[JOBID:${taskId}] Extension download thành công: ${videoUrl.slice(0, 80)}...`, 'info');
                 break;
             }
+
+            // Đã nhờ Extension download → chờ file path (không poll jwpduf nữa để tránh trùng)
+            if (downloadRequested) continue;
 
             // Refresh AT mỗi 10 polls (~50s) để tránh AT hết hạn
             if (poll > 0 && poll % 10 === 0) {
@@ -811,10 +812,20 @@ class VeoEngine {
                 || pollRawBody.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.webm[^"]{0,300})"/)
                 || pollRawBody.match(/"(https:(?:\\\/|\/){2}lh3\.googleusercontent\.com\/ais[^"]{10,})"/);
             if (rawUrlMatch) {
-                videoUrl = rawUrlMatch[1]
+                const foundUrl = rawUrlMatch[1]
                     .replace(/\\u003d/g, '=').replace(/\\u0026/g, '&')
                     .replace(/\\u002f/g, '/').replace(/\\\//g, '/');
-                break;
+                if (foundUrl.includes('flow-content.google')) {
+                    // flow-content.google cần Chrome cookie — nhờ Extension download qua chrome.downloads
+                    sendLog(`[JOBID:${taskId}] R2V URL tìm thấy → nhờ Extension download qua chrome.downloads...`, 'info');
+                    auth.pendingFlowVideoDownload = { url: foundUrl, operationId };
+                    auth.flowVideoDownloadTriggered = false;
+                    downloadRequested = true;
+                    // Tiếp tục poll để chờ file:// path từ pendingR2VVideoUrls
+                } else {
+                    videoUrl = foundUrl;
+                    break;
+                }
             }
 
             if (poll % 6 === 5) {
@@ -1856,6 +1867,15 @@ class VeoEngine {
 
     static async downloadMedia(url, destPath, useAuth = false) {
         if (!url || typeof url !== 'string') throw new Error(`URL không hợp lệ: ${url}`);
+        // Extension đã download qua chrome.downloads → copy vào outputFolder rồi xóa file temp
+        if (url.startsWith('file://')) {
+            const localPath = url.replace(/^file:\/\//i, '');
+            console.log(`[downloadMedia] file:// → copy from ${localPath} → ${destPath}`);
+            const fs = require('fs');
+            fs.copyFileSync(localPath, destPath);
+            try { fs.unlinkSync(localPath); } catch (_) {} // xóa file temp trong Chrome Downloads
+            return;
+        }
         const auth = global.googleLabsAuth;
         const options = { redirect: 'follow' };
 
@@ -1864,9 +1884,15 @@ class VeoEngine {
         const isFlowContent = url.includes('flow-content.google');
 
         if (isFlowContent) {
-            // Signed CDN URL (Expires+KeyName+Signature) — auth nằm trong URL, không cần cookie/bearer
+            // flow-content.google: dùng cookie riêng của domain này (không phải flow.google.com cookie)
+            const fcCookie = auth?.flowContentCookie || auth?.cookie || '';
+            const hasCookie = !!fcCookie;
+            console.log(`[downloadMedia] flow-content.google — fcCookie=${!!(auth?.flowContentCookie)} flow_cookie=${!!(auth?.cookie)} len=${fcCookie.length}`);
             options.headers = {
-                'user-agent': auth?.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'user-agent': auth?.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'referer': 'https://flow.google.com/',
+                'origin': 'https://flow.google.com',
+                ...(hasCookie ? { 'cookie': fcCookie } : {})
             };
         } else if (useAuth && !isGCSUrl) {
             // Nếu là labs.google URL: dùng full Chrome headers để tránh bị block
@@ -1976,6 +2002,17 @@ class VeoEngine {
             if (!fs.existsSync(outputFolder)) fs.mkdirSync(outputFolder, { recursive: true });
             const check = await this.checkCookie();
             if (!check.success) throw new Error(check.error);
+
+            // Nếu dùng Flow Direct API (cookie export), kiểm tra cookie còn sống trước khi bắt đầu
+            const auth = global.googleLabsAuth;
+            if (auth.flowCookies?.length > 0) {
+                const { checkCookiesValid } = require('./flow-direct-api');
+                const cookieCheck = await checkCookiesValid(auth.flowCookies);
+                if (!cookieCheck.valid) {
+                    throw new Error(`⚠️ Cookie flow.google.com hết hạn: ${cookieCheck.reason}\n\n→ Vào Settings → Extension → "Cookie trực tiếp" → dán cookie mới từ CocCoc`);
+                }
+                sendLog(`[Cookie] flow.google.com OK (${auth.flowCookies.length} cookies)`, 'info');
+            }
 
             sendLog(`Khởi động động cơ API...`, 'info');
 

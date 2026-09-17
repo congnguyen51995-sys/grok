@@ -1169,18 +1169,10 @@ async function ensureR2VPoller() {
                                                 try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_thumb_as29s', freq: at0.substring(0,4000), ts: Date.now(), thumbArgs, mid8: p.mid.substring(0,8), pid8: (p.pid||'').substring(0,8), wid8: (p.wid||p.opId||'').substring(0,8) }) }); } catch(_) {}
                                                 const au0 = _extractVideoUrl(at0);
                                                 if (au0) { window._fluxyOpClaimed[p.opId] = au0; return { opId: p.opId, url: au0, method: 'T2V_thumb_as29s_ok' }; }
-                                                // as29s failed → use direct URL from mediaId (thumbnail confirmed video is done)
-                                                const directUrlThumb = 'https://flow-content.google/video/' + p.mid;
-                                                window._fluxyOpClaimed[p.opId] = directUrlThumb;
-                                                return { opId: p.opId, url: directUrlThumb, method: 'T2V_direct_mid_thumb' };
-                                            } catch(_) {
-                                                // as29s threw → still try direct URL
-                                                if (p.mid) {
-                                                    const directUrlErr = 'https://flow-content.google/video/' + p.mid;
-                                                    window._fluxyOpClaimed[p.opId] = directUrlErr;
-                                                    return { opId: p.opId, url: directUrlErr, method: 'T2V_direct_mid_thumb_err' };
-                                                }
-                                            }
+                                                // as29s returned null — thumbnail detected but as29s has no URL yet
+                                                // Log full response for diagnosis
+                                                try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_thumb_as29s_null', at0: at0.substring(0,2000), ts: Date.now(), mid8: p.mid.substring(0,8) }) }); } catch(_) {}
+                                            } catch(_) {}
                                         }
 
                                         // Attempt 1: WuwhI — actual T2V polling endpoint (page calls every ~100ms)
@@ -1283,17 +1275,13 @@ async function ensureR2VPoller() {
                                                         return { opId: p.opId, url: null, method: 'T2V_WuwhI_wait', debug: `state=${stM2?stM2[1]||stM2[0]:'?'} http=${wresp.status} t=${Math.round(p.elapsedMs/1000)}s`, extractedMid: midFb, extractedPid: pidFb, extractedWid: widFb };
                                                     }
                                                 } catch(_) {}
-                                                // Direct URL fallback:
-                                                // 1) WuwhI stopped returning [] → video may be done
-                                                // 2) 180s elapsed → video almost certainly done
-                                                if (p.mid) {
-                                                    const wuwhiStillGenerating = !wtxt || wIsEmpty;
-                                                    if (!wuwhiStillGenerating || p.elapsedMs > 180000) {
-                                                        const directUrl = 'https://flow-content.google/video/' + p.mid;
-                                                        try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: wuwhiStillGenerating ? 'timeout_180s' : 'wuwhi_nonempty', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now() }) }); } catch(_) {}
-                                                        window._fluxyOpClaimed[p.opId] = directUrl;
-                                                        return { opId: p.opId, url: directUrl, method: wuwhiStillGenerating ? 'T2V_direct_mid_timeout' : 'T2V_direct_mid_wuwhi_done' };
-                                                    }
+                                                // Direct URL fallback: ONLY when WuwhI returned non-[] content (video confirmed done)
+                                                // Do NOT trigger on elapsed time — video may not be ready yet at 180s → 403
+                                                if (p.mid && !wIsEmpty) {
+                                                    const directUrl = 'https://flow-content.google/video/' + p.mid;
+                                                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: 'wuwhi_nonempty', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now(), wtxtPre: wtxt.substring(0,200) }) }); } catch(_) {}
+                                                    window._fluxyOpClaimed[p.opId] = directUrl;
+                                                    return { opId: p.opId, url: directUrl, method: 'T2V_direct_mid_wuwhi_done' };
                                                 }
                                                 const stM = wtxt.match(/"GENERATION_COMPLETE"|"state"[^:]*:[^"]*"([A-Z_]+)"/);
                                                 return { opId: p.opId, url: null, method: 'T2V_WuwhI_wait', debug: `state=${stM?stM[1]||stM[0]:'?'} http=${wresp.status} t=${Math.round(p.elapsedMs/1000)}s resp=${wtxt.substring(0,100)}` };

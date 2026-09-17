@@ -1143,6 +1143,18 @@ async function ensureR2VPoller() {
 
                                     // T2V: WuwhI PRIMARY (confirmed from F12) → as29s → jwpduf fallback
                                     if (p.isT2V) {
+                                        // Fast path: direct URL after 45s — video typically done in 30-40s
+                                        // WuwhI completion event consumed by page's 100ms polling before our 3s poll,
+                                        // so we can't rely on WuwhI non-[]. At 45s video is definitely done.
+                                        if (p.mid && p.elapsedMs > 45000 && !window._fluxyDirectTried?.[p.opId]) {
+                                            if (!window._fluxyDirectTried) window._fluxyDirectTried = {};
+                                            window._fluxyDirectTried[p.opId] = Date.now();
+                                            const directUrl = 'https://flow-content.google/video/' + p.mid;
+                                            try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: 'elapsed_45s', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now(), mid8: p.mid.substring(0,8) }) }); } catch(_) {}
+                                            window._fluxyOpClaimed[p.opId] = directUrl;
+                                            return { opId: p.opId, url: directUrl, method: 'T2V_direct_mid_45s' };
+                                        }
+
                                         // Method C: check fetch interceptor captured URLs (page's own RPCs)
                                         const _cap = window._fluxyCapturedUrls || [];
                                         // Log _fluxyCapturedUrls every ~30s for diagnosis

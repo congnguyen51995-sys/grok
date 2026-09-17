@@ -19,7 +19,7 @@ const SERVER_API = "http://127.0.0.1:3000/update-token";
 const CHECK_API = "http://127.0.0.1:3000/api/check-request";
 const SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 
-console.log("🚀 Fluxy Extension V3.13 - fix: WuwhI URL parse (aggr scan + WuwhI envelope), always capture WuwhI resp, chrome.downloads primary");
+console.log("🚀 Fluxy Extension V3.14 - fix T2V v4.9: as29s at 45s + declarativeNetRequest Referer inject + cookie url fix");
 
 // ══ webRequest: bắt URL video từ flow.google.com (đáng tin cậy hơn fetch interceptor) ══
 // Lưu { url, ts } cho mọi request video file từ tab flow.google.com
@@ -1143,14 +1143,30 @@ async function ensureR2VPoller() {
 
                                     // T2V: WuwhI PRIMARY (confirmed from F12) → as29s → jwpduf fallback
                                     if (p.isT2V) {
-                                        // Fast path: direct URL after 45s — video typically done in 30-40s
-                                        // WuwhI completion event consumed by page's 100ms polling before our 3s poll,
-                                        // so we can't rely on WuwhI non-[]. At 45s video is definitely done.
+                                        // At 45s+: video is definitely done (completes in 30-40s).
+                                        // First try as29s — may return a signed URL that bypasses CDN 403.
+                                        // Fall back to bare flow-content.google/video/UUID (requires Referer fix).
                                         if (p.mid && p.elapsedMs > 45000 && !window._fluxyDirectTried?.[p.opId]) {
                                             if (!window._fluxyDirectTried) window._fluxyDirectTried = {};
                                             window._fluxyDirectTried[p.opId] = Date.now();
+
+                                            // Try as29s — video done at 35s, as29s should have URL now
+                                            try {
+                                                const _as29sArgs = [p.mid, p.pid, p.wid || p.opId, 'CAE'];
+                                                const _as29sBody = JSON.stringify([[['as29s', JSON.stringify(_as29sArgs), null, 'generic']]]);
+                                                const _as29sResp = await fetch(`${BASE}?${mkUsp('as29s')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(_as29sBody)}&at=${encodeURIComponent(liveAt)}` });
+                                                const _as29sTxt = await _as29sResp.text();
+                                                const _as29sUrl = _extractVideoUrl(_as29sTxt);
+                                                try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_45s_as29s', hasUrl: !!_as29sUrl, url: _as29sUrl||null, raw: _as29sTxt.substring(0,2000), ts: Date.now(), mid8: p.mid.substring(0,8), pid8:(p.pid||'').substring(0,8), wid8:(p.wid||p.opId||'').substring(0,8) }) }); } catch(_) {}
+                                                if (_as29sUrl) {
+                                                    window._fluxyOpClaimed[p.opId] = _as29sUrl;
+                                                    return { opId: p.opId, url: _as29sUrl, method: 'T2V_45s_as29s_ok' };
+                                                }
+                                            } catch(_) {}
+
+                                            // Fallback: bare URL — download requires Referer injection (declarativeNetRequest)
                                             const directUrl = 'https://flow-content.google/video/' + p.mid;
-                                            try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: 'elapsed_45s', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now(), mid8: p.mid.substring(0,8) }) }); } catch(_) {}
+                                            try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: 'elapsed_45s_as29s_null', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now(), mid8: p.mid.substring(0,8) }) }); } catch(_) {}
                                             window._fluxyOpClaimed[p.opId] = directUrl;
                                             return { opId: p.opId, url: directUrl, method: 'T2V_direct_mid_45s' };
                                         }
@@ -1900,7 +1916,24 @@ const _dlLog = (msg, opId) => {
 async function downloadFlowContentVideo(videoUrl, operationId, saveVideoUrl, tabId = null) {
     _dlLog(`[FlowDL] START opId=${operationId.substring(0,8)} url=${videoUrl.substring(0,80)}`, operationId);
 
-    // === Primary: chrome.downloads (browser native — không bị CORS/CSP, dùng cookie browser) ===
+    // === Primary: chrome.downloads + Referer injection ===
+    // CDN hotlink protection: flow-content.google requires Referer: https://flow.google.com/
+    // chrome.downloads sends no Referer by default → 403. Fix via declarativeNetRequest.
+    const _DL_RULE_ID = 99901;
+    let _dlRuleAdded = false;
+    try {
+        await chrome.declarativeNetRequest.updateDynamicRules({
+            removeRuleIds: [_DL_RULE_ID],
+            addRules: [{
+                id: _DL_RULE_ID, priority: 1,
+                action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Referer', operation: 'set', value: 'https://flow.google.com/' }] },
+                condition: { urlFilter: 'flow-content.google/video/', resourceTypes: ['main_frame', 'sub_frame', 'media', 'other'] }
+            }]
+        });
+        _dlRuleAdded = true;
+        _dlLog('[FlowDL] Referer injected via declarativeNetRequest', operationId);
+    } catch(ruleErr) { _dlLog(`[FlowDL] Referer inject err: ${ruleErr.message}`, operationId); }
+
     try {
         const filename = `fluxy_dl_${operationId.substring(0,8)}_${Date.now()}.mp4`;
         const downloadId = await new Promise((resolve, reject) => {
@@ -1935,6 +1968,10 @@ async function downloadFlowContentVideo(videoUrl, operationId, saveVideoUrl, tab
         return;
     } catch (dlErr) {
         _dlLog(`⚠️ [FlowDL] chrome.downloads FAIL: ${dlErr.message} → MAIN world fetch`, operationId);
+    } finally {
+        if (_dlRuleAdded) {
+            try { await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [_DL_RULE_ID] }); } catch(_) {}
+        }
     }
 
     // === Secondary: MAIN world fetch (page context — bypass CDN CORS nếu CDN allow flow.google.com) ===
@@ -1987,7 +2024,8 @@ async function downloadFlowContentVideo(videoUrl, operationId, saveVideoUrl, tab
     _dlLog(`❌ [FlowDL] ALL methods failed, sending HTTPS URL + cookies back`, operationId);
     let fcCookieStr = '';
     try {
-        const fcCookies = await new Promise(resolve => chrome.cookies.getAll({ domain: 'flow-content.google' }, resolve));
+        // Use {url} not {domain} — captures all cookies sent to this URL (incl. parent .google TLD cookies like SAPISID)
+        const fcCookies = await new Promise(resolve => chrome.cookies.getAll({ url: 'https://flow-content.google/' }, resolve));
         fcCookieStr = (fcCookies || []).map(c => `${c.name}=${c.value}`).join('; ');
     } catch(_) {}
     fetch(saveVideoUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' },

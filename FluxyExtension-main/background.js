@@ -19,11 +19,12 @@ const SERVER_API = "http://127.0.0.1:3000/update-token";
 const CHECK_API = "http://127.0.0.1:3000/api/check-request";
 const SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 
-console.log("🚀 Fluxy Extension V2.6 - Cookie + AT token (batchexecute) support");
+console.log("🚀 Fluxy Extension V3.13 - fix: WuwhI URL parse (aggr scan + WuwhI envelope), always capture WuwhI resp, chrome.downloads primary");
 
 // ══ webRequest: bắt URL video từ flow.google.com (đáng tin cậy hơn fetch interceptor) ══
 // Lưu { url, ts } cho mọi request video file từ tab flow.google.com
 let _capturedR2VUrls = [];
+const SAVE_FLOW_VIDEO_URL = 'http://127.0.0.1:3000/api/save-flow-r2v-video';
 
 chrome.webRequest.onBeforeRequest.addListener(
     (details) => {
@@ -52,6 +53,8 @@ chrome.webRequest.onBeforeRequest.addListener(
             // Dọn cũ >30 phút
             const cutoff = Date.now() - 30 * 60 * 1000;
             _capturedR2VUrls = _capturedR2VUrls.filter(c => c.ts >= cutoff);
+            // KHÔNG auto-match với _pendingR2V ở đây — webRequest bắt cả video cũ trong thư viện
+            // URL chính xác được capture qua fetch interceptor (MAIN world) → _fluxyCapturedUrls
         }
     },
     { urls: ['<all_urls>'] }
@@ -140,6 +143,15 @@ setInterval(async () => {
 
         if (data.downloadVideo) {
             downloadVideoViaChrome(data.downloadVideo);
+        }
+
+        if (data.downloadFlowVideo) {
+            // Electron tìm thấy flow-content.google URL từ jwpduf poll → nhờ Extension download
+            const { url: dfUrl, operationId: dfOpId } = data.downloadFlowVideo;
+            if (dfUrl && dfOpId) {
+                console.log(`📥 [downloadFlowVideo] Nhận lệnh download R2V: opId=${dfOpId.substring(0,8)}`);
+                downloadFlowContentVideo(dfUrl, dfOpId, SAVE_FLOW_VIDEO_URL);
+            }
         }
     } catch (e) {}
 }, 1000);
@@ -519,6 +531,123 @@ async function executeFlowImageGen() {
     }
 }
 
+// ══ FETCH INTERCEPTOR: inject vào page để nghe lén MỌI batchexecute response ══
+async function injectFetchInterceptor(tabId, operationId) {
+    const genStartTs = Date.now();
+    try {
+        const result = await chrome.scripting.executeScript({
+            target: { tabId },
+            world: 'MAIN',
+            func: (opId, startTs) => {
+                if (window._fluxyFetchIntercepted) {
+                    // Already installed — update opId và xóa URL cũ (capture trước gen này)
+                    if (opId && !window._fluxyInterceptOpIds.includes(opId)) window._fluxyInterceptOpIds.push(opId);
+                    // Xóa URL stale — chỉ giữ URL capture trong 10s cuối (tránh video cũ trên trang)
+                    window._fluxyCapturedUrls = (window._fluxyCapturedUrls || []).filter(c => c.ts >= startTs - 10000);
+                    return 'already_patched';
+                }
+                window._fluxyFetchIntercepted = true;
+                window._fluxyInterceptOpIds = opId ? [opId] : [];
+                window._fluxyCapturedUrls = [];
+
+                const sentUrls = new Set();
+
+                function extractVideoUrl(text) {
+                    const dec = s => s.replace(/\\\//g,'/').replace(/\\{1,2}u003d/g,'=').replace(/\\{1,2}u0026/g,'&');
+                    // 1. Structured parse: wrb.fr as29s envelope
+                    try {
+                        const wm = text.match(/"wrb\.fr","as29s","((?:[^"\\]|\\.)*)"/);
+                        if (wm) {
+                            const inner = JSON.parse(JSON.parse('"' + wm[1] + '"'));
+                            const cands = [inner?.[5]?.[12], inner?.[6]?.[0]?.[13],
+                                           inner?.[0]?.[5]?.[12], inner?.[0]?.[6]?.[0]?.[13]];
+                            for (const u of cands) {
+                                if (typeof u === 'string' && u.startsWith('https')) return dec(u);
+                            }
+                        }
+                    } catch(_) {}
+                    // 2. Structured parse: wrb.fr WuwhI envelope
+                    try {
+                        const wm2 = text.match(/"wrb\.fr","WuwhI","((?:[^"\\]|\\.)*)"/);
+                        if (wm2) {
+                            const inner2 = JSON.parse(JSON.parse('"' + wm2[1] + '"'));
+                            const str2 = JSON.stringify(inner2);
+                            const um2 = str2.match(/"(https:\/\/flow-content\.google\/(?:video|image)\/[^"]{10,})"/);
+                            if (um2) return dec(um2[1]);
+                        }
+                    } catch(_) {}
+                    // 3. Aggressive: bất kỳ flow-content.google URL trong text
+                    const aggrM = text.match(/https:(?:\/|\\\/){2}flow-content\.google(?:\/|\\\/)[^\s"'\\]{10,}/);
+                    if (aggrM) {
+                        const u = aggrM[0].replace(/\\\//g,'/').replace(/\\u003d/gi,'=').replace(/\\u0026/gi,'&').split(/["'\s\\]/)[0];
+                        if (u.length > 30) return u;
+                    }
+                    // 4. Single-encoded URL patterns
+                    const patterns = [
+                        /"(https:\/\/flow-content\.google\/video\/[^"]{10,})"/,
+                        /"(https:\/\/storage\.googleapis\.com\/ais-[^"]{10,}\.mp4[^"]{0,300})"/,
+                        /"(https:\/\/[^"]{5,}\.mp4(?:\?[^"]{0,300})?)"/,
+                        /"(https:\/\/[^"]{5,}\.webm(?:\?[^"]{0,300})?)"/,
+                        /"(https:\/\/lh3\.googleusercontent\.com\/ais[^"]{10,})"/,
+                    ];
+                    // 5. Double-encoded (backslash-slash)
+                    const patterns2 = [
+                        /\\"(https:\\\/\\\/flow-content\.google\\\/video\\\/[^\\"]{10,})\\"/,
+                        /\\"(https:\\\/\\\/[^\\"]{5,}\.mp4[^\\"]{0,300})\\"/,
+                        /\\"(https:\\\/\\\/storage\.googleapis\.com\\\/ais-[^\\"]{10,})\\"/,
+                    ];
+                    for (const p of patterns) { const m = text.match(p); if (m) return dec(m[1]); }
+                    for (const p of patterns2) { const m = text.match(p); if (m) return dec(m[1]); }
+                    return null;
+                }
+
+                function onResponse(text, source) {
+                    if (!text || text.length < 20) return;
+                    const url = extractVideoUrl(text);
+                    if (!url || sentUrls.has(url)) return;
+                    sentUrls.add(url);
+                    const opId = window._fluxyInterceptOpIds[0] || 'intercepted';
+                    console.log('[FLUXY INTERCEPT] 🎯 Video URL captured from', source, ':', url.substring(0, 100));
+                    // Push vào _fluxyCapturedUrls — SW poller sẽ đọc và save (CSP chặn fetch trực tiếp)
+                    window._fluxyCapturedUrls.push({ url, ts: Date.now() });
+                }
+
+                // Patch window.fetch
+                const _origFetch = window.fetch;
+                window.fetch = async function(resource, init) {
+                    const resp = await _origFetch.call(this, resource, init);
+                    const reqUrl = typeof resource === 'string' ? resource : resource?.url || '';
+                    if (reqUrl.includes('batchexecute') || reqUrl.includes('AiSandboxAngular')) {
+                        resp.clone().text().then(txt => onResponse(txt, 'fetch')).catch(() => {});
+                    }
+                    return resp;
+                };
+
+                // Patch XMLHttpRequest
+                const _origOpen = XMLHttpRequest.prototype.open;
+                const _origSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.open = function(m, u, ...a) {
+                    this._fluxyReqUrl = u;
+                    return _origOpen.call(this, m, u, ...a);
+                };
+                XMLHttpRequest.prototype.send = function(...a) {
+                    if (this._fluxyReqUrl && (this._fluxyReqUrl.includes('batchexecute') || this._fluxyReqUrl.includes('AiSandboxAngular'))) {
+                        this.addEventListener('load', function() { onResponse(this.responseText, 'xhr'); });
+                    }
+                    return _origSend.call(this, ...a);
+                };
+
+                console.log('[FLUXY] ✅ Fetch interceptor installed — watching batchexecute responses');
+                return 'installed';
+            },
+            args: [operationId || null, genStartTs]
+        });
+        console.log(`✅ injectFetchInterceptor tab=${tabId} result=${result?.[0]?.result}`);
+    } catch (e) {
+        console.log(`⚠️ injectFetchInterceptor failed: ${e.message}`);
+    }
+}
+
 // TẠO VIDEO QUA FLOW.GOOGLE.COM BATCHEXECUTE (MAIN world — browser session đầy đủ)
 let isGeneratingFlowVideo = false;
 async function executeFlowVideoGen() {
@@ -665,39 +794,55 @@ async function executeFlowVideoGen() {
                     if (!yhRes.ok) return { error: `YhhmEf HTTP ${yhRes.status}: ${yhBody.substring(0, 300)}` };
 
                     const yhData = parseBatch(yhBody, 'YhhmEf');
+                    // DEBUG: gửi raw YhhmEf response để xem UUID nào là operationId thật
+                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'YhhmEf_raw', freq: yhBody.substring(0, 4000), ts: Date.now() }) }); } catch(_) {}
                     if (!yhData) return { error: `YhhmEf no data. yhBody=${yhBody.substring(0, 300)}` };
 
-                    // Tách operation ID và mediaId từ response
-                    let operationId = null, mediaId = null;
+                    // Tách operationId, mediaId, serverPid, workflowId từ response
+                    // HAR confirms: parsed[2][0][0] = operationId (WuwhI key)
+                    //               parsed[3][0][0] = mediaId (URL path + as29s arg[0])
+                    //               parsed[3][0][1] = serverPid (as29s arg[1]) ← CRITICAL
+                    //               parsed[3][0][2] = workflowId (= operationId in observed data, as29s arg[2])
+                    let operationId = null, mediaId = null, workflowId = null, serverPid = null;
                     try {
                         const parsed = typeof yhData === 'string' ? JSON.parse(yhData) : yhData;
                         const str = JSON.stringify(parsed);
-                        // UUID pattern — first UUID = operationId (dùng cho jwpduf polling)
-                        const uuidM = str.match(/"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/i);
-                        if (uuidM) operationId = uuidM[1];
-                        // Long string pattern (>20 chars, alphanumeric)
+                        // Lọc uuid1/uuid2/uuid3 (do chính mình tạo) — tìm UUID do server assign
+                        const myUuids = new Set([uuid1.toLowerCase(), uuid2.toLowerCase(), uuid3.toLowerCase()]);
+                        const allUuids = [...str.matchAll(/"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/gi)].map(m => m[1]);
+                        operationId = allUuids.find(u => !myUuids.has(u.toLowerCase())) || allUuids[0] || null;
+                        if (!operationId) {
+                            const uuidM = str.match(/"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/i);
+                            if (uuidM) operationId = uuidM[1];
+                        }
                         if (!operationId) {
                             const longM = str.match(/"([A-Za-z0-9_\-]{20,})"/);
                             if (longM) operationId = longM[1];
                         }
-                        // Array[0] direct
                         if (!operationId && Array.isArray(parsed) && typeof parsed[0] === 'string' && parsed[0].length > 8) {
                             operationId = parsed[0];
                         }
-                        // mediaId từ parsed[3][0][0] — tuple [mediaId, projId, workflowId, "CAE"]
-                        // T2V: workflowId === operationId, mediaId KHÁC operationId (dùng cho as29s + URL path)
-                        if (Array.isArray(parsed?.[3]?.[0]) && typeof parsed[3][0][0] === 'string' && parsed[3][0][0].includes('-')) {
-                            mediaId = parsed[3][0][0];
+                        const isServerUuid = (s) => typeof s === 'string' && s.includes('-') && !myUuids.has(s.toLowerCase());
+                        // parsed[3][0] = [mediaId, serverPid, workflowId, "CAE", ...] (HAR confirmed)
+                        if (Array.isArray(parsed?.[3]?.[0])) {
+                            if (isServerUuid(parsed[3][0][0])) mediaId = parsed[3][0][0];
+                            if (isServerUuid(parsed[3][0][1])) serverPid = parsed[3][0][1];  // ← as29s arg[1]
+                            if (isServerUuid(parsed[3][0][2])) workflowId = parsed[3][0][2];
                         }
-                        // Fallback: UUID thứ 2 trong response (khác operationId)
+                        // mediaId fallback: parsed[2][0][3][4]
+                        if (!mediaId && Array.isArray(parsed?.[2]?.[0]?.[3]) && isServerUuid(parsed[2][0][3][4])) {
+                            mediaId = parsed[2][0][3][4];
+                        }
+                        // mediaId fallback: second server UUID
                         if (!mediaId && operationId) {
-                            const allUuids = [...str.matchAll(/"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/gi)].map(m => m[1]);
-                            mediaId = allUuids.find(u => u !== operationId) || null;
+                            const serverUuids = allUuids.filter(u => !myUuids.has(u.toLowerCase()));
+                            mediaId = serverUuids.find(u => u.toLowerCase() !== operationId.toLowerCase()) || null;
                         }
+                        if (!workflowId) workflowId = operationId;
                     } catch(e) {}
                     if (!operationId) return { error: `YhhmEf: không tìm thấy operationId. data=${JSON.stringify(yhData).substring(0, 200)}` };
 
-                    return { operationId, mediaId, at };
+                    return { operationId, mediaId, serverPid, workflowId, at, bl, fsid };
                 } catch (e) { return { error: e.message }; }
             },
             args: [genParams]
@@ -708,21 +853,31 @@ async function executeFlowVideoGen() {
             console.log('❌ Flow video gen lỗi:', res.error);
             await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: res.error }) });
         } else if (res?.operationId) {
-            console.log('✅ YhhmEf OK, operationId:', res.operationId.substring(0, 20), '..., mediaId:', (res.mediaId || 'none').substring(0, 8));
-            // Thêm T2V vào Extension poller — wid=operationId (T2V: workflowId===operationId)
+            console.log('✅ YhhmEf OK, operationId:', res.operationId.substring(0, 20), '..., mediaId:', (res.mediaId || 'none').substring(0, 8), 'wid:', (res.workflowId || 'none').substring(0, 8), 'serverPid:', (res.serverPid || 'none').substring(0, 8), 'genPid:', (genParams.projectId||'none').substring(0,8));
+            // Clear stale T2V ops trước khi thêm mới (tránh op cũ cướp URL mới)
+            for (const [staleId, staleP] of _pendingR2V) {
+                if (staleP.isT2V) { console.log(`[T2V] Clear stale T2V op ${staleId.substring(0,8)}`); _pendingR2V.delete(staleId); }
+            }
+            // Thêm T2V vào Extension poller — wid=workflowId (HAR: = operationId, as29s arg[2])
+            // CRITICAL: pid phải dùng serverPid (parsed[3][0][1] từ YhhmEf) chứ không phải genParams.projectId
             _pendingR2V.set(res.operationId, {
-                pid: genParams.projectId,
-                bl: genParams.bl || '',
-                fsid: genParams.fsid || '',
+                pid: res.serverPid || genParams.projectId,
+                bl: res.bl || genParams.bl || '',
+                fsid: res.fsid || genParams.fsid || '',
                 at: res.at,
-                wid: res.operationId,
+                wid: res.workflowId || res.operationId,
                 mid: res.mediaId || null,
                 isT2V: true,
                 genStartTs: Date.now(),
                 tabId: tab.id,
-                startTime: Date.now()
+                startTime: Date.now(),
+                prompt: genParams.prompt,
+                modelCode: genParams.modelCode,
+                aspectCode: genParams.aspectCode,
             });
             ensureR2VPoller();
+            // Inject fetch interceptor vào page — nghe lén MỌI batchexecute response của page
+            injectFetchInterceptor(tab.id, res.operationId).catch(() => {});
             await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operationId: res.operationId, at: res.at }) });
         } else {
             await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'NO_RESULT' }) });
@@ -742,7 +897,7 @@ let _r2vPollerActive = false;
 async function ensureR2VPoller() {
     if (_r2vPollerActive) return;
     _r2vPollerActive = true;
-    const SAVE_VIDEO = 'http://127.0.0.1:3000/api/save-flow-r2v-video';
+    const SAVE_VIDEO = SAVE_FLOW_VIDEO_URL; // global constant
 
     let _pollIter = 0;
     while (_pendingR2V.size > 0) {
@@ -766,15 +921,22 @@ async function ensureR2VPoller() {
             if (!cap.url.includes('flow-content.google')) continue;
             for (const [opId, p] of _pendingR2V) {
                 if (cap.claimedBy) continue;
-                // FIX: T2V với p.mid=null → extract mediaId từ /video/<uuid>/ URL
-                if (p.isT2V && !p.mid && cap.url.includes('/video/')) {
-                    const uuidM = cap.url.match(/\/video\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+                // FIX: T2V với p.mid=null → match bất kỳ video/image URL từ flow-content
+                if (p.isT2V && !p.mid && (cap.url.includes('/video/') || cap.url.includes('/image/'))) {
+                    const uuidM = cap.url.match(/\/(?:video|image)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
                     if (uuidM) {
                         p.mid = uuidM[1];
                         cap.claimedBy = opId;
-                        console.log(`[T2V ${opId.substring(0,8)}] ✅ A-webRequest extracted mediaId=${p.mid.substring(0,8)} URL=${cap.url.substring(0,70)}`);
-                        _pendingR2V.delete(opId);
-                        fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: cap.url }) }).catch(()=>{});
+                        if (cap.url.includes('/video/')) {
+                            console.log(`[T2V ${opId.substring(0,8)}] ✅ A-webRequest video mid=${p.mid.substring(0,8)}`);
+                            _pendingR2V.delete(opId);
+                            fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: cap.url }) })
+                                .then(r => console.log(`[T2V-A SAVE] ok status=${r.status} opId=${opId.substring(0,8)}`))
+                                .catch(e => console.log(`[T2V-A SAVE] FAIL opId=${opId.substring(0,8)} err=`, e.message));
+                        } else {
+                            console.log(`[T2V ${opId.substring(0,8)}] 🖼️ Thumbnail mid=${p.mid.substring(0,8)} → as29s next poll`);
+                            p.thumbnailDetected = true;
+                        }
                         break;
                     }
                     continue;
@@ -787,7 +949,9 @@ async function ensureR2VPoller() {
                     // Video URL trực tiếp → tải về ngay
                     console.log(`[R2V ${opId.substring(0,8)}] ✅ A-webRequest VIDEO: ${cap.url.substring(0,70)}`);
                     _pendingR2V.delete(opId);
-                    fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: cap.url }) }).catch(()=>{});
+                    fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: cap.url }) })
+                        .then(r => console.log(`[A-SAVE] ok status=${r.status} opId=${opId.substring(0,8)}`))
+                        .catch(e => console.log(`[A-SAVE] FAIL opId=${opId.substring(0,8)} err=`, e.message));
                 } else if (cap.url.includes('/image/')) {
                     // Thumbnail image → video ĐÃ XONG → đánh dấu để poll as29s gấp
                     console.log(`[R2V ${opId.substring(0,8)}] 🖼️ Thumbnail detected → poll as29s ngay`);
@@ -806,7 +970,10 @@ async function ensureR2VPoller() {
                 isT2V: p.isT2V || false,
                 genStartTs: p.genStartTs,
                 elapsedMs: now - p.startTime,
-                thumbnailDetected: p.thumbnailDetected || false
+                thumbnailDetected: p.thumbnailDetected || false,
+                prompt: p.prompt || '',
+                modelCode: p.modelCode || '',
+                aspectCode: p.aspectCode || 2
             });
         }
         for (const [tabId, ops] of byTab) {
@@ -821,17 +988,31 @@ async function ensureR2VPoller() {
                         const captured = window._fluxyCapturedUrls || [];
 
                         // Method C: _fluxyCapturedUrls — chỉ nhận video URL (không nhận image)
+                        const videoCaptures = captured.filter(c => c.url.includes('/video/') && !claimed.has(c.url));
                         for (const p of pendingOps) {
                             if (window._fluxyOpClaimed[p.opId]) {
                                 results[p.opId] = { url: window._fluxyOpClaimed[p.opId], method: 'C_recall' };
                                 continue;
                             }
-                            const exact = captured.find(c => c.url.includes(p.mid || p.opId) && c.url.includes('/video/') && !claimed.has(c.url));
+                            // Try exact match by mediaId first
+                            const exact = p.mid
+                                ? videoCaptures.find(c => c.url.includes(p.mid) && !claimed.has(c.url))
+                                : null;
                             if (exact) {
                                 window._fluxyOpClaimed[p.opId] = exact.url;
                                 claimed.add(exact.url);
                                 window._fluxyCapturedUrls = captured.filter(c => c.url !== exact.url);
                                 results[p.opId] = { url: exact.url, method: 'C_exact' };
+                            } else if ((p.isT2V || p.isR2V) && videoCaptures.length > 0 && !results[p.opId]) {
+                                // T2V hoặc R2V: chỉ nhận URL capture SAU khi generation bắt đầu (tránh video cũ trên trang)
+                                const freshCaptures = videoCaptures.filter(c => c.ts >= (p.genStartTs || 0) && !claimed.has(c.url));
+                                const anyVideo = freshCaptures.find(c => c.url.includes('flow-content.google'));
+                                if (anyVideo) {
+                                    window._fluxyOpClaimed[p.opId] = anyVideo.url;
+                                    claimed.add(anyVideo.url);
+                                    window._fluxyCapturedUrls = captured.filter(c => c.url !== anyVideo.url);
+                                    results[p.opId] = { url: anyVideo.url, method: 'C_t2v_fresh' };
+                                }
                             }
                         }
 
@@ -886,6 +1067,18 @@ async function ensureR2VPoller() {
                         const needPoll = pendingOps.filter(p => !results[p.opId]);
                         if (needPoll.length > 0) {
                             const BASE = 'https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute';
+                            // Fallback AT từ page scripts nếu window._flowAuthData chưa set (sau reload)
+                            if (!window._flowAuthData?.at) {
+                                try {
+                                    const sc = Array.from(document.querySelectorAll('script')).map(x=>x.textContent||'').join('\n');
+                                    const mAt = sc.match(/"xsrf"\s*,\s*"(AIQ-[^"]+)"|"SNlM0e"\s*:\s*"(AIQ-[^"]+)"/);
+                                    const extractedAt = mAt ? (mAt[1] || mAt[2] || '') : '';
+                                    if (extractedAt.length > 20) {
+                                        if (!window._flowAuthData) window._flowAuthData = {};
+                                        window._flowAuthData.at = extractedAt;
+                                    }
+                                } catch(_) {}
+                            }
                             const _decodeUrl = s => s
                                 .replace(/\\\//g,'/')
                                 .replace(/\\{1,2}u003d/g,'=')
@@ -893,7 +1086,33 @@ async function ensureR2VPoller() {
                                 .replace(/\\{1,2}u002f/g,'/')
                                 .replace(/\\+$/, '');
                             const _extractVideoUrl = txt => {
-                                // Single-encoded: "https://..." (URL is a direct JSON value)
+                                // 1. Structured parse: wrb.fr as29s envelope
+                                try {
+                                    const wm = txt.match(/"wrb\.fr","as29s","((?:[^"\\]|\\.)*)"/);
+                                    if (wm) {
+                                        const inner = JSON.parse(JSON.parse('"' + wm[1] + '"'));
+                                        const u = inner?.[5]?.[12] || inner?.[6]?.[0]?.[13]
+                                            || inner?.[0]?.[5]?.[12] || inner?.[0]?.[6]?.[0]?.[13];
+                                        if (typeof u === 'string' && u.startsWith('http')) return _decodeUrl(u);
+                                    }
+                                } catch(_) {}
+                                // 2. Structured parse: wrb.fr WuwhI envelope
+                                try {
+                                    const wm2 = txt.match(/"wrb\.fr","WuwhI","((?:[^"\\]|\\.)*)"/);
+                                    if (wm2) {
+                                        const inner2 = JSON.parse(JSON.parse('"' + wm2[1] + '"'));
+                                        const str2 = JSON.stringify(inner2);
+                                        const um2 = str2.match(/"(https:\/\/flow-content\.google\/(?:video|image)\/[^"]{10,})"/);
+                                        if (um2) return _decodeUrl(um2[1]);
+                                    }
+                                } catch(_) {}
+                                // 3. Aggressive: bất kỳ flow-content.google URL trong raw text
+                                const aggrM = txt.match(/https:(?:\/|\\\/){2}flow-content\.google(?:\/|\\\/)[^\s"'\\]{10,}/);
+                                if (aggrM) {
+                                    const u = aggrM[0].replace(/\\\//g,'/').replace(/\\u003d/gi,'=').replace(/\\u0026/gi,'&').split(/["'\s\\]/)[0];
+                                    if (u.length > 30) return u;
+                                }
+                                // 4. Single-encoded patterns
                                 const m1 = txt.match(/"(https:(?:\\\/|\/){2}flow-content\.google\/(?:video|image)\/[^"]{10,})"/)
                                     || txt.match(/"(https:(?:\\\/|\/){2}storage\.googleapis\.com\/ais-[^"]{10,})"/)
                                     || txt.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.mp4[^"]{0,800})"/)
@@ -901,7 +1120,7 @@ async function ensureR2VPoller() {
                                     || txt.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.webm[^"]{0,300})"/)
                                     || txt.match(/"(https:(?:\\\/|\/){2}lh3\.googleusercontent\.com\/ais[^"]{10,})"/);
                                 if (m1) return _decodeUrl(m1[1]);
-                                // Double-encoded: \"https:...\" (URL inside JSON-string inside JSON-string)
+                                // 5. Double-encoded patterns
                                 const m2 = txt.match(/\\"(https:(?:\\\/|\/){2}flow-content\.google\/(?:video|image)\/[^\\"]{10,})\\"/)
                                     || txt.match(/\\"(https:(?:\\\/|\/){2}storage\.googleapis\.com\/ais-[^\\"]{10,})\\"/)
                                     || txt.match(/\\"(https:(?:\\\/|\/){2}[^\\"]{5,}\.mp4[^\\"]{0,800})\\"/)
@@ -922,19 +1141,187 @@ async function ensureR2VPoller() {
                                         return u;
                                     };
 
-                                    // T2V: jwpduf → as29s (R2V-style) → WuwhI fallback
+                                    // T2V: WuwhI PRIMARY (confirmed from F12) → as29s → jwpduf fallback
                                     if (p.isT2V) {
-                                        // Attempt 1: jwpduf — khi video done có thể trả URL trực tiếp
+                                        // Method C: check fetch interceptor captured URLs (page's own RPCs)
+                                        const _cap = window._fluxyCapturedUrls || [];
+                                        // Log _fluxyCapturedUrls every ~30s for diagnosis
+                                        if (p.elapsedMs < 8000 || p.elapsedMs % 30000 < 4000) {
+                                            try { fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_cap_urls', count: _cap.length, urls: _cap.slice(-3).map(c=>c&&c.url?c.url.substring(0,80):'?'), ts: Date.now(), t: Math.round(p.elapsedMs/1000)+'s', intercepted: !!window._fluxyFetchIntercepted }) }); } catch(_) {}
+                                        }
+                                        if (_cap.length > 0) {
+                                            // Try match by mediaId first (most specific)
+                                            for (const cu of _cap) {
+                                                if (!cu || !cu.url) continue;
+                                                if (p.mid && cu.url.includes(p.mid) && (cu.url.includes('flow-content.google') || cu.url.includes('storage.googleapis.com') || cu.url.match(/\.mp4/))) {
+                                                    window._fluxyOpClaimed[p.opId] = cu.url;
+                                                    return { opId: p.opId, url: cu.url, method: 'T2V_intercepted_mid' };
+                                                }
+                                            }
+                                            // Any video URL (when only one T2V is pending)
+                                            for (const cu of _cap) {
+                                                if (!cu || !cu.url) continue;
+                                                if (cu.url.includes('flow-content.google/video/') && !window._fluxyOpClaimed[p.opId]) {
+                                                    window._fluxyOpClaimed[p.opId] = cu.url;
+                                                    return { opId: p.opId, url: cu.url, method: 'T2V_intercepted_any' };
+                                                }
+                                            }
+                                        }
+                                        // Fast path: thumbnail mid captured by webRequest → as29s ngay
+                                        if (p.thumbnailDetected && p.mid) {
+                                            try {
+                                                const thumbArgs = [p.mid, p.pid, p.wid || p.opId, 'CAE'];
+                                                const af0 = JSON.stringify([[['as29s', JSON.stringify(thumbArgs), null, 'generic']]]);
+                                                const ar0 = await fetch(`${BASE}?${mkUsp('as29s')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(af0)}&at=${encodeURIComponent(liveAt)}` });
+                                                const at0 = await ar0.text();
+                                                try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_thumb_as29s', freq: at0.substring(0,4000), ts: Date.now(), thumbArgs, mid8: p.mid.substring(0,8), pid8: (p.pid||'').substring(0,8), wid8: (p.wid||p.opId||'').substring(0,8) }) }); } catch(_) {}
+                                                const au0 = _extractVideoUrl(at0);
+                                                if (au0) { window._fluxyOpClaimed[p.opId] = au0; return { opId: p.opId, url: au0, method: 'T2V_thumb_as29s_ok' }; }
+                                                // as29s failed → use direct URL from mediaId (thumbnail confirmed video is done)
+                                                const directUrlThumb = 'https://flow-content.google/video/' + p.mid;
+                                                window._fluxyOpClaimed[p.opId] = directUrlThumb;
+                                                return { opId: p.opId, url: directUrlThumb, method: 'T2V_direct_mid_thumb' };
+                                            } catch(_) {
+                                                // as29s threw → still try direct URL
+                                                if (p.mid) {
+                                                    const directUrlErr = 'https://flow-content.google/video/' + p.mid;
+                                                    window._fluxyOpClaimed[p.opId] = directUrlErr;
+                                                    return { opId: p.opId, url: directUrlErr, method: 'T2V_direct_mid_thumb_err' };
+                                                }
+                                            }
+                                        }
+
+                                        // Attempt 1: WuwhI — actual T2V polling endpoint (page calls every ~100ms)
+                                        // Full MEDIA_GENERATION payload confirmed from F12 capture 2026-09-15
+                                        if (p.prompt && p.modelCode) {
+                                            try {
+                                                const nowMs = Date.now();
+                                                const mediaSettingsJson = JSON.stringify({
+                                                    videoModelKey: p.modelCode,
+                                                    aspectRatio: p.aspectCode || 2,
+                                                    count: 1,
+                                                    structuredPrompt: { parts: [{ text: p.prompt }] }
+                                                });
+                                                let expIds = '';
+                                                try {
+                                                    const s = Array.from(document.querySelectorAll('script')).map(x=>x.textContent||'').join('\n');
+                                                    const em = s.match(/(\d{6,9}(?:,\d{6,9}){30,})/);
+                                                    if (em) expIds = em[1];
+                                                } catch(_) {}
+                                                if (!expIds) expIds = '106210719,106077941,106681111,106501717,106611001,106536612,119157484,1714245,106486771,106555492,106637415,106299202,106556077,106437280,106104244,1706538,106238955,106592798,106184493,106585383,106599983,106281924,106210711,105484652,106322568,106430149,106625630,106615367,106225453,106676866,106259075,105746691,106577881,106430287,106432686,106262194,106210380,106681103,106536604,106486763,106555484,106637407,106299194,106556069,106592790,106585375,106599975,106210378,106430141,106625362,106615359,106676858,106577873,106430279';
+                                                const wCaps = [
+                                                    ["IS_MOBILE", ["type.googleapis.com/google.protobuf.BoolValue", []]],
+                                                    ["IS_TABLET", ["type.googleapis.com/google.protobuf.BoolValue", []]],
+                                                    ["IS_DESKTOP", ["type.googleapis.com/google.protobuf.BoolValue", [1]]],
+                                                    ["IS_ANGULAR", ["type.googleapis.com/google.protobuf.BoolValue", [1]]],
+                                                    ["USER_AGENT", ["type.googleapis.com/google.protobuf.StringValue", [navigator.userAgent]]],
+                                                    ["TOOL_NAME", ["type.googleapis.com/google.protobuf.StringValue", ["PINHOLE"]]],
+                                                    ["MEDIA_GENERATION_TYPE", ["type.googleapis.com/google.protobuf.StringValue", ["video"]]],
+                                                    ["AUDIO_FAILURE_PREFERENCE", ["type.googleapis.com/google.protobuf.BoolValue", []]],
+                                                    ["MEDIA_GENERATION_SETTINGS", ["type.googleapis.com/google.protobuf.StringValue", [mediaSettingsJson]]],
+                                                    ["PROJECT_ID", ["type.googleapis.com/google.protobuf.StringValue", [p.pid]]],
+                                                    ["MEDIA_GENERATION_PAYGATE_TIER", ["type.googleapis.com/google.protobuf.StringValue", ["PAYGATE_TIER_TWO"]]]
+                                                ];
+                                                const wInner = [[["MEDIA_GENERATION", [p.opId, [Math.floor(nowMs/1000), (nowMs%1000)*1000000], null, wCaps, expIds]]]];
+                                                const wfreq = JSON.stringify([[['WuwhI', JSON.stringify(wInner), null, 'generic']]]);
+                                                const wresp = await fetch(`${BASE}?${mkUsp('WuwhI')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(wfreq)}&at=${encodeURIComponent(liveAt)}` });
+                                                const wtxt = await wresp.text();
+                                                // Only capture: first 2 polls (to verify WuwhI is running), OR when non-empty / interesting
+                                                const wIsEmpty = wtxt.includes('"WuwhI",\\"[]"') || wtxt.includes('"WuwhI","[]"');
+                                                if (!wIsEmpty || wtxt.includes('GENERATION_COMPLETE') || wtxt.includes('flow-content.google') || p.elapsedMs < 7000) {
+                                                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'WuwhI_resp', freq: wtxt.substring(0,6000), ts: Date.now(), http: wresp.status, t: Math.round(p.elapsedMs/1000)+'s', hasComplete: wtxt.includes('GENERATION_COMPLETE'), hasFlowContent: wtxt.includes('flow-content.google'), isEmpty: wIsEmpty }) }); } catch(_) {}
+                                                }
+                                                const wUrl = _extractVideoUrl(wtxt);
+                                                if (wUrl) {
+                                                    window._fluxyOpClaimed[p.opId] = wUrl;
+                                                    return { opId: p.opId, url: wUrl, method: 'T2V_WuwhI_ok' };
+                                                }
+                                                // Aggressive URL scan: tìm bất kỳ flow-content.google URL trong toàn bộ WuwhI text
+                                                const aggrM = wtxt.match(/https:(?:\/|\\\/){2}flow-content\.google(?:\/|\\\/)[^\s"'\\]{10,}/);
+                                                if (aggrM) {
+                                                    const aggrUrl = aggrM[0].replace(/\\\/|%2F/g, '/').replace(/\\u0026/gi,'&').replace(/\\u003d/gi,'=').split(/["'\s\\]/)[0];
+                                                    if (aggrUrl.includes('flow-content.google')) {
+                                                        window._fluxyOpClaimed[p.opId] = aggrUrl;
+                                                        return { opId: p.opId, url: aggrUrl, method: 'T2V_WuwhI_aggr' };
+                                                    }
+                                                }
+                                                // as29s fallback — thử ngay sau WuwhI (works when video is ready)
+                                                // T2V: workflowId = operationId (same UUID)
+                                                const asArgs = p.mid ? [p.mid, p.pid, p.wid || p.opId, 'CAE'] : [p.opId, p.pid, p.wid || p.opId, 'CAE'];
+                                                const asFreq = JSON.stringify([[['as29s', JSON.stringify(asArgs), null, 'generic']]]);
+                                                try {
+                                                    const ar = await fetch(`${BASE}?${mkUsp('as29s')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(asFreq)}&at=${encodeURIComponent(liveAt)}` });
+                                                    const atxt = await ar.text();
+                                                    // Capture as29s: only when non-null response (interesting) OR first poll
+                                                    const asIsNull = atxt.includes('"as29s",null') || atxt.includes('"as29s",\\"null\\"');
+                                                    if (!asIsNull || p.elapsedMs < 4000) {
+                                                        try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_as29s_debug', freq: atxt.substring(0,6000), ts: Date.now(), asArgs, mid8: (p.mid||'').substring(0,8), pid8: (p.pid||'').substring(0,8), wid8: (p.wid||p.opId||'').substring(0,8), t: Math.round(p.elapsedMs/1000)+'s', isNull: asIsNull }) }); } catch(_) {}
+                                                    }
+                                                    const aUrl = _extractVideoUrl(atxt);
+                                                    if (aUrl) {
+                                                        window._fluxyOpClaimed[p.opId] = aUrl;
+                                                        return { opId: p.opId, url: aUrl, method: 'T2V_WuwhI_as29s_ok' };
+                                                    }
+                                                } catch(ae) {
+                                                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_as29s_err', err: ae.message, ts: Date.now() }) }); } catch(_) {}
+                                                }
+                                                // jwpduf fallback: lấy [mediaId, serverPid, workflowId] thực từ server → as29s đúng args
+                                                // CRITICAL: jwpduf trả về [mediaId, serverPid, workflowId, 'CAE']
+                                                //           p.pid có thể là clientProjectId (sai) → phải dùng serverPid từ jwpduf
+                                                try {
+                                                    const jfreqFb = JSON.stringify([[['jwpduf', JSON.stringify([p.opId]), null, 'generic']]]);
+                                                    const jrespFb = await fetch(`${BASE}?${mkUsp('jwpduf')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(jfreqFb)}&at=${encodeURIComponent(liveAt)}` });
+                                                    const jtxtFb = await jrespFb.text();
+                                                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_jwpduf_fb', freq: jtxtFb.substring(0,4000), ts: Date.now(), opId8: p.opId.substring(0,8) }) }); } catch(_) {}
+                                                    const jUrlFb = _extractVideoUrl(jtxtFb);
+                                                    if (jUrlFb) { window._fluxyOpClaimed[p.opId] = jUrlFb; return { opId: p.opId, url: jUrlFb, method: 'T2V_WuwhI_jwpduf_direct' }; }
+                                                    // Bắt cả 3 UUID: [mediaId, serverPid, workflowId, 'CAE']
+                                                    const jmFb = jtxtFb.match(/\\"([0-9a-f-]{36})\\",\\"([0-9a-f-]{36})\\",\\"([0-9a-f-]{36})\\",\\"CAE\\"/i)
+                                                              || jtxtFb.match(/"([0-9a-f-]{36})","([0-9a-f-]{36})","([0-9a-f-]{36})","CAE"/i);
+                                                    if (jmFb) {
+                                                        const midFb = jmFb[1], pidFb = jmFb[2], widFb = jmFb[3];
+                                                        const afFb = JSON.stringify([[['as29s', JSON.stringify([midFb, pidFb, widFb, 'CAE']), null, 'generic']]]);
+                                                        const arFb = await fetch(`${BASE}?${mkUsp('as29s')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(afFb)}&at=${encodeURIComponent(liveAt)}` });
+                                                        const atxtFb = await arFb.text();
+                                                        try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_jwpduf_as29s_fb', freq: atxtFb.substring(0,4000), ts: Date.now(), mid8: midFb.substring(0,8), pid8: pidFb.substring(0,8), wid8: widFb.substring(0,8) }) }); } catch(_) {}
+                                                        const aUrlFb = _extractVideoUrl(atxtFb);
+                                                        if (aUrlFb) { window._fluxyOpClaimed[p.opId] = aUrlFb; return { opId: p.opId, url: aUrlFb, method: 'T2V_WuwhI_then_as29s' }; }
+                                                        // Trả về wid/mid/pid để SW cập nhật _pendingR2V cho poll tiếp theo
+                                                        const stM2 = wtxt.match(/"GENERATION_COMPLETE"|"state"[^:]*:[^"]*"([A-Z_]+)"/);
+                                                        return { opId: p.opId, url: null, method: 'T2V_WuwhI_wait', debug: `state=${stM2?stM2[1]||stM2[0]:'?'} http=${wresp.status} t=${Math.round(p.elapsedMs/1000)}s`, extractedMid: midFb, extractedPid: pidFb, extractedWid: widFb };
+                                                    }
+                                                } catch(_) {}
+                                                // Direct URL fallback:
+                                                // 1) WuwhI stopped returning [] → video may be done
+                                                // 2) 180s elapsed → video almost certainly done
+                                                if (p.mid) {
+                                                    const wuwhiStillGenerating = !wtxt || wIsEmpty;
+                                                    if (!wuwhiStillGenerating || p.elapsedMs > 180000) {
+                                                        const directUrl = 'https://flow-content.google/video/' + p.mid;
+                                                        try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: wuwhiStillGenerating ? 'timeout_180s' : 'wuwhi_nonempty', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now() }) }); } catch(_) {}
+                                                        window._fluxyOpClaimed[p.opId] = directUrl;
+                                                        return { opId: p.opId, url: directUrl, method: wuwhiStillGenerating ? 'T2V_direct_mid_timeout' : 'T2V_direct_mid_wuwhi_done' };
+                                                    }
+                                                }
+                                                const stM = wtxt.match(/"GENERATION_COMPLETE"|"state"[^:]*:[^"]*"([A-Z_]+)"/);
+                                                return { opId: p.opId, url: null, method: 'T2V_WuwhI_wait', debug: `state=${stM?stM[1]||stM[0]:'?'} http=${wresp.status} t=${Math.round(p.elapsedMs/1000)}s resp=${wtxt.substring(0,100)}` };
+                                            } catch(we) {
+                                                return { opId: p.opId, url: null, method: 'T2V_WuwhI_err', debug: we.message };
+                                            }
+                                        }
+
+                                        // Attempt 2: jwpduf — fallback khi không có prompt/modelCode
                                         const jfreq = JSON.stringify([[['jwpduf', JSON.stringify([p.opId]), null, 'generic']]]);
                                         const jresp = await fetch(`${BASE}?${mkUsp('jwpduf')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(jfreq)}&at=${encodeURIComponent(liveAt)}` });
                                         const jtxt = await jresp.text();
+                                        if (p.elapsedMs < 30000) {
+                                            try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_jwpduf_debug', freq: jtxt.substring(0,3000), ts: Date.now(), http: jresp.status }) }); } catch(_) {}
+                                        }
                                         const jUrl = _extractVideoUrl(jtxt);
                                         if (jUrl) {
                                             window._fluxyOpClaimed[p.opId] = jUrl;
-                                            return { opId: p.opId, url: jUrl, method: 'T2V_jwpduf', debug: null };
+                                            return { opId: p.opId, url: jUrl, method: 'T2V_jwpduf' };
                                         }
-
-                                        // Attempt 2: Parse workflowId từ jwpduf response → gọi as29s (giống R2V)
                                         const jm = jtxt.match(/\\"([0-9a-f-]{36})\\",\\"[0-9a-f-]{36}\\",\\"([0-9a-f-]{36})\\",\\"CAE\\"/i)
                                                  || jtxt.match(/"([0-9a-f-]{36})","[0-9a-f-]{36}","([0-9a-f-]{36})","CAE"/i);
                                         if (jm) {
@@ -948,37 +1335,10 @@ async function ensureR2VPoller() {
                                                 const aUrl = _extractVideoUrl(atxt);
                                                 if (aUrl) {
                                                     window._fluxyOpClaimed[p.opId] = aUrl;
-                                                    return { opId: p.opId, url: aUrl, method: 'T2V_as29s', debug: null };
+                                                    return { opId: p.opId, url: aUrl, method: 'T2V_as29s' };
                                                 }
                                             } catch(_) {}
                                         }
-
-                                        // Attempt 3: WuwhI với mediaId (thử nhiều payload formats)
-                                        if (p.mid) {
-                                            try {
-                                                let wUrl = null;
-                                                for (const wPayload of [
-                                                    JSON.stringify([p.mid]),
-                                                    JSON.stringify([p.pid, p.mid]),
-                                                    JSON.stringify([p.mid, 'VIDEO']),
-                                                    JSON.stringify([p.mid, 'ORIGINAL_VIDEO']),
-                                                ]) {
-                                                    const wfreq = JSON.stringify([[['WuwhI', wPayload, null, 'generic']]]);
-                                                    const wresp = await fetch(`${BASE}?${mkUsp('WuwhI')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(wfreq)}&at=${encodeURIComponent(liveAt)}` });
-                                                    const wtxt = await wresp.text();
-                                                    wUrl = _extractVideoUrl(wtxt);
-                                                    if (wUrl) {
-                                                        window._fluxyOpClaimed[p.opId] = wUrl;
-                                                        return { opId: p.opId, url: wUrl, method: 'T2V_WuwhI', debug: `payload=${wPayload.substring(0,40)}` };
-                                                    }
-                                                }
-                                                const jErrM = jtxt.match(/\["e",(\d+)/);
-                                                return { opId: p.opId, url: null, method: 'T2V_null', debug: `jwpduf_err=${jErrM?jErrM[1]:'?'} WuwhI_no_url mid=${p.mid.substring(0,8)}` };
-                                            } catch(we) {
-                                                return { opId: p.opId, url: null, method: 'T2V_null', debug: `WuwhI_err=${we.message}` };
-                                            }
-                                        }
-
                                         const errM = jtxt.match(/\["e",(\d+)/);
                                         return { opId: p.opId, url: null, method: 'T2V_jwpduf_null', debug: `err=${errM?errM[1]:'?'} http=${jresp.status} resp=${jtxt.substring(0,150)}`, rawResp: jtxt.substring(0,3000) };
                                     }
@@ -1034,11 +1394,28 @@ async function ensureR2VPoller() {
                 for (const [opId, result] of Object.entries(results)) {
                     if (result?.url) {
                         console.log(`[R2V ${opId.substring(0,8)}] ✅ ${result.method}: ${result.url.substring(0,70)}`);
+                        const dlTabId = _pendingR2V.get(opId)?.tabId || tabId; // lấy trước khi delete
                         _pendingR2V.delete(opId);
-                        fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: result.url }) }).catch(()=>{});
-                    } else if (result?.debug) {
-                        // Log as29s response vào SW console để debug
-                        console.log(`[R2V ${opId.substring(0,8)}] ❌ ${result.method}: ${result.debug}`);
+                        // flow-content.google: dùng MAIN world fetch (page context, đúng Origin/cookies)
+                        if (result.url.includes('flow-content.google')) {
+                            console.log(`[T2V/R2V ${opId.substring(0,8)}] URL → MAIN world download (tabId=${dlTabId})`);
+                            downloadFlowContentVideo(result.url, opId, SAVE_VIDEO, dlTabId);
+                        } else {
+                            fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: result.url }) })
+                                .then(r => console.log(`[SAVE_VIDEO] ok status=${r.status} opId=${opId.substring(0,8)} method=${result.method}`))
+                                .catch(e => console.log(`[SAVE_VIDEO] FAIL opId=${opId.substring(0,8)} method=${result.method} err=`, e.message));
+                        }
+                    } else if (result) {
+                        // Cập nhật _pendingR2V với wid/mid thực nếu jwpduf trả về
+                        const pendingOp = _pendingR2V.get(opId);
+                        if (pendingOp) {
+                            if (result.extractedWid && !pendingOp.wid) { pendingOp.wid = result.extractedWid; console.log(`[R2V ${opId.substring(0,8)}] 🔧 wid: ${result.extractedWid.substring(0,8)}`); }
+                            if (result.extractedMid && !pendingOp.mid) { pendingOp.mid = result.extractedMid; console.log(`[R2V ${opId.substring(0,8)}] 🔧 mid: ${result.extractedMid.substring(0,8)}`); }
+                            if (result.extractedPid) { pendingOp.pid = result.extractedPid; console.log(`[R2V ${opId.substring(0,8)}] 🔧 pid: ${result.extractedPid.substring(0,8)}`); }
+                        }
+                        if (result.debug) {
+                            console.log(`[R2V ${opId.substring(0,8)}] ❌ ${result.method}: ${result.debug}`);
+                        }
                         if (result.rawResp) {
                             fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'jwpduf_response', freq: result.rawResp, ts: Date.now() }) }).catch(()=>{});
                         }
@@ -1050,6 +1427,7 @@ async function ensureR2VPoller() {
                 }
             }
         }
+
     }
     _r2vPollerActive = false;
 }
@@ -1296,6 +1674,10 @@ async function executeFlowR2VGen() {
             const _opId = res.operationId;
             console.log(`✅ MZZa6b OK, opId:${_opId.substring(0,8)}, wid:${res.workflowId?.substring(0,8)||'null'}, allUuids:[${res._allUuids?.join(',')||''}]`);
             await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operationId: _opId, at: res.at }) });
+            // Clear stale R2V ops trước khi thêm mới (tránh op cũ cướp URL mới)
+            for (const [staleId, staleP] of _pendingR2V) {
+                if (staleP.isR2V) { console.log(`[R2V] Clear stale R2V op ${staleId.substring(0,8)}`); _pendingR2V.delete(staleId); }
+            }
             // Thêm vào shared poller (không tạo IIFE riêng nữa)
             _pendingR2V.set(_opId, {
                 pid: genParams.projectId,
@@ -1303,11 +1685,14 @@ async function executeFlowR2VGen() {
                 fsid: genParams.fsid || '',
                 at: res.at,
                 wid: res.workflowId || null,
+                isR2V: true,
                 genStartTs: Date.now(),
                 tabId: tab.id,
                 startTime: Date.now()
             });
             ensureR2VPoller();
+            // Inject fetch interceptor — bắt URL từ page's batchexecute response (giống T2V)
+            injectFetchInterceptor(tab.id, _opId).catch(() => {});
         } else {
             await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'NO_RESULT' }) });
         }
@@ -1500,6 +1885,110 @@ async function executeVideoGen() {
     } finally {
         isGeneratingVideo = false;
     }
+}
+
+// TẢI VIDEO T2V/R2V flow-content.google
+// Primary: chrome.downloads (browser-level — không CORS, không CSP, dùng cookie đúng)
+// Secondary: MAIN world fetch (page context — có thể bị CSP block connect-src)
+// Log mỗi bước về Electron /api/capture-rpc-body để debug trong cmd.exe
+const _dlLog = (msg, opId) => {
+    console.log(msg);
+    fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rpc: 'FlowDL', freq: msg, ts: Date.now(), opId: (opId||'').substring(0,8) })
+    }).catch(() => {});
+};
+
+async function downloadFlowContentVideo(videoUrl, operationId, saveVideoUrl, tabId = null) {
+    _dlLog(`[FlowDL] START opId=${operationId.substring(0,8)} url=${videoUrl.substring(0,80)}`, operationId);
+
+    // === Primary: chrome.downloads (browser native — không bị CORS/CSP, dùng cookie browser) ===
+    try {
+        const filename = `fluxy_dl_${operationId.substring(0,8)}_${Date.now()}.mp4`;
+        const downloadId = await new Promise((resolve, reject) => {
+            chrome.downloads.download({ url: videoUrl, filename, saveAs: false, conflictAction: 'uniquify' }, (id) => {
+                if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+                else resolve(id);
+            });
+        });
+        _dlLog(`[FlowDL] chrome.downloads started ID=${downloadId}`, operationId);
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                chrome.downloads.onChanged.removeListener(listener);
+                reject(new Error('chrome.downloads timeout 300s'));
+            }, 300000);
+            function listener(delta) {
+                if (delta.id !== downloadId) return;
+                if (delta.state?.current === 'complete') {
+                    clearTimeout(timer); chrome.downloads.onChanged.removeListener(listener); resolve();
+                } else if (delta.state?.current === 'interrupted') {
+                    clearTimeout(timer); chrome.downloads.onChanged.removeListener(listener);
+                    reject(new Error(`interrupted: ${delta.error?.current || '?'}`));
+                }
+            }
+            chrome.downloads.onChanged.addListener(listener);
+        });
+        const items = await new Promise(resolve => chrome.downloads.search({ id: downloadId }, resolve));
+        const filePath = items?.[0]?.filename;
+        if (!filePath) throw new Error('no filePath from chrome.downloads.search');
+        _dlLog(`✅ [FlowDL] chrome.downloads OK: ${filePath}`, operationId);
+        await fetch(saveVideoUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ operationId, videoUrl: 'file://' + filePath.replace(/\\/g, '/') }) });
+        return;
+    } catch (dlErr) {
+        _dlLog(`⚠️ [FlowDL] chrome.downloads FAIL: ${dlErr.message} → MAIN world fetch`, operationId);
+    }
+
+    // === Secondary: MAIN world fetch (page context — bypass CDN CORS nếu CDN allow flow.google.com) ===
+    const activeTabId = tabId || (await findActiveTab().catch(() => null))?.id || null;
+    if (activeTabId) {
+        try {
+            _dlLog(`[FlowDL] MAIN world fetch start tab=${activeTabId}`, operationId);
+            const mwResult = await chrome.scripting.executeScript({
+                target: { tabId: activeTabId },
+                world: 'MAIN',
+                func: async (url) => {
+                    try {
+                        const resp = await fetch(url, { credentials: 'include' });
+                        if (!resp.ok) return { error: `HTTP ${resp.status}` };
+                        const buf = await resp.arrayBuffer();
+                        const bytes = new Uint8Array(buf);
+                        const CHUNK = 8192;
+                        const parts = [];
+                        for (let i = 0; i < bytes.length; i += CHUNK) {
+                            parts.push(String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CHUNK, bytes.length))));
+                        }
+                        return { b64: btoa(parts.join('')), size: buf.byteLength };
+                    } catch (e) { return { error: e.message }; }
+                },
+                args: [videoUrl]
+            });
+            const mwData = mwResult?.[0]?.result;
+            if (mwData?.b64 && !mwData.error) {
+                const sizeMB = (mwData.size / 1024 / 1024).toFixed(1);
+                _dlLog(`[FlowDL] MAIN world OK ${sizeMB}MB → sending to Electron...`, operationId);
+                const binaryStr = atob(mwData.b64);
+                const outBytes = new Uint8Array(binaryStr.length);
+                for (let i = 0; i < binaryStr.length; i++) outBytes[i] = binaryStr.charCodeAt(i);
+                const saveResp = await fetch('http://127.0.0.1:3000/api/save-r2v-video-bytes', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/octet-stream', 'x-operation-id': operationId },
+                    body: outBytes.buffer
+                });
+                if (!saveResp.ok) throw new Error(`save-r2v-video-bytes HTTP ${saveResp.status}`);
+                _dlLog(`✅ [FlowDL] MAIN world fetch done ${sizeMB}MB`, operationId);
+                return;
+            }
+            _dlLog(`⚠️ [FlowDL] MAIN world fail: ${mwData?.error || 'no result'}`, operationId);
+        } catch (mwErr) {
+            _dlLog(`⚠️ [FlowDL] MAIN world err: ${mwErr.message}`, operationId);
+        }
+    }
+
+    // === All methods failed → gửi HTTPS URL về Electron (sẽ retry qua pendingFlowVideoDownload) ===
+    _dlLog(`❌ [FlowDL] ALL methods failed, sending HTTPS URL back`, operationId);
+    fetch(saveVideoUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ operationId, videoUrl }) }).catch(() => {});
 }
 
 // TẢI VIDEO 1080P QUA CHROME.DOWNLOADS (Chrome native — xử lý flow-content.google đúng cách)
@@ -1896,6 +2385,25 @@ registerSelf();
 
 // ── KEEPALIVE: MV3 service worker bị Chrome tắt sau 30s idle ─────────────────
 // chrome.alarms đảm bảo service worker được đánh thức lại mỗi 25s, duy trì setInterval
+// Re-inject fetch interceptor khi tab reload (tránh mất capture sau khi user reload trang flow)
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.status !== 'complete') return;
+    // Kiểm tra xem tab này có pending T2V/R2V op không
+    let hasOp = false;
+    for (const [, p] of _pendingR2V) { if (p.tabId === tabId) { hasOp = true; break; } }
+    if (!hasOp) return;
+    // Re-inject sau khi page load xong (delay nhỏ để Angular khởi động)
+    setTimeout(() => {
+        for (const [opId, p] of _pendingR2V) {
+            if (p.tabId === tabId) {
+                console.log(`[Poller] Tab ${tabId} reloaded — re-inject interceptor for opId=${opId.substring(0,8)}`);
+                injectFetchInterceptor(tabId, opId).catch(() => {});
+                break; // chỉ inject 1 lần (interceptor nghe tất cả ops trên tab)
+            }
+        }
+    }, 2000);
+});
+
 chrome.alarms.create('fluxy-keepalive', { periodInMinutes: 0.5 });  // 30 giây (minimum Chrome cho phép)
 
 // Chrome API ping mỗi 20s — chrome.storage call giữ SW sống (fetch tới 127.0.0.1 không đủ)

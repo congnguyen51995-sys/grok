@@ -100,6 +100,8 @@ global.googleLabsAuth = {
     videoDownloadDone: false,       // Extension set true khi xong
     videoDownloadError: null,       // Extension set error string nếu lỗi
     videoDownloadPath: null,        // đường dẫn file tạm Extension đã lưu (nếu có)
+    // ── DIRECT API (không cần Extension) ─────────────────────────────────────
+    flowCookies: null,              // Array cookie JSON export từ CocCoc → flow-direct-api dùng
 };
 
 // 1. Hứng Token, Cookie & VÂN TAY từ Extension
@@ -160,6 +162,10 @@ expressApp.get('/api/check-request', (req, res) => {
         // để các poll tiếp theo không kích hoạt chrome.downloads lần 2 (tránh file trùng)
         downloadVideo: (global.googleLabsAuth.pendingVideoDownload && !global.googleLabsAuth.videoDownloadTriggered)
             ? (global.googleLabsAuth.videoDownloadTriggered = true, global.googleLabsAuth.pendingVideoDownload)
+            : null,
+        // Lệnh download flow-content.google video qua chrome.downloads (Electron không có cookie .google)
+        downloadFlowVideo: (global.googleLabsAuth.pendingFlowVideoDownload && !global.googleLabsAuth.flowVideoDownloadTriggered)
+            ? (global.googleLabsAuth.flowVideoDownloadTriggered = true, global.googleLabsAuth.pendingFlowVideoDownload)
             : null
     });
 });
@@ -261,13 +267,41 @@ expressApp.post('/api/save-flow-r2v-video', (req, res) => {
     res.json({ ok: true });
 });
 
+// Extension SW fetch bytes video → lưu thẳng vào temp → veo-engine copy sang outputFolder
+// Tránh Chrome Downloads: SW fetch dùng credentials:include → có cookie flow-content.google
+expressApp.post('/api/save-r2v-video-bytes',
+    (req, res, next) => {
+        let chunks = [];
+        req.on('data', c => chunks.push(c));
+        req.on('end', () => { req.rawBody = Buffer.concat(chunks); next(); });
+    },
+    (req, res) => {
+        const operationId = req.headers['x-operation-id'];
+        const buf = req.rawBody;
+        if (!buf || buf.length === 0) return res.status(400).json({ error: 'empty body' });
+        const os = require('os');
+        const tempPath = path.join(os.tmpdir(), `veo_r2v_${Date.now()}.mp4`);
+        try {
+            fs.writeFileSync(tempPath, buf);
+            if (!global.googleLabsAuth.pendingR2VVideoUrls) global.googleLabsAuth.pendingR2VVideoUrls = {};
+            if (operationId) {
+                global.googleLabsAuth.pendingR2VVideoUrls[operationId] = 'file://' + tempPath.replace(/\\/g, '/');
+                console.log(`[R2V bytes] ${(buf.length/1024/1024).toFixed(1)}MB → ${tempPath} (opId=${operationId.substring(0,16)})`);
+            }
+            res.json({ ok: true });
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
+    }
+);
+
 // Debug: nhận f.req body từ Extension để phân tích aspect code
 let _capturedRpcBodies = [];
 expressApp.post('/api/capture-rpc-body', (req, res) => {
     if (req.body) {
         const entry = { ...req.body, capturedAt: new Date().toISOString() };
         _capturedRpcBodies.push(entry);
-        if (_capturedRpcBodies.length > 20) _capturedRpcBodies = _capturedRpcBodies.slice(-20);
+        if (_capturedRpcBodies.length > 200) _capturedRpcBodies = _capturedRpcBodies.slice(-200);
         console.log(`[RPC CAPTURE] ${entry.rpc} @ ${entry.capturedAt}`);
         console.log(`[RPC CAPTURE] freq preview: ${(entry.freq || '').substring(0, 500)}`);
     }
@@ -275,6 +309,44 @@ expressApp.post('/api/capture-rpc-body', (req, res) => {
 });
 expressApp.get('/api/get-captured-rpc', (req, res) => {
     res.json({ bodies: _capturedRpcBodies });
+});
+
+// ── FLOW DIRECT API COOKIES (không cần Extension) ───────────────────────────
+const getFlowCookiesFile = () => {
+    try { return path.join(require('electron').app.getPath('userData'), 'flow-cookies.json'); }
+    catch (_) { return path.join(require('os').homedir(), 'fluxy-flow-cookies.json'); }
+};
+
+expressApp.post('/api/flow-cookies', (req, res) => {
+    const cookies = req.body;
+    if (!Array.isArray(cookies) || cookies.length === 0) return res.status(400).json({ error: 'Cần array cookies' });
+    global.googleLabsAuth.flowCookies = cookies;
+    try { fs.writeFileSync(getFlowCookiesFile(), JSON.stringify(cookies, null, 2), 'utf-8'); } catch (e) { console.error('[FlowDirect] Save cookies fail:', e.message); }
+    console.log(`[FlowDirect] Saved ${cookies.length} cookies`);
+    res.json({ ok: true, count: cookies.length });
+});
+
+expressApp.get('/api/flow-cookies', (req, res) => {
+    const cookies = global.googleLabsAuth.flowCookies;
+    res.json({ count: cookies?.length || 0, hasCookies: !!(cookies?.length) });
+});
+
+expressApp.get('/api/check-flow-cookies', async (req, res) => {
+    const cookies = global.googleLabsAuth.flowCookies;
+    if (!cookies?.length) return res.json({ valid: false, reason: 'Chưa có cookie' });
+    try {
+        const { checkCookiesValid } = require('./services/flow-direct-api');
+        const result = await checkCookiesValid(cookies);
+        res.json(result);
+    } catch (e) {
+        res.json({ valid: false, reason: e.message });
+    }
+});
+
+expressApp.delete('/api/flow-cookies', (req, res) => {
+    global.googleLabsAuth.flowCookies = null;
+    try { const f = getFlowCookiesFile(); if (fs.existsSync(f)) fs.unlinkSync(f); } catch (_) {}
+    res.json({ ok: true });
 });
 
 // Nhận mediaId sau khi Extension upload thành công
@@ -425,6 +497,18 @@ async function initializeServices() {
 
     db = new DatabaseService(app.getPath('userData'));
     await db.init();
+
+    // Load flow direct cookies nếu đã lưu từ lần trước
+    try {
+        const cookieFile = path.join(app.getPath('userData'), 'flow-cookies.json');
+        if (fs.existsSync(cookieFile)) {
+            const saved = JSON.parse(fs.readFileSync(cookieFile, 'utf-8'));
+            if (Array.isArray(saved) && saved.length > 0) {
+                global.googleLabsAuth.flowCookies = saved;
+                console.log(`[FlowDirect] Loaded ${saved.length} saved cookies`);
+            }
+        }
+    } catch (_) {}
 
     const savedDownloadsDir = await db.getSetting('downloadsDir', null);
     const downloadsDir = savedDownloadsDir || path.join(app.getPath('documents'), 'GrokStudio_Downloads');

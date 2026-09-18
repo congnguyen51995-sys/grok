@@ -19,7 +19,7 @@ const SERVER_API = "http://127.0.0.1:3000/update-token";
 const CHECK_API = "http://127.0.0.1:3000/api/check-request";
 const SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 
-console.log("🚀 Fluxy Extension V3.15 - fix T2V v5.0: detect xml wrong-content + webRequest URL check + cookie diag");
+console.log("🚀 Fluxy Extension V3.16 - fix T2V v5.1: Accept:video/* + Referer in chrome.downloads.headers");
 
 // ══ webRequest: bắt URL video từ flow.google.com (đáng tin cậy hơn fetch interceptor) ══
 // Lưu { url, ts } cho mọi request video file từ tab flow.google.com
@@ -1961,8 +1961,15 @@ async function downloadFlowContentVideo(videoUrl, operationId, saveVideoUrl, tab
 
     try {
         const filename = `fluxy_dl_${operationId.substring(0,8)}_${Date.now()}.mp4`;
+        // Add Referer + Accept headers directly in chrome.downloads (more reliable than declarativeNetRequest)
+        // Accept: video/* tells server to return video binary, not XML error page
+        const _dlHeaders = [
+            { name: 'Referer', value: 'https://flow.google.com/' },
+            { name: 'Accept', value: 'video/mp4,video/webm,video/ogg,video/*;q=0.9,*/*;q=0.8' }
+        ];
+        _dlLog(`[FlowDL] headers: Referer+Accept(video/*) via chrome.downloads.headers`, operationId);
         const downloadId = await new Promise((resolve, reject) => {
-            chrome.downloads.download({ url: videoUrl, filename, saveAs: false, conflictAction: 'uniquify' }, (id) => {
+            chrome.downloads.download({ url: videoUrl, filename, headers: _dlHeaders, saveAs: false, conflictAction: 'uniquify' }, (id) => {
                 if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
                 else resolve(id);
             });

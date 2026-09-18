@@ -771,7 +771,7 @@ class VeoEngine {
         let currentAt = r2vExtAt || auth.atToken;
         let videoUrl = null;
         let downloadRequested = false; // đã nhờ Extension download flow-content.google URL chưa
-        const MAX_R2V_POLLS = 100; // 500s (~8.3 phút) — R2V với voice cần thêm thời gian
+        const MAX_R2V_POLLS = 240; // 1200s (20 phút) — R2V với voice cần nhiều thời gian hơn T2V
         for (let poll = 0; poll < MAX_R2V_POLLS; poll++) {
             await new Promise(r => setTimeout(r, 5000));
 
@@ -804,13 +804,14 @@ class VeoEngine {
 
             if (!pollRawBody) continue;
 
-            // Match: flow-content.google (R2V voice), storage ais-sandbox, .mp4, .m3u8, lh3 ais
+            // Match: flow-content.google (R2V voice), storage ais-sandbox, .mp4, .m3u8, lh3 ais, googlevideo
             const rawUrlMatch = pollRawBody.match(/"(https:(?:\\\/|\/){2}flow-content\.google\/(?:video|image)\/[^"]{10,})"/)
                 || pollRawBody.match(/"(https:(?:\\\/|\/){2}storage\.googleapis\.com\/ais-[^"]{10,})"/)
                 || pollRawBody.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.mp4[^"]{0,800})"/)
                 || pollRawBody.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.m3u8[^"]{0,300})"/)
                 || pollRawBody.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.webm[^"]{0,300})"/)
-                || pollRawBody.match(/"(https:(?:\\\/|\/){2}lh3\.googleusercontent\.com\/ais[^"]{10,})"/);
+                || pollRawBody.match(/"(https:(?:\\\/|\/){2}lh3\.googleusercontent\.com\/ais[^"]{10,})"/)
+                || pollRawBody.match(/"(https:(?:\\\/|\/){2}[^"]{5,}googlevideo\.com\/videoplayback[^"]{20,})"/);
             if (rawUrlMatch) {
                 const foundUrl = rawUrlMatch[1]
                     .replace(/\\u003d/g, '=').replace(/\\u0026/g, '&')
@@ -840,7 +841,7 @@ class VeoEngine {
             delete auth.pendingR2VVideoUrls[operationId];
         }
 
-        if (!videoUrl) throw new Error('R2V gen timeout 500s — không nhận được URL từ jwpduf');
+        if (!videoUrl) throw new Error('R2V gen timeout 1200s — không nhận được URL từ jwpduf/Extension poll');
         return { videoUrl };
     }
 
@@ -1882,9 +1883,31 @@ class VeoEngine {
         const isGCSUrl = url.includes('storage.googleapis.com') || url.includes('lh3.googleusercontent.com');
         const isLabsUrl = url.includes('labs.google');
         const isFlowContent = url.includes('flow-content.google');
+        const isGooglevideo = url.includes('googlevideo.com/videoplayback');
 
-        if (isFlowContent) {
-            // flow-content.google: dùng cookie riêng của domain này (không phải flow.google.com cookie)
+        if (isGooglevideo) {
+            // Self-authenticated URL (expire/ei/ip params baked in) — chỉ cần User-Agent thông thường
+            options.headers = {
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+                'referer': 'https://flow.google.com/',
+            };
+        } else if (isFlowContent) {
+            // URL ?alt=media không có Expires/X-Goog-Signature → cần cookies .google TLD (Chrome không gửi từ Node.js)
+            // Thử aisandbox Bearer-token URL trước — đáng tin cậy hơn từ Node.js
+            const isUnsignedAltMedia = url.includes('?alt=media') && !url.includes('Expires=') && !url.includes('X-Goog-Signature');
+            if (isUnsignedAltMedia && auth?.bearerToken && auth?.projectId) {
+                const midM = url.match(/\/video\/([0-9a-f-]{8,})/);
+                if (midM) {
+                    const aisUrl = `https://aisandbox-pa.googleapis.com/v1/projects/${auth.projectId}/flowMedia/${midM[1]}?alt=media`;
+                    console.log(`[downloadMedia] unsigned alt=media → try aisandbox: ${aisUrl.substring(0, 80)}`);
+                    try {
+                        return await VeoEngine.downloadMedia(aisUrl, destPath, true);
+                    } catch(e2) {
+                        console.log(`[downloadMedia] aisandbox failed (${e2.message}), fallback cookies...`);
+                    }
+                }
+            }
+            // flow-content.google signed URL hoặc fallback cookie
             const fcCookie = auth?.flowContentCookie || auth?.cookie || '';
             const hasCookie = !!fcCookie;
             console.log(`[downloadMedia] flow-content.google — fcCookie=${!!(auth?.flowContentCookie)} flow_cookie=${!!(auth?.cookie)} len=${fcCookie.length}`);
@@ -2002,17 +2025,6 @@ class VeoEngine {
             if (!fs.existsSync(outputFolder)) fs.mkdirSync(outputFolder, { recursive: true });
             const check = await this.checkCookie();
             if (!check.success) throw new Error(check.error);
-
-            // Nếu dùng Flow Direct API (cookie export), kiểm tra cookie còn sống trước khi bắt đầu
-            const auth = global.googleLabsAuth;
-            if (auth.flowCookies?.length > 0) {
-                const { checkCookiesValid } = require('./flow-direct-api');
-                const cookieCheck = await checkCookiesValid(auth.flowCookies);
-                if (!cookieCheck.valid) {
-                    throw new Error(`⚠️ Cookie flow.google.com hết hạn: ${cookieCheck.reason}\n\n→ Vào Settings → Extension → "Cookie trực tiếp" → dán cookie mới từ CocCoc`);
-                }
-                sendLog(`[Cookie] flow.google.com OK (${auth.flowCookies.length} cookies)`, 'info');
-            }
 
             sendLog(`Khởi động động cơ API...`, 'info');
 

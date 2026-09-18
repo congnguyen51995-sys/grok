@@ -1164,8 +1164,8 @@ async function ensureR2VPoller() {
                                                 }
                                             } catch(_) {}
 
-                                            // Fallback: bare URL — download requires Referer injection (declarativeNetRequest)
-                                            const directUrl = 'https://flow-content.google/video/' + p.mid;
+                                            // Fallback: bare URL with ?alt=media (GCS-style: forces binary download vs XML manifest)
+                                            const directUrl = 'https://flow-content.google/video/' + p.mid + '?alt=media';
                                             try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: 'elapsed_45s_as29s_null', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now(), mid8: p.mid.substring(0,8) }) }); } catch(_) {}
                                             window._fluxyOpClaimed[p.opId] = directUrl;
                                             return { opId: p.opId, url: directUrl, method: 'T2V_direct_mid_45s' };
@@ -1999,8 +1999,8 @@ async function downloadFlowContentVideo(videoUrl, operationId, saveVideoUrl, tab
         // Detect wrong content: server returned XML/HTML error page instead of video
         if (filePath.endsWith('.xml') || filePath.endsWith('.html') || filePath.endsWith('.htm')
             || (mimeType && !mimeType.startsWith('video/'))) {
-            _dlLog(`⚠️ [FlowDL] WRONG CONTENT: mime=${mimeType} file=${filePath.split(/[/\\]/).pop()} — URL needs auth/signed token`, operationId);
-            try { chrome.downloads.removeFile(downloadId); } catch(_) {}
+            _dlLog(`⚠️ [FlowDL] WRONG CONTENT: mime=${mimeType} file=${filePath.split(/[/\\]/).pop()} path=${filePath} — KEEP FILE FOR INSPECTION`, operationId);
+            // Giữ file lại để đọc nội dung XML (không xóa) — sau khi diagnose xong mới xóa
             throw new Error(`wrong_content mime=${mimeType} — bare URL not authorized`);
         }
         _dlLog(`✅ [FlowDL] chrome.downloads OK: ${filePath} mime=${mimeType}`, operationId);
@@ -2061,13 +2061,20 @@ async function downloadFlowContentVideo(videoUrl, operationId, saveVideoUrl, tab
         }
     }
 
-    // === All methods failed → gửi HTTPS URL + flow-content.google cookies về Electron ===
+    // === All methods failed → gửi HTTPS URL + cookies về Electron ===
     _dlLog(`❌ [FlowDL] ALL methods failed, sending HTTPS URL + cookies back`, operationId);
     let fcCookieStr = '';
     try {
-        // Use {url} not {domain} — captures all cookies sent to this URL (incl. parent .google TLD cookies like SAPISID)
+        // Lấy flow.google.com cookies (có .google TLD auth cookies như SAPISID, SID)
+        // flow-content.google cùng TLD .google nên cùng cookies
+        const flowCookies = await new Promise(resolve => chrome.cookies.getAll({ url: 'https://flow.google.com/' }, resolve));
+        const flowCookieStr = (flowCookies || []).map(c => `${c.name}=${c.value}`).join('; ');
+        // Cũng lấy flow-content.google riêng (cookies set trực tiếp cho domain này)
         const fcCookies = await new Promise(resolve => chrome.cookies.getAll({ url: 'https://flow-content.google/' }, resolve));
-        fcCookieStr = (fcCookies || []).map(c => `${c.name}=${c.value}`).join('; ');
+        const fcOnlyStr = (fcCookies || []).map(c => `${c.name}=${c.value}`).join('; ');
+        // Combine: ưu tiên flow-content.google, fallback flow.google.com
+        fcCookieStr = [fcOnlyStr, flowCookieStr].filter(Boolean).join('; ');
+        _dlLog(`[FlowDL] fallback cookies: flow-content.google=${(fcCookies||[]).length} flow.google.com=${(flowCookies||[]).length} total=${fcCookieStr.length}chars`, operationId);
     } catch(_) {}
     fetch(saveVideoUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ operationId, videoUrl, flowContentCookie: fcCookieStr || undefined }) }).catch(() => {});

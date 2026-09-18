@@ -46,21 +46,39 @@ function _fluxyCapture(txt) {
     } catch(_) {}
 }
 
-// ── Intercept HTMLMediaElement.src setter → bắt URL video gán vào <video> ──
+// ── Intercept HTMLMediaElement.src setter + currentSrc → bắt URL video gán vào <video> ──
 (function() {
     const _d = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
     if (_d?.set) {
         Object.defineProperty(HTMLMediaElement.prototype, 'src', {
             get: _d.get,
             set: function(val) {
-                if (val && typeof val === 'string' && !val.startsWith('blob:') && !val.startsWith('data:') && _fluxyIsVideoUrl(val)) {
-                    _fluxyCapture('"' + val + '"');
+                if (val && typeof val === 'string') {
+                    if (!val.startsWith('blob:') && !val.startsWith('data:') && _fluxyIsVideoUrl(val)) {
+                        _fluxyCapture('"' + val + '"');
+                    }
+                    // Log blob URLs too — so we know the app is using MSE/blob
+                    if (val.startsWith('blob:')) {
+                        window.dispatchEvent(new CustomEvent('AutoFlow_VIDEO_SRC', { detail: { src: val, isBlobUrl: true, ts: Date.now() } }));
+                    }
                 }
                 return _d.set.call(this, val);
             },
             configurable: true,
         });
     }
+    // Intercept URL.createObjectURL → detect blob creation for video
+    const _origCOBU = URL.createObjectURL;
+    URL.createObjectURL = function(obj) {
+        const result = _origCOBU.call(URL, obj);
+        try {
+            const t = (obj instanceof Blob || obj instanceof File) ? obj.type : (obj instanceof MediaSource ? 'mediasource' : '?');
+            if (t && (t.startsWith('video/') || t === 'mediasource' || t.startsWith('audio/'))) {
+                window.dispatchEvent(new CustomEvent('AutoFlow_VIDEO_BLOB', { detail: { blobUrl: result, type: t, size: obj.size || 0, ts: Date.now() } }));
+            }
+        } catch(_) {}
+        return result;
+    };
 })();
 
 // ── Intercept EventSource (SSE) → bắt real-time update từ Flow ──
@@ -201,6 +219,7 @@ window.fetch = async function (...args) {
                     }
                 }
                 // Bắt workflowId từ jwpduf FETCH response (Angular dùng fetch, không phải XHR)
+                // Đồng thời: khi WuwhI/jwpduf trả về COMPLETE signal → gửi raw body lên SW để debug URL
                 try {
                     const _absUrl = url.startsWith('/') ? (window.location.origin + url) : url;
                     if (new URL(_absUrl).searchParams.get('rpcids') === 'jwpduf') {
@@ -213,6 +232,10 @@ window.fetch = async function (...args) {
                                 window._fluxyWorkflowIds[_mid] = _wid;
                                 console.log('[Fluxy] fetch jwpduf wid:', _wid.substring(0,8), 'for:', _mid.substring(0,8));
                             }
+                        }
+                        // Nếu response KHÔNG phải "[3]" pending → có thể là complete signal, gửi raw để debug
+                        if (!respText.includes('[3]') && respText.length > 50) {
+                            window.dispatchEvent(new CustomEvent('AutoFlow_JWPDUF_RESP', { detail: { raw: respText.substring(0, 2000), ts: Date.now() } }));
                         }
                     }
                 } catch(_) {}
@@ -345,6 +368,10 @@ XMLHttpRequest.prototype.send = function (...args) {
                             window._fluxyWorkflowIds[_mid] = _wid;
                             console.log('[Fluxy] jwpduf wid:', _wid.substring(0,8), 'for:', _mid.substring(0,8));
                         }
+                    }
+                    // Complete signal (không phải [3] pending) → gửi raw body lên SW
+                    if (!_rt.includes('[3]') && _rt.length > 50) {
+                        window.dispatchEvent(new CustomEvent('AutoFlow_JWPDUF_RESP', { detail: { raw: _rt.substring(0, 2000), ts: Date.now() } }));
                     }
                 }
             } catch(_) {}

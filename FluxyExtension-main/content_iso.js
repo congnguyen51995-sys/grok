@@ -29,3 +29,18 @@ window.addEventListener('AutoFlow_FLOW_AUTH', (e) => {
         chrome.runtime.sendMessage({ type: "FLOW_AUTH_FOUND", data: { at, bl } });
     }
 });
+
+// WuwhI/jwpduf complete response — để debug URL format thực tế của Angular app
+window.addEventListener('AutoFlow_JWPDUF_RESP', (e) => {
+    chrome.runtime.sendMessage({ type: "JWPDUF_COMPLETE_BODY", data: e.detail });
+});
+
+// Blob URL created for video (Angular app dùng MSE/blob thay vì direct URL)
+window.addEventListener('AutoFlow_VIDEO_BLOB', (e) => {
+    chrome.runtime.sendMessage({ type: "VIDEO_BLOB_CREATED", data: e.detail });
+});
+
+// Video src assigned (direct URL, not blob)
+window.addEventListener('AutoFlow_VIDEO_SRC', (e) => {
+    chrome.runtime.sendMessage({ type: "VIDEO_SRC_SET", data: e.detail });
+});

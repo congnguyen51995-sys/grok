@@ -2389,6 +2389,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             console.log(`✅ AT token — at=${at.substring(0, 20)}... bl=${bl.substring(0, 30)}... fsid=${fsid?.substring(0,15) || '?'}`);
         });
     }
+
+    // WuwhI/jwpduf complete response body — debug actual URL format Angular uses
+    if (message.type === "JWPDUF_COMPLETE_BODY" && message.data?.raw) {
+        try {
+            await fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rpc: 'JWPDUF_COMPLETE_RAW', raw: message.data.raw.substring(0, 3000), ts: Date.now() })
+            });
+        } catch(_) {}
+    }
+
+    // Video blob created in page (Angular dùng MSE/blob URL)
+    if (message.type === "VIDEO_BLOB_CREATED") {
+        try {
+            await fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rpc: 'VIDEO_BLOB_CREATED', blobUrl: message.data?.blobUrl, type: message.data?.type, size: message.data?.size, ts: Date.now() })
+            });
+        } catch(_) {}
+    }
+
+    // Video src directly set (not blob)
+    if (message.type === "VIDEO_SRC_SET") {
+        try {
+            await fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rpc: 'VIDEO_SRC_SET', src: message.data?.src, ts: Date.now() })
+            });
+        } catch(_) {}
+    }
 });
 
 

@@ -187,6 +187,23 @@ window.fetch = async function (...args) {
         } catch (_) {}
     }
 
+    // ── Bắt FULL request tới flow-content.google — cần biết auth headers ──
+    if (url.includes('flow-content.google') || url.includes('flow.google.com/video')) {
+        try {
+            const init = args[1] || {};
+            const hdrs = {};
+            if (init.headers) {
+                const h = init.headers;
+                if (typeof h.forEach === 'function') { h.forEach((v, k) => { hdrs[k] = v.substring(0, 80); }); }
+                else if (typeof h.get === 'function') { ['authorization','Authorization','cookie','Cookie','x-goog-authuser'].forEach(k => { const v = h.get(k); if (v) hdrs[k] = v.substring(0, 80); }); }
+                else if (typeof h === 'object') { Object.keys(h).forEach(k => { hdrs[k] = String(h[k]).substring(0, 80); }); }
+            }
+            window.dispatchEvent(new CustomEvent('AutoFlow_FC_REQUEST', {
+                detail: { url: url.substring(0, 200), method: init.method || 'GET', credentials: init.credentials || 'default', headers: hdrs, ts: Date.now() }
+            }));
+        } catch (_) {}
+    }
+
     const response = await originalFetch.apply(this, args);
 
     // ── Scan MỌI response từ flow.google.com cho video URL ──────────────────────

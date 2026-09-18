@@ -26,6 +26,8 @@ console.log("🚀 Fluxy Extension V3.16 - fix T2V v5.1: Accept:video/* + Referer
 let _capturedR2VUrls = [];
 const SAVE_FLOW_VIDEO_URL = 'http://127.0.0.1:3000/api/save-flow-r2v-video';
 
+// Debug: capture ALL non-batchexecute URLs from flow.google.com tab for diagnosis
+let _debugAllFlowUrls = [];
 chrome.webRequest.onBeforeRequest.addListener(
     (details) => {
         // Chỉ quan tâm request từ tab flow.google.com (initiator = trang gọi request)
@@ -34,6 +36,22 @@ chrome.webRequest.onBeforeRequest.addListener(
         if (!isFlowTab) return;
 
         const url = details.url;
+
+        // ── DEBUG: log ALL non-batchexecute URLs to a rolling buffer ──
+        const isBatchexecute = url.includes('batchexecute') || url.includes('/$rpc/');
+        const isStaticAsset = /\.(js|css|png|jpg|svg|ico|woff|woff2|ttf)(\?|#|$)/i.test(url);
+        if (!isBatchexecute && !isStaticAsset && !_debugAllFlowUrls.some(u => u === url)) {
+            _debugAllFlowUrls.push(url);
+            if (_debugAllFlowUrls.length > 100) _debugAllFlowUrls = _debugAllFlowUrls.slice(-100);
+            // Log flow-content.google requests immediately
+            if (url.includes('flow-content.google') || url.includes('/video/') || url.includes('.mp4') || url.includes('.m3u8') || url.includes('.webm')) {
+                fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rpc: 'WR_FLOW_URL', url: url.substring(0, 300), type: details.type, initiator: details.initiator, ts: Date.now() })
+                }).catch(_=>{});
+            }
+        }
+
         // Match: flow-content.google (video R2V/voice), storage.googleapis.com, .mp4, .m3u8
         const isVideoUrl = url.includes('flow-content.google/video/')
             || url.includes('flow-content.google/image/')
@@ -59,6 +77,16 @@ chrome.webRequest.onBeforeRequest.addListener(
     },
     { urls: ['<all_urls>'] }
 );
+
+// Expose debug URL list via new endpoint (added to Express in main.js — but we log on demand here)
+// After T2V completes, we send the full list once
+function _logDebugAllFlowUrls(label) {
+    if (_debugAllFlowUrls.length === 0) return;
+    fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rpc: 'ALL_FLOW_URLS', label, count: _debugAllFlowUrls.length, urls: _debugAllFlowUrls.slice(-50), ts: Date.now() })
+    }).catch(_=>{});
+}
 
 let lastSentTime = 0;
 
@@ -1419,6 +1447,7 @@ async function ensureR2VPoller() {
                                 (_opMid ? c.url.includes(_opMid) : c.url.includes(opId))
                             );
                             const _dlUrl = _webCapVideo?.url || result.url;
+                            _logDebugAllFlowUrls('at_dl_' + opId.substring(0, 8));
                             try {
                                 await fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
                                     method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -2411,6 +2440,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ rpc: 'VIDEO_SRC_SET', src: message.data?.src, ts: Date.now() })
+        }).catch(_=>{});
+    }
+
+    // Fetch to flow-content.google captured from page — reveals auth mechanism
+    if (message.type === "FC_REQUEST_CAPTURED") {
+        fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rpc: 'FC_REQUEST', url: message.data?.url, method: message.data?.method, credentials: message.data?.credentials, headers: message.data?.headers, ts: Date.now() })
         }).catch(_=>{});
     }
 });

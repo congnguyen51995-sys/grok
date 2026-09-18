@@ -44,3 +44,8 @@ window.addEventListener('AutoFlow_VIDEO_BLOB', (e) => {
 window.addEventListener('AutoFlow_VIDEO_SRC', (e) => {
     chrome.runtime.sendMessage({ type: "VIDEO_SRC_SET", data: e.detail });
 });
+
+// Fetch request to flow-content.google — capture exact URL + auth headers
+window.addEventListener('AutoFlow_FC_REQUEST', (e) => {
+    chrome.runtime.sendMessage({ type: "FC_REQUEST_CAPTURED", data: e.detail });
+});

@@ -771,7 +771,7 @@ class VeoEngine {
         let currentAt = r2vExtAt || auth.atToken;
         let videoUrl = null;
         let downloadRequested = false; // đã nhờ Extension download flow-content.google URL chưa
-        const MAX_R2V_POLLS = 24; // 120s (2 phút) — video xong trên web ~1 phút, Method A2 detect qua googlevideo URL
+        const MAX_R2V_POLLS = 36; // 180s (3 phút) — Lower Priority mất 2-3 phút; Method A2 detect xong ngay khi page play video
         for (let poll = 0; poll < MAX_R2V_POLLS; poll++) {
             await new Promise(r => setTimeout(r, 5000));
 
@@ -841,7 +841,7 @@ class VeoEngine {
             delete auth.pendingR2VVideoUrls[operationId];
         }
 
-        if (!videoUrl) throw new Error('R2V gen timeout 2 phút — không nhận được URL (video chưa xong hoặc tab flow.google.com bị đóng)');
+        if (!videoUrl) throw new Error('R2V gen timeout 3 phút — video chưa xong hoặc tab flow.google.com bị đóng/không hiển thị video');
         return { videoUrl };
     }
 

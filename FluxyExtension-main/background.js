@@ -19,7 +19,7 @@ const SERVER_API = "http://127.0.0.1:3000/update-token";
 const CHECK_API = "http://127.0.0.1:3000/api/check-request";
 const SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 
-console.log("🚀 Fluxy Extension V3.17 - T2V v5.26: R2V dùng googlevideo.com URL (webRequest) thay jwpduf — phát hiện xong trong ~30-40s");
+console.log("🚀 Fluxy Extension V3.17 - T2V v5.27: R2V dùng chrome.downloads cho googlevideo URL (tránh 403 IP-lock từ Node.js HTTPS)");
 
 // ══ webRequest: bắt URL video từ flow.google.com (đáng tin cậy hơn fetch interceptor) ══
 // Lưu { url, ts, mid } cho mọi request video file từ tab flow.google.com
@@ -1064,14 +1064,15 @@ async function ensureR2VPoller() {
 
         // ── Method A2: googlevideo.com URLs for R2V (page play video khi xong → webRequest bắt được) ──
         // Khi R2V hoàn thành, page play video → Chrome bắn onBeforeRequest cho googlevideo.com URL
-        // Đây là URL self-signed (không cần cookie) → veo-engine.js download trực tiếp được
+        // Dùng chrome.downloads (browser context, đúng IP) thay vì Node.js HTTPS để tránh 403 IP-lock
         {
             const r2vJobs = [..._pendingR2V.entries()].filter(([, p]) => p.isR2V);
             if (r2vJobs.length > 0) {
                 const gvCaps = unclaimedCaptures.filter(c =>
                     !c.claimedBy &&
                     c.url && c.url.includes('googlevideo.com/videoplayback') &&
-                    c.url.includes('source=contrib_service_ai_sandbox')
+                    c.url.includes('source=contrib_service_ai_sandbox') &&
+                    c.url.includes('itag=22')  // itag=22 = 720p MP4 combined; skip audio-only tracks
                 );
                 if (gvCaps.length > 0) {
                     // Sort jobs by genStartTs (oldest first) → FIFO match với googlevideo URLs
@@ -1084,10 +1085,36 @@ async function ensureR2VPoller() {
                         const cap = gvCaps[gi++];
                         cap.claimedBy = opId;
                         _pendingR2V.delete(opId);
-                        console.log(`[R2V ${opId.substring(0,8)}] ✅ A2-googlevideo: cap.ts=${cap.ts} genStart=${p.genStartTs} url=${cap.url.substring(0,70)}`);
-                        fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: cap.url }) })
-                            .then(r => console.log(`[R2V-A2 SAVE] status=${r.status} opId=${opId.substring(0,8)}`))
-                            .catch(e => console.log(`[R2V-A2 SAVE] FAIL opId=${opId.substring(0,8)} err=${e.message}`));
+                        const gvUrl = cap.url;
+                        const dlFilename = `fluxy_r2v_${opId.substring(0,8)}_${Date.now()}.mp4`;
+                        console.log(`[R2V ${opId.substring(0,8)}] ✅ A2-gv → chrome.downloads: ${gvUrl.substring(0,70)}`);
+                        // Dùng chrome.downloads (browser IP/cookie) thay Node.js HTTPS để tránh 403
+                        chrome.downloads.download({ url: gvUrl, filename: dlFilename, conflictAction: 'uniquify', saveAs: false }, (dlId) => {
+                            if (chrome.runtime.lastError || !dlId) {
+                                console.log(`[R2V-A2 DL FAIL] ${opId.substring(0,8)}: ${chrome.runtime.lastError?.message}`);
+                                return;
+                            }
+                            const onDlChanged = (delta) => {
+                                if (delta.id !== dlId) return;
+                                if (delta.state?.current === 'complete') {
+                                    chrome.downloads.onChanged.removeListener(onDlChanged);
+                                    chrome.downloads.search({ id: dlId }, (items) => {
+                                        const fp = items?.[0]?.filename;
+                                        if (fp) {
+                                            const fUrl = 'file://' + fp.replace(/\\/g, '/');
+                                            console.log(`[R2V-A2 DL OK] ${opId.substring(0,8)} → ${fp}`);
+                                            fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: fUrl }) })
+                                                .then(r => console.log(`[R2V-A2 SAVE] status=${r.status} opId=${opId.substring(0,8)}`))
+                                                .catch(e => console.log(`[R2V-A2 SAVE] FAIL: ${e.message}`));
+                                        }
+                                    });
+                                } else if (delta.state?.current === 'interrupted') {
+                                    chrome.downloads.onChanged.removeListener(onDlChanged);
+                                    console.log(`[R2V-A2 DL INTERRUPTED] ${opId.substring(0,8)} reason=${delta.error?.current}`);
+                                }
+                            };
+                            chrome.downloads.onChanged.addListener(onDlChanged);
+                        });
                     }
                 }
             }

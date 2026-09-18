@@ -19,7 +19,7 @@ const SERVER_API = "http://127.0.0.1:3000/update-token";
 const CHECK_API = "http://127.0.0.1:3000/api/check-request";
 const SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 
-console.log("🚀 Fluxy Extension V3.14 - fix T2V v4.9: as29s at 45s + declarativeNetRequest Referer inject + cookie url fix");
+console.log("🚀 Fluxy Extension V3.15 - fix T2V v5.0: detect xml wrong-content + webRequest URL check + cookie diag");
 
 // ══ webRequest: bắt URL video từ flow.google.com (đáng tin cậy hơn fetch interceptor) ══
 // Lưu { url, ts } cho mọi request video file từ tab flow.google.com
@@ -1408,12 +1408,33 @@ async function ensureR2VPoller() {
                 for (const [opId, result] of Object.entries(results)) {
                     if (result?.url) {
                         console.log(`[R2V ${opId.substring(0,8)}] ✅ ${result.method}: ${result.url.substring(0,70)}`);
-                        const dlTabId = _pendingR2V.get(opId)?.tabId || tabId; // lấy trước khi delete
+                        const dlTabId = _pendingR2V.get(opId)?.tabId || tabId;
+                        const _opMid = _pendingR2V.get(opId)?.mid; // lấy trước khi delete
                         _pendingR2V.delete(opId);
-                        // flow-content.google: dùng MAIN world fetch (page context, đúng Origin/cookies)
+                        // flow-content.google: check webRequest captures first, then chrome.downloads
                         if (result.url.includes('flow-content.google')) {
-                            console.log(`[T2V/R2V ${opId.substring(0,8)}] URL → MAIN world download (tabId=${dlTabId})`);
-                            downloadFlowContentVideo(result.url, opId, SAVE_VIDEO, dlTabId);
+                            // Check if webRequest already captured a better URL (signed GCS or different format)
+                            const _webCapVideo = _capturedR2VUrls.find(c =>
+                                c.url.includes('/video/') &&
+                                (_opMid ? c.url.includes(_opMid) : c.url.includes(opId))
+                            );
+                            const _dlUrl = _webCapVideo?.url || result.url;
+                            try {
+                                await fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
+                                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                                    body: JSON.stringify({
+                                        rpc: 'capturedUrls_at_dl',
+                                        count: _capturedR2VUrls.length,
+                                        urls: _capturedR2VUrls.slice(-5).map(c => c.url.substring(0, 100)),
+                                        usedCaptured: !!_webCapVideo,
+                                        opId8: opId.substring(0, 8),
+                                        opMid8: (_opMid||'').substring(0, 8),
+                                        ts: Date.now()
+                                    })
+                                });
+                            } catch(_) {}
+                            console.log(`[T2V/R2V ${opId.substring(0,8)}] URL → download (tabId=${dlTabId}) usedCaptured=${!!_webCapVideo}`);
+                            downloadFlowContentVideo(_dlUrl, opId, SAVE_VIDEO, dlTabId);
                         } else {
                             fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: result.url }) })
                                 .then(r => console.log(`[SAVE_VIDEO] ok status=${r.status} opId=${opId.substring(0,8)} method=${result.method}`))
@@ -1917,8 +1938,12 @@ async function downloadFlowContentVideo(videoUrl, operationId, saveVideoUrl, tab
     _dlLog(`[FlowDL] START opId=${operationId.substring(0,8)} url=${videoUrl.substring(0,80)}`, operationId);
 
     // === Primary: chrome.downloads + Referer injection ===
-    // CDN hotlink protection: flow-content.google requires Referer: https://flow.google.com/
-    // chrome.downloads sends no Referer by default → 403. Fix via declarativeNetRequest.
+    // Log cookies for diagnosis (flow-content.google vs flow.google.com)
+    try {
+        const _fcCk = await new Promise(r => chrome.cookies.getAll({ url: 'https://flow-content.google/' }, r));
+        const _flCk = await new Promise(r => chrome.cookies.getAll({ url: 'https://flow.google.com/' }, r));
+        _dlLog(`[FlowDL] cookies: flow-content.google=${(_fcCk||[]).length}[${(_fcCk||[]).map(c=>c.name).join(',')||'none'}] flow.google.com=${(_flCk||[]).length}`, operationId);
+    } catch(_) {}
     const _DL_RULE_ID = 99901;
     let _dlRuleAdded = false;
     try {
@@ -1960,9 +1985,18 @@ async function downloadFlowContentVideo(videoUrl, operationId, saveVideoUrl, tab
             chrome.downloads.onChanged.addListener(listener);
         });
         const items = await new Promise(resolve => chrome.downloads.search({ id: downloadId }, resolve));
-        const filePath = items?.[0]?.filename;
+        const _dlItem = items?.[0];
+        const filePath = _dlItem?.filename;
+        const mimeType = _dlItem?.mime;
         if (!filePath) throw new Error('no filePath from chrome.downloads.search');
-        _dlLog(`✅ [FlowDL] chrome.downloads OK: ${filePath}`, operationId);
+        // Detect wrong content: server returned XML/HTML error page instead of video
+        if (filePath.endsWith('.xml') || filePath.endsWith('.html') || filePath.endsWith('.htm')
+            || (mimeType && !mimeType.startsWith('video/'))) {
+            _dlLog(`⚠️ [FlowDL] WRONG CONTENT: mime=${mimeType} file=${filePath.split(/[/\\]/).pop()} — URL needs auth/signed token`, operationId);
+            try { chrome.downloads.removeFile(downloadId); } catch(_) {}
+            throw new Error(`wrong_content mime=${mimeType} — bare URL not authorized`);
+        }
+        _dlLog(`✅ [FlowDL] chrome.downloads OK: ${filePath} mime=${mimeType}`, operationId);
         await fetch(saveVideoUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ operationId, videoUrl: 'file://' + filePath.replace(/\\/g, '/') }) });
         return;

@@ -1,11 +1,108 @@
 ﻿const path   = require('path');
 const fs     = require('fs');
 const https  = require('https');
+const os     = require('os');
 const { spawn } = require('child_process');
+
+// ── GPU encoder probe + re-encode helper ─────────────────────────────────────
+// Thứ tự ưu tiên: NVIDIA h264_nvenc → AMD h264_amf → Intel h264_qsv → CPU libx264
+const GPU_CANDIDATES = [
+  { name: 'h264_nvenc', label: 'NVIDIA NVENC', encArgs: ['-preset', 'p1', '-rc', 'vbr', '-cq', '20'] },
+  { name: 'h264_amf',   label: 'AMD AMF',      encArgs: ['-quality', 'quality', '-rc', 'cqp', '-qp_i', '16', '-qp_p', '18'] },
+  { name: 'h264_qsv',   label: 'Intel QSV',    encArgs: ['-preset', 'veryfast', '-global_quality', '20'] },
+];
+
+let _gpuProbeResult = undefined; // undefined = chưa probe; null = không có GPU
+
+function getFFmpegBin() {
+  try { return require('ffmpeg-static'); } catch { return 'ffmpeg'; }
+}
+
+// Probe một encoder bằng cách encode 1 frame null — nhanh (~0.3s)
+function probeEncoder(ffmpegBin, encoderName, extraArgs) {
+  return new Promise((resolve) => {
+    const args = [
+      '-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=1',
+      '-c:v', encoderName, ...extraArgs,
+      '-f', 'null', '-',
+    ];
+    const p = spawn(ffmpegBin, args, { stdio: 'pipe' });
+    p.on('close', code => resolve(code === 0));
+    p.on('error', () => resolve(false));
+  });
+}
+
+// Trả về GPU_CANDIDATES entry hoặc null nếu không có GPU nào hỗ trợ
+async function detectGpuEncoder(sendLog) {
+  if (_gpuProbeResult !== undefined) return _gpuProbeResult;
+  const ffmpegBin = getFFmpegBin();
+  sendLog('🔍 Quét GPU encoder...');
+  for (const enc of GPU_CANDIDATES) {
+    const ok = await probeEncoder(ffmpegBin, enc.name, enc.encArgs);
+    if (ok) {
+      sendLog(`✅ GPU hỗ trợ: ${enc.label} (${enc.name})`);
+      _gpuProbeResult = enc;
+      return enc;
+    }
+    sendLog(`  ✗ ${enc.label} không khả dụng`);
+  }
+  sendLog('ℹ️ Không có GPU encoder — dùng CPU libx264');
+  _gpuProbeResult = null;
+  return null;
+}
+
+async function tryGpuReencode(inputPath, outputPath, sendLog) {
+  const ffmpegBin = getFFmpegBin();
+  const gpu = await detectGpuEncoder(sendLog);
+
+  const encArgs = gpu
+    ? ['-c:v', gpu.name, ...gpu.encArgs]
+    : ['-c:v', 'libx264', '-preset', 'fast', '-crf', '17'];
+  const label = gpu ? `GPU (${gpu.label})` : 'CPU (libx264 ultrafast)';
+
+  sendLog(`🎬 Re-encode ${label}...`);
+  return new Promise((resolve) => {
+    const args = ['-y', '-i', inputPath, ...encArgs, '-c:a', 'copy', '-movflags', '+faststart', outputPath];
+    const proc = spawn(ffmpegBin, args, { stdio: 'pipe' });
+    proc.on('close', code => {
+      if (code === 0) { sendLog(`✅ Encode xong (${label})`); resolve({ ok: true, gpu: !!gpu }); }
+      else if (gpu) {
+        // GPU thất bại lúc encode thật (driver lỗi) → reset cache + fallback CPU
+        sendLog(`⚠ ${gpu.label} lỗi lúc encode → fallback CPU`);
+        _gpuProbeResult = null;
+        const argsCpu = ['-y', '-i', inputPath, '-c:v', 'libx264', '-preset', 'fast', '-crf', '17', '-c:a', 'copy', '-movflags', '+faststart', outputPath];
+        const p2 = spawn(ffmpegBin, argsCpu, { stdio: 'pipe' });
+        p2.on('close', c2 => {
+          if (c2 === 0) { sendLog('✅ CPU encode xong'); resolve({ ok: true, gpu: false }); }
+          else resolve({ ok: false, error: `libx264 cũng thất bại (${c2})` });
+        });
+        p2.on('error', e => resolve({ ok: false, error: e.message }));
+      } else {
+        resolve({ ok: false, error: `libx264 thất bại (${code})` });
+      }
+    });
+    proc.on('error', e => resolve({ ok: false, error: e.message }));
+  });
+}
 
 const REMOTION_DIR   = path.join('D:\\TOOL REUP\\remotion');
 const GENERATED_DIR  = path.join(REMOTION_DIR, 'src', 'generated');
 const OUT_DIR        = path.join(REMOTION_DIR, 'out');
+
+// Remotion chép cả thư mục public vào TEMP mỗi lần render (0.2–1.5GB); render lỗi/bị dừng không tự dọn
+// → ổ C: đầy (ENOSPC). Đưa TEMP của Remotion sang ổ chứa REMOTION_DIR và dọn thư mục cũ > 3 giờ.
+const RENDER_TMP_DIR = path.join(REMOTION_DIR, '.render-tmp');
+function remotionEnv() {
+  try {
+    fs.mkdirSync(RENDER_TMP_DIR, { recursive: true });
+    const cut = Date.now() - 3 * 60 * 60 * 1000;
+    for (const name of fs.readdirSync(RENDER_TMP_DIR)) {
+      const full = path.join(RENDER_TMP_DIR, name);
+      try { if (fs.statSync(full).mtimeMs < cut) fs.rmSync(full, { recursive: true, force: true }); } catch (_) {}
+    }
+  } catch (_) {}
+  return { ...process.env, TEMP: RENDER_TMP_DIR, TMP: RENDER_TMP_DIR, TMPDIR: RENDER_TMP_DIR };
+}
 
 function ensureDirs() {
   if (!fs.existsSync(GENERATED_DIR)) fs.mkdirSync(GENERATED_DIR, { recursive: true });
@@ -169,39 +266,73 @@ function makeRenderSink(sendLog) {
 const qp = (p) => (p.includes(' ') ? `"${p}"` : p);
 
 // outputDir: thư mục người dùng chọn, fallback về OUT_DIR mặc định
-function renderVideo(compositionId, outputFilename, sendLog, outputDir) {
-  return new Promise((resolve, reject) => {
-    ensureDirs();
-    const targetDir = outputDir || OUT_DIR;
-    if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+async function renderVideo(compositionId, outputFilename, sendLog, outputDir) {
+  ensureDirs();
+  const targetDir = outputDir || OUT_DIR;
+  if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
 
-    const outPath   = path.join(targetDir, outputFilename);
-    const entryFile = path.join('src', 'generated', 'GeneratedIndex.jsx');
+  const finalPath = path.join(targetDir, outputFilename);
+  // Remotion render vào file tạm, sau đó GPU re-encode ra file cuối
+  const tmpPath   = path.join(targetDir, '_tmp_' + outputFilename);
+  const entryFile = path.join('src', 'generated', 'GeneratedIndex.jsx');
 
-    // Remotion 4.x: output là positional arg thứ 3, không dùng --output flag
-    // Bọc path có khoảng trắng trong dấu nháy kép (Windows shell:true)
-    const args = ['remotion', 'render', qp(entryFile), compositionId, qp(outPath)];
+  // Tăng concurrency dựa vào số CPU core (tối thiểu 4, tối đa 12)
+  const cpuCount   = os.cpus().length;
+  const concurrency = Math.min(12, Math.max(4, cpuCount));
 
-    sendLog(`▶ npx ${args.join(' ')}`);
-    sendLog(`📁 Output: ${outPath}`);
+  // --gl=angle: Chromium dùng DirectX (AMD GPU) để render CSS filter / WebGL
+  // Giúp các effect như vignette, color grade, SVG filter chạy trên GPU
+  const args = [
+    'remotion', 'render',
+    `--concurrency=${concurrency}`,
+    '--gl=angle',
+    '--timeout=300000',
+    qp(entryFile), compositionId, qp(tmpPath),
+  ];
 
+  sendLog(`▶ Render x${concurrency} threads + GPU (angle)`);
+  sendLog(`📁 Output: ${finalPath}`);
+
+  await new Promise((resolve, reject) => {
     const sink = makeRenderSink(sendLog);
-    const proc = spawn('npx', args, { cwd: REMOTION_DIR, shell: true });
-
+    const errLines = [];
+    const proc = spawn('npx', args, { cwd: REMOTION_DIR, shell: true, env: remotionEnv() });
     proc.stdout.on('data', d => sink(d));
-    proc.stderr.on('data', d => sink(d));
-
+    proc.stderr.on('data', d => {
+      sink(d);
+      // Lưu các dòng lỗi để báo cáo nếu render thất bại
+      const txt = stripAnsi(d.toString());
+      if (/error|Error|exception|Exception|SyntaxError|ReferenceError|TypeError/i.test(txt)) {
+        errLines.push(txt.trim().slice(0, 200));
+      }
+    });
     proc.on('close', code => {
-      if (code === 0) {
-        sendLog(`✅ Render hoàn tất: ${outputFilename}`);
-        resolve(outPath);
-      } else {
+      if (code === 0) resolve();
+      else {
+        if (errLines.length) sendLog(`❌ Chi tiết: ${errLines.slice(-3).join(' | ')}`);
         reject(new Error(`Remotion exited with code ${code}`));
       }
     });
-
     proc.on('error', err => reject(new Error(`Không chạy được npx: ${err.message}`)));
   });
+
+  sendLog('⚙️ Render xong — encode với GPU AMD...');
+
+  // GPU re-encode: AMD h264_amf → lossless chuyển codec, giải phóng CPU
+  const reRes = await tryGpuReencode(tmpPath, finalPath, sendLog);
+  // Dọn file tạm
+  try { fs.unlinkSync(tmpPath); } catch {}
+
+  if (!reRes.ok) {
+    // Re-encode thất bại → dùng file tạm làm output
+    try { fs.renameSync(tmpPath, finalPath); } catch {}
+    sendLog('⚠ Dùng output gốc từ Remotion (không re-encode GPU)');
+  }
+
+  const sizeMB = (() => { try { return (fs.statSync(finalPath).size / 1048576).toFixed(1); } catch { return '?'; } })();
+  sendLog(`+ ${finalPath} ${sizeMB} MB`);
+  sendLog(`✅ Render hoàn tất: ${outputFilename}`);
+  return finalPath;
 }
 
 // ─── Illustration system ──────────────────────────────────────────────────────
@@ -281,7 +412,7 @@ function callGeminiDirect(apiKey, systemPrompt, userPrompt) {
 
     const options = {
       hostname: 'generativelanguage.googleapis.com',
-      path: `/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+      path: `/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     };
@@ -310,18 +441,27 @@ function extractJsx(text) {
   return m ? m[1].trim() : text.trim();
 }
 
-// renderStill: render 1 frame ra PNG/JPEG
-function renderStill(compositionId, outputPath, sendLog = () => {}) {
+// src/generated/GeneratedVideo là 1 file dùng chung → ghi + render phải tuần tự,
+// nếu không các luồng song song (batch 8 ảnh) ghi đè nhau và chụp nhầm nội dung
+let _generatedLock = Promise.resolve();
+function withGeneratedLock(fn) {
+  const run = _generatedLock.then(fn, fn);
+  _generatedLock = run.catch(() => {});
+  return run;
+}
+
+// renderStill: render 1 frame ra PNG/JPEG. frame: chọn frame sau khi hiệu ứng hiện dần đã xong
+function renderStill(compositionId, outputPath, sendLog = () => {}, frame = 0) {
   return new Promise((resolve, reject) => {
     ensureDirs();
     const dir = path.dirname(outputPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
     const entryFile = path.join('src', 'generated', 'GeneratedIndex.jsx');
-    const args = ['remotion', 'still', qp(entryFile), compositionId, qp(outputPath), '--frame=0'];
+    const args = ['remotion', 'still', qp(entryFile), compositionId, qp(outputPath), `--frame=${frame}`];
 
     sendLog(`🖼️ npx ${args.join(' ')}`);
-    const proc = spawn('npx', args, { cwd: REMOTION_DIR, shell: true });
+    const proc = spawn('npx', args, { cwd: REMOTION_DIR, shell: true, env: remotionEnv() });
     let stderr = '';
     proc.stdout.on('data', d => sendLog(stripAnsi(d.toString()).trim()));
     proc.stderr.on('data', d => { stderr += d.toString(); });
@@ -538,14 +678,17 @@ Extract key visuals from the narration. Return JSON only.`;
 
   // Build JSX từ template cố định (không bao giờ fail vì syntax error)
   const jsx = buildIllustrationJsx(data, dim, copiedRefs);
-  writeGeneratedFiles(jsx);
 
   const outDir = outputDir || OUT_DIR;
   if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
   const outPath = path.join(outDir, `illustration_seg_${String(segId).padStart(3, '0')}.png`);
 
   sendLog(`🖼️ Remotion render illustration cảnh ${segId}...`);
-  await renderStill('GeneratedVideo', outPath, sendLog);
+  // Frame 60: mẫu minh họa fade-in 0→20 và số liệu hiện tới ~frame 60; frame 0 chỉ ra nền trống
+  await withGeneratedLock(async () => {
+    writeGeneratedFiles(jsx);
+    await renderStill('GeneratedVideo', outPath, sendLog, 60);
+  });
   return outPath;
 }
 
@@ -648,35 +791,35 @@ export const GeneratedVideo = () => {
   return (
     <AbsoluteFill style={{ background: bg, fontFamily: FONT, overflow: 'hidden' }}>
 
-      {/* ── Background character image ─────────────────────────────────── */}
+      {/* ── Background character image — full cover ───────────────────── */}
       {hasImg && (
         <img
           src={staticFile(imgFile)}
           style={{
             position: 'absolute',
-            top: 0, bottom: 0,
-            left: layout === 'character_left' ? 0 : 'auto',
-            right: layout === 'character_right' ? 0 : layout === 'character_center' ? 'auto' : 'auto',
-            width: layout === 'character_center' ? '100%' : '58%',
+            inset: 0,
+            width: '100%',
             height: '100%',
             objectFit: 'cover',
-            objectPosition: 'top center',
+            objectPosition: layout === 'character_right' ? 'right center'
+              : layout === 'character_left' ? 'left center'
+              : 'center',
           }}
         />
       )}
 
-      {/* ── Gradient overlay (text readability) ───────────────────────── */}
+      {/* ── Gradient overlay for text readability ─────────────────────── */}
       {hasImg && layout === 'character_right' && (
         <div style={{ position:'absolute', inset:0,
-          background:'linear-gradient(to right, rgba(0,0,0,0.92) 0%, rgba(0,0,0,0.85) 48%, rgba(0,0,0,0.15) 72%, transparent 100%)' }} />
+          background:'linear-gradient(to right, rgba(0,0,0,0.88) 0%, rgba(0,0,0,0.75) 42%, rgba(0,0,0,0.35) 65%, rgba(0,0,0,0.1) 100%)' }} />
       )}
       {hasImg && layout === 'character_left' && (
         <div style={{ position:'absolute', inset:0,
-          background:'linear-gradient(to left, rgba(0,0,0,0.92) 0%, rgba(0,0,0,0.85) 48%, rgba(0,0,0,0.15) 72%, transparent 100%)' }} />
+          background:'linear-gradient(to left, rgba(0,0,0,0.88) 0%, rgba(0,0,0,0.75) 42%, rgba(0,0,0,0.35) 65%, rgba(0,0,0,0.1) 100%)' }} />
       )}
       {hasImg && layout === 'character_center' && (
         <div style={{ position:'absolute', inset:0,
-          background:'linear-gradient(to bottom, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0.25) 40%, rgba(0,0,0,0.75) 100%)' }} />
+          background:'linear-gradient(to bottom, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0.2) 40%, rgba(0,0,0,0.7) 100%)' }} />
       )}
 
       {/* ── Ambient glow (accent color) ───────────────────────────────── */}
@@ -783,11 +926,13 @@ async function renderThumbnail({ thumbnailData, outputPath, sendLog = () => {} }
   }
 
   const jsx = buildThumbnailJsx(thumbnailData, publicImageName);
-  writeGeneratedFiles(jsx);
   if (!fs.existsSync(path.dirname(outputPath))) fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   sendLog('🖼️ Remotion render thumbnail...');
-  await renderStill('GeneratedVideo', outputPath, sendLog);
+  await withGeneratedLock(async () => {
+    writeGeneratedFiles(jsx);
+    await renderStill('GeneratedVideo', outputPath, sendLog);
+  });
   return outputPath;
 }
 
-module.exports = { writeGeneratedFiles, renderVideo, renderStill, renderThumbnail, generateIllustration, mixAudioWithDucking, getDefaultOutputDir, getSystemPrompt, REMOTION_DIR };
+module.exports = { writeGeneratedFiles, renderVideo, renderStill, renderThumbnail, generateIllustration, mixAudioWithDucking, getDefaultOutputDir, getSystemPrompt, REMOTION_DIR, remotionEnv };

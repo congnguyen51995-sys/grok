@@ -1,5 +1,5 @@
 /**
- * Stock Video Service — Pexels & Pixabay
+ * Stock Video Service — Pexels, Pixabay & DVIDS
  * Dùng cho Audio-to-Video: search + download clip stock miễn phí
  */
 const https = require('https');
@@ -107,6 +107,102 @@ function searchPexels(keyword, apiKey, perPage = 5) {
     });
 }
 
+// ─── Tìm kiếm DVIDS (video quân sự Mỹ, public domain, liên quan nhất trước) ──
+// Public key cài sẵn (chỉ đọc) — dùng khi người dùng chưa lưu key riêng trong Cài đặt
+const DEFAULT_DVIDS_KEY = 'key-6ab75f1e17922';
+// B-roll DVIDS thường 1-4 phút → bỏ clip quá dài (720p 3000k ≈ 22MB/phút)
+const DVIDS_MAX_DURATION = 240;
+
+// DVIDS API đôi khi treo/504 → timeout để không chặn cả batch, caller sẽ fallback Pexels/Pixabay
+const DVIDS_TIMEOUT_MS = 30000;
+
+function dvidsGet(pathAndQuery) {
+    return new Promise((resolve, reject) => {
+        const req = https.get(`https://api.dvidshub.net${pathAndQuery}`, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => {
+                if (res.statusCode === 403) return reject(new Error('DVIDS API key không hợp lệ'));
+                if (res.statusCode !== 200) return reject(new Error(`DVIDS HTTP ${res.statusCode}`));
+                try { resolve(JSON.parse(data)); } catch (e) { reject(new Error(`DVIDS parse: ${e.message}`)); }
+            });
+        });
+        req.setTimeout(DVIDS_TIMEOUT_MS, () => req.destroy(new Error('DVIDS timeout')));
+        req.on('error', e => reject(new Error(`DVIDS request: ${e.message}`)));
+    });
+}
+
+// DVIDS thường trả bitrate=0 → lấy từ tên file (...-1280x720-3000k.mp4), không có thì tính từ size
+function dvidsKbps(f, duration) {
+    if (f.bitrate > 0) return f.bitrate;
+    const m = String(f.src).match(/-(\d+)k\.mp4(\?|$)/i);
+    if (m) return parseInt(m[1], 10);
+    return f.size > 0 && duration > 0 ? Math.round(f.size * 8 / duration / 1000) : Infinity;
+}
+
+// Chọn mp4 ngang ≥1280px, bitrate ≤4000k (bản gốc/1080p 6000-9000k rất nặng)
+function pickDvidsFile(files, duration) {
+    const landscape = (files || []).filter(f => f.src && f.width > f.height).map(f => ({ ...f, kbps: dvidsKbps(f, duration) }));
+    const hd = landscape.filter(f => f.width >= 1280);
+    const light = hd.filter(f => f.kbps <= 4000).sort((a, b) => (b.width - a.width) || (b.kbps - a.kbps));
+    return light[0]
+        || hd.sort((a, b) => a.kbps - b.kbps)[0]
+        || landscape.sort((a, b) => (b.width - a.width) || (b.kbps - a.kbps))[0] || null;
+}
+
+// Không dùng cho B-roll: người nói trước camera, bản tin có MC
+const DVIDS_SKIP_CATEGORIES = new Set(['Interviews', 'Newscasts', 'PSA', 'Package']);
+
+async function searchDvids(keyword, apiKey, perPage = 5) {
+    const kw  = (keyword || 'military').trim().slice(0, 100);
+    const q   = encodeURIComponent(kw);
+    const key = encodeURIComponent(apiKey);
+    // sort=date trả video mới nhất chỉ cần nhắc keyword trong mô tả (vd buổi họp an toàn) → lạc đề.
+    // sort=score + category=B-Roll ra đúng cảnh quay thô của vũ khí được tìm.
+    const base = `/search?api_key=${key}&q=${q}&type=video&sort=score&aspect_ratio=16:9&max_results=${Math.min(Math.max(perPage * 4, 20), 50)}`;
+    let results = (await dvidsGet(`${base}&category=B-Roll`)).results || [];
+    if (results.length < perPage * 2) {
+        const more = (await dvidsGet(base).catch(() => ({}))).results || [];
+        const seen = new Set(results.map(r => r.id));
+        results = results.concat(more.filter(r => !seen.has(r.id)));
+    }
+
+    // Tên riêng/model (HIMARS, F-35, M1A2...) có trong tiêu đề → đưa lên đầu
+    const strong = kw.split(/\s+/).filter(t => /[A-Z0-9]/.test(t) && t.length >= 2).map(t => t.toLowerCase());
+    const titleHit = r => strong.some(t => `${r.title} ${r.keywords || ''}`.toLowerCase().includes(t));
+    const candidates = results
+        .filter(r => !DVIDS_SKIP_CATEGORIES.has(r.category) && r.duration >= 5 && r.duration <= DVIDS_MAX_DURATION)
+        .sort((a, b) => titleHit(b) - titleHit(a))
+        .slice(0, perPage);
+
+    const assets = await Promise.all(candidates.map(r =>
+        dvidsGet(`/asset?id=${encodeURIComponent(r.id)}&api_key=${key}`).then(a => a.results).catch(() => null)));
+
+    return assets.map(a => {
+        // duration ở /search đôi khi lệch /asset → lọc lại theo asset
+        if (!a || a.duration > DVIDS_MAX_DURATION) return null;
+        const file = pickDvidsFile(a.files, a.duration);
+        if (!file) return null;
+        const credit = (a.credit || []).map(c => [c.rank, c.name].filter(Boolean).join(' ')).join(', ');
+        return {
+            id: String(a.id).replace(/^video:/, ''),
+            url: file.src,
+            width: file.width,
+            height: file.height,
+            duration: a.duration,
+            startSec: a.time_start > 0 ? a.time_start : 0,
+            thumbnail: a.image || '',
+            provider: 'dvids',
+            tags: a.keywords || '',
+            title: a.title || '',
+            date: a.date || '',
+            credit: `DVIDS${credit ? ` — ${credit}` : ''}`,
+            pageUrl: a.url || '',
+        };
+    }).filter(Boolean)
+      .sort((a, b) => (b.width >= 1280) - (a.width >= 1280)); // footage SD cũ xuống cuối
+}
+
 // ─── Xen kẽ 2 mảng: [a0,b0,a1,b1,...] để kết quả đa dạng hơn ────────────────
 function interleave(a, b) {
     const out = [];
@@ -119,7 +215,7 @@ function interleave(a, b) {
 }
 
 // ─── Public: search ──────────────────────────────────────────────────────────
-// provider: 'pexels' | 'pixabay' | 'both'
+// provider: 'pexels' | 'pixabay' | 'dvids' | 'both'  ('both' = Pexels + Pixabay; DVIDS chỉ khi gọi riêng)
 // Khi provider === 'both': apiKey = { pexels: '...', pixabay: '...' }
 async function searchStockVideo({ keyword, provider, apiKey, perPage = 5 }) {
     try {
@@ -150,10 +246,11 @@ async function searchStockVideo({ keyword, provider, apiKey, perPage = 5 }) {
         }
 
         // Single provider
+        if (provider === 'dvids' && !apiKey) apiKey = DEFAULT_DVIDS_KEY;
         if (!apiKey) return { success: false, error: `Chưa cấu hình API key ${provider || ''}` };
-        const results = provider === 'pexels'
-            ? await searchPexels(keyword, apiKey, perPage)
-            : await searchPixabay(keyword, apiKey, perPage);
+        const results = provider === 'pexels'  ? await searchPexels(keyword, apiKey, perPage)
+                      : provider === 'dvids'   ? await searchDvids(keyword, apiKey, perPage)
+                      : await searchPixabay(keyword, apiKey, perPage);
         return { success: true, results };
     } catch (e) {
         return { success: false, error: e.message, results: [] };
@@ -161,8 +258,10 @@ async function searchStockVideo({ keyword, provider, apiKey, perPage = 5 }) {
 }
 
 // ─── Public: download clip ────────────────────────────────────────────────────
-async function downloadStockClip({ url, destPath }) {
+async function downloadStockClip({ url, destPath, tempName }) {
     if (!url) return { success: false, error: 'Thiếu URL' };
+    // Không truyền destPath → file tạm vào thư mục temp của hệ thống (renderer không có process.env.TEMP)
+    if (!destPath) destPath = path.join(require('os').tmpdir(), tempName || `stock_tmp_${Date.now()}.mp4`);
     const dir = path.dirname(destPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 

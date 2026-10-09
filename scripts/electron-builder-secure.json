@@ -7,7 +7,7 @@
   },
   "extraMetadata": {
     "main": "build-protected/main/bootstrap.js",
-    "version": "5.2.4"
+    "version": "5.4.5"
   },
   "files": [
     "dist/**/*",
@@ -28,6 +28,10 @@
     {
       "from": "assets/voicestudio",
       "to": "voicestudio"
+    },
+    {
+      "from": "flowkit",
+      "to": "flowkit"
     }
   ],
   "win": {

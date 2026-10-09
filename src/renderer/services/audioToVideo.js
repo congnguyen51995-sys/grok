@@ -119,7 +119,6 @@ async function transcribeAudioSingle(key, base64, mimeType, model) {
       ]}],
       config: {
         maxOutputTokens: 8192,
-        ...(/gemini-2\.5/.test(model || TRANSCRIBE_MODEL) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
         httpOptions: { timeout: 45_000 }
       }
     });
@@ -199,7 +198,6 @@ Return ONLY valid JSON — all start/end must be positive numbers in seconds:
         }],
         config: {
           maxOutputTokens: 8192,
-          ...(/gemini-2\.5/.test(model || TRANSCRIBE_MODEL) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
           httpOptions: { timeout: TRANSCRIBE_TIMEOUT_MS }
         }
       });
@@ -262,7 +260,6 @@ CRITICAL: end must always be GREATER than start. No -1 values allowed.
           ]}],
           config: {
             maxOutputTokens: 8192,
-            ...(/gemini-2\.5/.test(model || TRANSCRIBE_MODEL) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
             httpOptions: { timeout: TRANSCRIBE_TIMEOUT_MS }
           }
         });
@@ -679,7 +676,7 @@ Return ONLY valid JSON (no markdown, no extra text):
 }`
         }]
       }],
-      config: { maxOutputTokens: 3000, thinkingConfig: { thinkingBudget: 0 } }
+      config: { maxOutputTokens: 3000 }
     });
 
     const raw = (response?.text || '').trim();
@@ -737,7 +734,7 @@ Return ONLY valid JSON (no markdown):
   "mainSetting": "primary visual setting description (e.g. modern office, dense jungle, city street at night)",
   "visualStyle": "recommended cinematography style (e.g. photorealistic, cinematic, documentary)"
 }` }] }],
-      config: { maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } }
+      config: { maxOutputTokens: 2048 }
     });
     const raw = (res?.text || '').trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
     const parsed = extractFirstJSON(raw);
@@ -794,7 +791,7 @@ Return ONLY a JSON array with exactly ${batch.length} objects:
         const res = await ai.models.generateContent({
           model: LLM_MODEL,
           contents: [{ role: 'user', parts: [{ text: scenesPrompt }] }],
-          config: { maxOutputTokens: 4096, thinkingConfig: { thinkingBudget: 0 } }
+          config: { maxOutputTokens: 4096 }
         });
         const raw = (res?.text || '').trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
         const m = raw.match(/\[[\s\S]*\]/);
@@ -868,7 +865,7 @@ Return ONLY a JSON array with exactly ${batch.length} strings, one per segment:
         const response = await ai.models.generateContent({
           model: LLM_MODEL,
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          config: { maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } }
+          config: { maxOutputTokens: 2048 }
         });
         const raw = (response?.text || '').trim()
           .replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
@@ -1034,7 +1031,6 @@ REMINDER: Include ALL 9 required elements — Subject, Environment, Camera Movem
       config: {
         systemInstruction,
         maxOutputTokens: 1024,
-        thinkingConfig: { thinkingBudget: 0 },
         temperature: 0.7
       }
     });
@@ -1187,7 +1183,6 @@ No markdown, no extra text outside the JSON array.`;
       config: {
         systemInstruction,
         maxOutputTokens: chunks.length * 500,
-        thinkingConfig: { thinkingBudget: 0 },
         temperature: 0.65
       }
     });
@@ -1398,7 +1393,7 @@ Return ONLY valid JSON (no markdown, no explanation):
   "recurring_motifs": ["3-5 visual symbols/themes repeated throughout"],
   "camera_style": "preferred camera movements and shot types"
 }` }] }],
-        config: { maxOutputTokens: 1200, thinkingConfig: { thinkingBudget: 0 }, temperature: 0.4 }
+        config: { maxOutputTokens: 1200, temperature: 0.4 }
       });
       return (res?.text || '').trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
     }, apiKeys, { maxCycles: 2 });
@@ -1561,7 +1556,6 @@ Return ONLY a JSON array of exactly ${batchChunks.length} English Veo prompt str
           config: {
             systemInstruction,
             maxOutputTokens: batchChunks.length * 480,
-            thinkingConfig: { thinkingBudget: 0 },
             temperature: 0.6
           }
         });
@@ -1609,7 +1603,7 @@ Write ONE Veo prompt that visually illustrates this audio. Return ONLY the promp
             const res = await ai.models.generateContent({
               model: LLM_MODEL,
               contents: [{ role: 'user', parts: [{ text: singleMsg }] }],
-              config: { systemInstruction, maxOutputTokens: 500, thinkingConfig: { thinkingBudget: 0 }, temperature: 0.6 }
+              config: { systemInstruction, maxOutputTokens: 500, temperature: 0.6 }
             });
             return (res?.text || '').trim().replace(/^["']|["']$/g, '');
           }, apiKeys, {
@@ -1684,7 +1678,7 @@ Return ONLY a JSON array of exactly ${batch.length} keyword strings:
 ["keyword", "keyword", ...]`
             }]
           }],
-          config: { maxOutputTokens: batch.length * 20, thinkingConfig: { thinkingBudget: 0 } }
+          config: { maxOutputTokens: batch.length * 20 }
         });
 
         const raw = (response?.text || '').trim()

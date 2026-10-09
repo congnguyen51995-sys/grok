@@ -15,7 +15,8 @@ import {
   Sparkles, Play, Code2, Terminal, FolderOpen, Video,
   Copy, Check, ChevronDown, ChevronUp, Loader2,
   AlertCircle, CheckCircle2, BookOpen, X, Info,
-  ImagePlus, Film, Upload, Mic, MicOff, Volume2, Wand2,
+  ImagePlus, Film, Upload, Mic, MicOff, Volume2, Wand2, Clapperboard,
+  Send, MessageSquare, RotateCcw, RefreshCw,
 } from 'lucide-react';
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -53,6 +54,16 @@ const EXAMPLE_PROMPTS = [
   'Lower-third cho livestream: tên "Nguyễn Văn A" slide từ trái, chức danh xuất hiện sau. Nền gradient xanh bán trong suốt. 5 giây.',
   'Slide 3 cảnh: nền đỏ "Vấn đề" → nền xanh "Giải pháp" → nền vàng "Kết quả". Mỗi cảnh 3s, wipe sang phải.',
   'Logo reveal: hình tròn xoay → phát sáng → hiện chữ "AI STUDIO" typewriter. Nền tối, màu cyan + trắng. 8 giây.',
+];
+
+const EXAMPLE_EDIT_PROMPTS = [
+  'Thêm color grading kinh dị: màu lạnh xanh, tối, tương phản cao, ánh sáng mờ nhạt.',
+  'Thêm tiêu đề "KINH DỊ CÓ THẬT" nổi bật ở giữa đầu video, xuất hiện từ từ, sau 3 giây mờ dần.',
+  'Zoom in chậm từ đầu đến cuối video (Ken Burns effect), hướng zoom vào trung tâm.',
+  'Thêm watermark logo góc phải dưới: chữ "@ThanhCongMedia" màu trắng, opacity 60%, font bold.',
+  'Tốc độ 1.1x, thêm overlay mờ nhẹ màu đỏ thẫm (rgba 120,0,0,0.15) trên toàn bộ video.',
+  'Thêm lower-third tên kênh slide từ trái vào lúc 0s, hiển thị 5 giây rồi slide ra.',
+  'Áp hiệu ứng phim cũ: grain, vignette tối góc, màu desaturate, flicker nhẹ.',
 ];
 
 // 10MB = threshold để đọc base64 preview; > threshold thì upload qua main process
@@ -361,17 +372,26 @@ export default function RemotionStudio() {
   // ── AI Assets state ────────────────────────────────────────────────────────
   const [missingAssets,  setMissingAssets]  = useState([]);
 
+  // ── Source video for editing ──────────────────────────────────────────────
+  const [srcVideo,      setSrcVideo]      = useState(null); // {path, name, durationSec, mimeType, size, status, uploadedUri}
+
   const [refFiles,      setRefFiles]      = useState([]);
   const [phase,         setPhase]         = useState('idle');
   const [generatedCode, setGeneratedCode] = useState(() => localStorage.getItem(LS_LAST_CODE) || '');
   const [streamBuffer,  setStreamBuffer]  = useState('');
   const [codeOpen,      setCodeOpen]      = useState(false);
   const [logs,          setLogs]          = useState([]);
-  const [logOpen,       setLogOpen]       = useState(true);
+  const [logOpen,       setLogOpen]       = useState(false);
   const [videoPath,     setVideoPath]     = useState(null);
   const [errorMsg,      setErrorMsg]      = useState('');
   const [systemPrompt,  setSystemPrompt]  = useState('');
   const [showHelp,      setShowHelp]      = useState(false);
+
+  // ── Chat state ────────────────────────────────────────────────────────────
+  const [messages,   setMessages]   = useState([]); // [{id, role:'user'|'ai', content, phase?, videoPath?}]
+  const [chatInput,  setChatInput]  = useState('');
+  const chatEndRef   = useRef(null);
+  const chatInputRef = useRef(null);
 
   useEffect(() => {
     window.electronAPI?.remotionGetSystemPrompt?.().then(p => setSystemPrompt(p || ''));
@@ -439,6 +459,13 @@ export default function RemotionStudio() {
   };
 
   const handleRemoveRefFile = (id) => setRefFiles(prev => prev.filter(r => r.id !== id));
+
+  // ── Source video picker ───────────────────────────────────────────────────
+  const handleSelectSrcVideo = async () => {
+    const info = await window.electronAPI?.remotionSelectSourceVideo?.();
+    if (!info) return;
+    setSrcVideo({ ...info, status: 'ready', uploadedUri: null });
+  };
 
   // ── Upload files cần thiết qua main process ──────────────────────────────
   const ensureFilesUploaded = async (refs, apiKey) => {
@@ -554,7 +581,7 @@ export default function RemotionStudio() {
     : selectedSec === -1 ? customSecFinal * 30
     : selectedSec * 30;
 
-  function buildFullPrompt() {
+  function buildFullPrompt(promptText) {
     const { width, height } = ASPECT_OPTIONS[aspect];
     const hasVideoRef = refFiles.some(r => r.mimeType?.startsWith('video/') && ['ready', 'uploaded'].includes(r.status));
     const hasImageRef = refFiles.some(r => r.mimeType?.startsWith('image/') && ['ready', 'uploaded'].includes(r.status));
@@ -563,7 +590,37 @@ export default function RemotionStudio() {
       : '';
 
     let refSection = '';
-    if (hasVideoRef) {
+
+    // Chế độ chỉnh sửa video nguồn (ưu tiên hơn refFiles)
+    if (srcVideo?.status === 'ready' || srcVideo?.status === 'uploaded') {
+      const srcDurSec  = srcVideo.durationSec || 0;
+      const srcFrames  = Math.round(srcDurSec * 30);
+      const durLine    = srcFrames > 0
+        ? `BẮT BUỘC set COMPOSITION_DURATION_FRAMES = ${srcFrames} (khớp đúng duration video nguồn ${srcDurSec.toFixed(1)}s)`
+        : `Set COMPOSITION_DURATION_FRAMES phù hợp với nội dung`;
+      refSection = `═══ CHẾ ĐỘ CHỈNH SỬA VIDEO NGUỒN ═══
+Video nguồn đã được sao chép vào thư mục public với tên 'input.mp4'.
+${srcVideo.uploadedUri ? 'Tôi đính kèm video nguồn để AI phân tích nội dung.' : ''}
+
+BẮT BUỘC — KHÔNG ĐƯỢC BỎ QUA:
+1. import { AbsoluteFill, Video, useCurrentFrame, useVideoConfig, interpolate, staticFile } from 'remotion';
+2. Layer nền: <Video src={staticFile('input.mp4')} style={{width:'100%', height:'100%', objectFit:'cover'}} />
+3. Tất cả hiệu ứng/overlay đặt BÊN TRÊN Video trong một <AbsoluteFill> khác (position absolute)
+4. ${durLine}
+
+CÁC HIỆU ỨNG CÓ THỂ ÁP DỤNG:
+- Color grading: style={{filter:'brightness(0.85) contrast(1.3) saturate(0.6) hue-rotate(5deg)'}} trên thẻ Video
+- Slow zoom (Ken Burns): const frame=useCurrentFrame(); style={{transform:\`scale(\${1+frame/totalFrames*0.1})\`}}
+- Pan: thay đổi translateX/Y theo frame
+- Tốc độ: <Video playbackRate={1.05} />  (0.5x → 2x)
+- Trim/cắt đoạn: <Video startFrom={startFrame} endAt={endFrame} />
+- Text overlay: <AbsoluteFill style={{justifyContent:'flex-end',alignItems:'center',paddingBottom:60}}><p style={{color:'white',fontSize:36,textShadow:'2px 2px 4px black'}}>Text</p></AbsoluteFill>
+- Watermark: <AbsoluteFill style={{justifyContent:'flex-end',alignItems:'flex-end',padding:20}}><span style={{color:'white',opacity:0.6,fontSize:16}}>@channel</span></AbsoluteFill>
+- Vignette overlay: <AbsoluteFill style={{background:'radial-gradient(ellipse at center,transparent 60%,rgba(0,0,0,0.7) 100%)'}} />
+- Hiệu ứng grain/noise: dùng SVG feTurbulence filter trong một div overlay bán trong suốt
+
+\n`;
+    } else if (hasVideoRef) {
       refSection = `CHẾ ĐỘ CHỈNH SỬA VIDEO: Tôi đính kèm video tham chiếu. Hãy phân tích kỹ:\n` +
         `1. Phân chia video thành các cảnh/đoạn logic\n` +
         `2. Với mỗi đoạn, tạo <Sequence from={N} durationInFrames={M}> tương ứng về timing\n` +
@@ -583,28 +640,65 @@ export default function RemotionStudio() {
         `Dùng ảnh tham chiếu làm nhân vật/nền chính trong video — KHÔNG vẽ nhân vật bằng CSS shapes.\n\n`;
     }
 
-    const durationLine = totalFrames === null
-      ? `- COMPOSITION_DURATION_FRAMES = <tự xác định phù hợp với nội dung, tối thiểu 150 frames>`
-      : `- COMPOSITION_DURATION_FRAMES = ${totalFrames}`;
-    return `${systemPrompt}\n\n${refSection}YÊU CẦU VIDEO:\n${prompt}${audioSection}\n\n[RÀNG BUỘC BẮT BUỘC — KHÔNG THAY ĐỔI]\n- COMPOSITION_WIDTH = ${width}\n- COMPOSITION_HEIGHT = ${height}\n- COMPOSITION_FPS = 30\n${durationLine}`;
+    // Duration: nếu có srcVideo thì override bằng duration thực tế
+    const srcFramesOverride = srcVideo?.durationSec ? Math.round(srcVideo.durationSec * 30) : null;
+    const durationLine = srcFramesOverride
+      ? `- COMPOSITION_DURATION_FRAMES = ${srcFramesOverride}`
+      : totalFrames === null
+        ? `- COMPOSITION_DURATION_FRAMES = <tự xác định phù hợp với nội dung, tối thiểu 150 frames>`
+        : `- COMPOSITION_DURATION_FRAMES = ${totalFrames}`;
+
+    return `${systemPrompt}\n\n${refSection}YÊU CẦU VIDEO:\n${promptText}${audioSection}\n\n[RÀNG BUỘC BẮT BUỘC — KHÔNG THAY ĐỔI]\n- COMPOSITION_WIDTH = ${width}\n- COMPOSITION_HEIGHT = ${height}\n- COMPOSITION_FPS = 30\n${durationLine}`;
   }
 
   // ── Generate ─────────────────────────────────────────────────────────────
   const handleGenerate = async () => {
     const keys = loadKeys();
     if (!keys.length) return setErrorMsg('Chưa có Gemini API key. Vào Cài đặt → Gemini để thêm key.');
-    if (!prompt.trim()) return setErrorMsg('Nhập mô tả video trước.');
+    if (!prompt.trim()) return setErrorMsg('Nhập mô tả cần chỉnh sửa trước.');
     setErrorMsg(''); setPhase('generating'); setStreamBuffer('');
     setGeneratedCode(''); setVideoPath(null);
     setNarrationStatus('idle'); setScriptEditing(false);
     localStorage.setItem(LS_LAST_PROMPT, prompt);
     localStorage.setItem(LS_MODEL, model);
+    setLogOpen(true);
+
+    // ── Xử lý video nguồn nếu có ────────────────────────────────────────
+    let srcVideoPart = null;
+    if (srcVideo?.path && ['ready', 'uploaded'].includes(srcVideo.status)) {
+      // 1. Copy vào public/input.mp4
+      setLogs(prev => [...prev.slice(-299), `📋 Copy video nguồn → public/input.mp4...`]);
+      const copyRes = await window.electronAPI?.remotionCopyVideoToPublic?.({ srcPath: srcVideo.path });
+      if (!copyRes?.success) {
+        setLogs(prev => [...prev.slice(-299), `⚠ Copy thất bại: ${copyRes?.error} — tiếp tục không có video nguồn`]);
+      } else {
+        setLogs(prev => [...prev.slice(-299), `✅ Copy xong → public/input.mp4`]);
+      }
+
+      // 2. Upload lên Gemini File API để AI phân tích nội dung
+      if (!srcVideo.uploadedUri) {
+        setLogs(prev => [...prev.slice(-299), `📤 Upload video nguồn lên Gemini để phân tích...`]);
+        setSrcVideo(v => ({ ...v, status: 'uploading' }));
+        try {
+          const result = await window.electronAPI?.remotionUploadToGeminiFileApi?.({
+            filePath: srcVideo.path, mimeType: srcVideo.mimeType, apiKey: keys[0],
+          });
+          setSrcVideo(v => ({ ...v, uploadedUri: result.uri, status: 'uploaded' }));
+          srcVideoPart = { fileData: { mimeType: srcVideo.mimeType, fileUri: result.uri } };
+          setLogs(prev => [...prev.slice(-299), `✅ Upload xong — Gemini sẽ phân tích video nguồn`]);
+        } catch (e) {
+          setSrcVideo(v => ({ ...v, status: 'ready' }));
+          setLogs(prev => [...prev.slice(-299), `⚠ Upload thất bại: ${e.message} — AI không xem được video nhưng vẫn viết code`]);
+        }
+      } else {
+        srcVideoPart = { fileData: { mimeType: srcVideo.mimeType, fileUri: srcVideo.uploadedUri } };
+      }
+    }
 
     // Copy ảnh tham chiếu vào remotion/public/ref_N.ext để code dùng staticFile()
     const imageRefs = refFiles.filter(r => r.mimeType?.startsWith('image/') && r.path && ['ready','uploaded'].includes(r.status));
     if (imageRefs.length > 0) {
       setLogs(prev => [...prev.slice(-299), `📋 Copy ${imageRefs.length} ảnh tham chiếu vào public folder...`]);
-      setLogOpen(true);
       await window.electronAPI?.remotionCopyRefImagesToPublic?.({ filePaths: imageRefs.map(r => r.path) });
     }
 
@@ -615,7 +709,6 @@ export default function RemotionStudio() {
     let currentRefs = refFiles;
     if (hasNeedUpload) {
       setLogs(prev => [...prev.slice(-299),'📤 Chuẩn bị upload file tham chiếu...']);
-      setLogOpen(true);
       currentRefs = await ensureFilesUploaded(refFiles, keys[0]);
     }
 
@@ -641,10 +734,13 @@ export default function RemotionStudio() {
       }
     }
 
-    const refParts = buildRefParts(currentRefs);
+    const refParts = [
+      ...(srcVideoPart ? [srcVideoPart] : []),
+      ...buildRefParts(currentRefs),
+    ];
     let buffer = '';
     try {
-      const raw = await callGeminiStream(keys, buildFullPrompt(), model, refParts, (chunk) => {
+      const raw = await callGeminiStream(keys, buildFullPrompt(prompt), model, refParts, (chunk) => {
         buffer += chunk;
         setStreamBuffer(buffer);
       });
@@ -689,6 +785,166 @@ export default function RemotionStudio() {
     if (dir) { setOutputDir(dir); localStorage.setItem(LS_OUT_DIR, dir); }
   };
 
+  // ── New Chat session ──────────────────────────────────────────────────────
+  const handleNewSession = () => {
+    setMessages([]);
+    setGeneratedCode('');
+    setVideoPath(null);
+    setErrorMsg('');
+    setPhase('idle');
+    setLogs([]);
+    setMissingAssets([]);
+    setChatInput('');
+    localStorage.removeItem(LS_LAST_CODE);
+  };
+
+  // ── Chat send handler ─────────────────────────────────────────────────────
+  const handleChat = async () => {
+    const userMsg = chatInput.trim();
+    if (!userMsg || isBusy) return;
+    setChatInput('');
+
+    const keys = loadKeys();
+    if (!keys.length) {
+      const ts = Date.now();
+      setMessages(prev => [...prev,
+        { id: ts,     role: 'user', content: userMsg },
+        { id: ts + 1, role: 'ai',   content: 'Chưa có Gemini API key. Vào Cài đặt → Gemini để thêm key.', phase: 'error' },
+      ]);
+      return;
+    }
+
+    const userMsgId = Date.now();
+    const aiMsgId   = userMsgId + 1;
+    setMessages(prev => [...prev,
+      { id: userMsgId, role: 'user', content: userMsg },
+      { id: aiMsgId,   role: 'ai',   content: '', phase: 'generating' },
+    ]);
+
+    setPhase('generating');
+    setStreamBuffer('');
+    setVideoPath(null);
+    setErrorMsg('');
+    setLogOpen(false);
+    localStorage.setItem(LS_MODEL, model);
+
+    // Upload source video if needed
+    let srcVideoPart = null;
+    if (srcVideo?.path && ['ready', 'uploaded'].includes(srcVideo.status)) {
+      setLogs(prev => [...prev.slice(-299), '📋 Copy video nguồn → public/input.mp4...']);
+      const copyRes = await window.electronAPI?.remotionCopyVideoToPublic?.({ srcPath: srcVideo.path });
+      if (copyRes?.success) setLogs(prev => [...prev.slice(-299), '✅ Copy xong → public/input.mp4']);
+      if (!srcVideo.uploadedUri) {
+        setLogs(prev => [...prev.slice(-299), '📤 Upload video nguồn lên Gemini...']);
+        setSrcVideo(v => ({ ...v, status: 'uploading' }));
+        try {
+          const result = await window.electronAPI?.remotionUploadToGeminiFileApi?.({
+            filePath: srcVideo.path, mimeType: srcVideo.mimeType, apiKey: keys[0],
+          });
+          setSrcVideo(v => ({ ...v, uploadedUri: result.uri, status: 'uploaded' }));
+          srcVideoPart = { fileData: { mimeType: srcVideo.mimeType, fileUri: result.uri } };
+          setLogs(prev => [...prev.slice(-299), '✅ Upload xong']);
+        } catch (e) {
+          setSrcVideo(v => ({ ...v, status: 'ready' }));
+          setLogs(prev => [...prev.slice(-299), `⚠ Upload thất bại: ${e.message}`]);
+        }
+      } else {
+        srcVideoPart = { fileData: { mimeType: srcVideo.mimeType, fileUri: srcVideo.uploadedUri } };
+      }
+    }
+
+    // Copy ref images to public
+    const imageRefs = refFiles.filter(r => r.mimeType?.startsWith('image/') && r.path && ['ready','uploaded'].includes(r.status));
+    if (imageRefs.length > 0) {
+      await window.electronAPI?.remotionCopyRefImagesToPublic?.({ filePaths: imageRefs.map(r => r.path) });
+    }
+
+    // Upload large ref files
+    const hasNeedUpload = refFiles.some(r =>
+      r.uploadedUri == null && (r.mimeType.startsWith('video/') || (r.mimeType.startsWith('image/') && r.size > PREVIEW_MAX_BYTES))
+    );
+    let currentRefs = refFiles;
+    if (hasNeedUpload) {
+      setLogs(prev => [...prev.slice(-299), '📤 Upload file tham chiếu...']);
+      currentRefs = await ensureFilesUploaded(refFiles, keys[0]);
+    }
+
+    // TTS
+    if (ttsEnabled) {
+      try {
+        setNarrationStatus('scripting');
+        const durationSec = totalFrames ? Math.round(totalFrames / 30) : null;
+        const script = await generateNarrationScript(userMsg, durationSec, keys, model);
+        setNarrationText(script);
+        setNarrationStatus('tts');
+        setLogs(prev => [...prev.slice(-299), `🎙️ Tạo audio TTS...`]);
+        await generateNarration(script);
+        setLogs(prev => [...prev.slice(-299), '✅ narration.wav sẵn sàng']);
+      } catch (err) {
+        setNarrationStatus('error');
+        setLogs(prev => [...prev.slice(-299), `❌ TTS lỗi: ${err.message}`]);
+      }
+    }
+
+    // Build prompt: update existing code OR create new
+    let finalPrompt;
+    if (generatedCode) {
+      finalPrompt = `[CODE REMOTION HIỆN TẠI — giữ nguyên tất cả hiệu ứng, chỉ thêm/sửa theo yêu cầu mới]\n\`\`\`jsx\n${generatedCode}\n\`\`\`\n\n[YÊU CẦU CẬP NHẬT]\n${userMsg}\n\nTrả về CODE JSX HOÀN CHỈNH đã cập nhật. Không giải thích, chỉ trả về code duy nhất.`;
+    } else {
+      finalPrompt = buildFullPrompt(userMsg);
+    }
+
+    const refParts = [
+      ...(srcVideoPart ? [srcVideoPart] : []),
+      ...buildRefParts(currentRefs),
+    ];
+
+    let buffer = '';
+    try {
+      const raw = await callGeminiStream(keys, finalPrompt, model, refParts, (chunk) => {
+        buffer += chunk;
+        setStreamBuffer(buffer);
+      });
+      const code = extractCode(raw);
+      setGeneratedCode(code);
+      setStreamBuffer('');
+      localStorage.setItem(LS_LAST_CODE, code);
+      setMissingAssets(detectStaticFileRefs(code));
+
+      // Update AI message → rendering
+      setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, phase: 'rendering' } : m));
+      setPhase('rendering');
+      setLogs([]);
+      setLogOpen(true);
+
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const result = await window.electronAPI?.remotionRenderCode?.({
+        code,
+        outputFilename: `video_${ts}.mp4`,
+        outputDir: outputDir || undefined,
+      });
+
+      if (result?.ok) {
+        setVideoPath(result.path);
+        setPhase('done');
+        setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, phase: 'done', videoPath: result.path } : m));
+      } else {
+        const errMsg = result?.error || 'Render thất bại';
+        setPhase('error');
+        setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, phase: 'error', content: errMsg } : m));
+      }
+    } catch (err) {
+      const errMsg = err.message || 'Gemini thất bại';
+      setPhase('error');
+      setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, phase: 'error', content: errMsg } : m));
+    }
+  };
+
+  // Auto-scroll khi messages thay đổi
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, streamBuffer]);
+
   const isBusy       = phase === 'generating' || phase === 'rendering';
   const isGenerating = phase === 'generating';
   const isRendering  = phase === 'rendering';
@@ -706,14 +962,22 @@ export default function RemotionStudio() {
         <div className="px-5 py-3 border-b border-slate-800 flex items-center justify-between shrink-0">
           <div>
             <h1 className="text-[14px] font-black text-white flex items-center gap-2">
-              <Video className="w-4 h-4 text-violet-400" /> Remotion Studio
+              <MessageSquare className="w-4 h-4 text-violet-400" /> AI Video Chat
             </h1>
-            <p className="text-[10px] text-slate-500">Gemini → Code → Remotion → MP4</p>
+            <p className="text-[10px] text-slate-500">Chat → Gemini → Code → Remotion → MP4</p>
           </div>
-          <button onClick={() => setShowHelp(true)}
-            className="flex items-center gap-1.5 text-[11px] font-bold text-violet-400 hover:text-violet-300 bg-violet-900/20 border border-violet-800/40 px-3 py-1.5 rounded-lg transition-all">
-            <BookOpen className="w-3.5 h-3.5" /> Hướng dẫn
-          </button>
+          <div className="flex items-center gap-2">
+            {messages.length > 0 && (
+              <button onClick={handleNewSession}
+                className="flex items-center gap-1 text-[10px] font-bold text-slate-400 hover:text-red-400 border border-slate-700 hover:border-red-700 px-2 py-1 rounded-lg transition-all">
+                <RotateCcw className="w-3 h-3" /> New
+              </button>
+            )}
+            <button onClick={() => setShowHelp(true)}
+              className="flex items-center gap-1.5 text-[11px] font-bold text-violet-400 hover:text-violet-300 bg-violet-900/20 border border-violet-800/40 px-3 py-1.5 rounded-lg transition-all">
+              <BookOpen className="w-3.5 h-3.5" /> Hướng dẫn
+            </button>
+          </div>
         </div>
 
         {/* ── Setup status banner ── */}
@@ -918,6 +1182,51 @@ export default function RemotionStudio() {
             )}
           </div>
 
+          {/* ── Video nguồn để chỉnh sửa ── */}
+          <div className="border border-slate-800 rounded-xl overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-2.5 bg-slate-900/30">
+              <span className="flex items-center gap-2 text-[11px] font-black text-slate-300">
+                <Clapperboard className="w-3.5 h-3.5 text-orange-400" /> Video nguồn
+                <span className="text-[9px] font-normal text-slate-600">(để chỉnh sửa)</span>
+              </span>
+              {srcVideo && (
+                <button onClick={() => setSrcVideo(null)}
+                  className="text-[9px] text-slate-600 hover:text-red-400 transition-colors">✕ Xóa</button>
+              )}
+            </div>
+            <div className="px-4 pb-4 pt-3 bg-[#0d1628] border-t border-slate-800">
+              {!srcVideo ? (
+                <button onClick={handleSelectSrcVideo}
+                  className="w-full h-16 flex flex-col items-center justify-center gap-1.5 border border-dashed border-slate-700 hover:border-orange-500 rounded-lg text-slate-600 hover:text-orange-400 transition-all bg-slate-900/20 hover:bg-orange-900/10">
+                  <Film className="w-5 h-5" />
+                  <span className="text-[10px]">Nhấn để chọn video muốn chỉnh sửa</span>
+                </button>
+              ) : (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 bg-[#131d30] rounded-lg px-3 py-2 border border-slate-700">
+                    <Film className="w-4 h-4 text-orange-400 shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[11px] font-bold text-slate-200 truncate">{srcVideo.name}</p>
+                      <p className="text-[9px] text-slate-500">
+                        {fmtSize(srcVideo.size)} • {srcVideo.durationSec > 0 ? `${srcVideo.durationSec.toFixed(1)}s` : 'unknown'}
+                        {' • '}{srcVideo.status === 'uploaded' ? <span className="text-emerald-400">✓ Gemini đã phân tích</span>
+                          : srcVideo.status === 'uploading' ? <span className="text-amber-400">⏳ Đang upload...</span>
+                          : <span className="text-slate-500">sẽ upload khi tạo code</span>}
+                      </p>
+                    </div>
+                  </div>
+                  <button onClick={handleSelectSrcVideo}
+                    className="w-full text-[10px] text-slate-600 hover:text-slate-400 text-center py-1 transition-colors">
+                    ↺ Đổi video
+                  </button>
+                </div>
+              )}
+              {srcVideo && (
+                <p className="text-[9px] text-orange-500/70 mt-2">💡 AI sẽ dùng <code className="bg-slate-800 px-1 rounded">staticFile('input.mp4')</code> làm layer nền</p>
+              )}
+            </div>
+          </div>
+
           {/* ── Reference Files ── */}
           <div>
             <div className="flex items-center justify-between mb-1.5">
@@ -954,192 +1263,189 @@ export default function RemotionStudio() {
             )}
           </div>
 
-          {/* Prompt */}
-          <div>
-            <div className="flex items-center justify-between mb-1.5">
-              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Mô tả video</label>
-              {readyRefCount > 0 && <span className="text-[9px] text-emerald-500 font-bold">{readyRefCount} tham chiếu sẵn sàng</span>}
-            </div>
-            <textarea value={prompt} onChange={e => setPrompt(e.target.value)}
-              placeholder={readyRefCount > 0
-                ? 'Mô tả + có thể thêm "tái tạo phong cách của ảnh/video tham chiếu"...'
-                : 'Ví dụ: "Video intro YouTube phong cách neon tím, tên kênh xuất hiện từng chữ..."'}
-              rows={6}
-              className="w-full bg-[#131d30] border border-slate-700 text-slate-200 text-[12px] rounded-lg px-3 py-2.5 focus:outline-none focus:border-violet-500 resize-none custom-scrollbar placeholder-slate-600"
-            />
-            <div className="mt-1.5">
-              <p className="text-[9px] text-slate-600 mb-1">Ví dụ prompt:</p>
-              <div className="space-y-1 max-h-28 overflow-y-auto custom-scrollbar">
-                {EXAMPLE_PROMPTS.map((ex, i) => (
-                  <button key={i} onClick={() => setPrompt(ex)}
-                    className="w-full text-left text-[9px] text-slate-500 hover:text-slate-300 bg-slate-800/40 hover:bg-slate-800 border border-slate-800 rounded px-2 py-1.5 transition-all line-clamp-2 leading-relaxed">
+          {/* Audio Mixer — luôn hiển thị trong left panel */}
+          <AudioMixerPanel collapsed={true} />
+
+          {/* Re-render button khi có code sẵn */}
+          {generatedCode && (
+            <button onClick={handleRender} disabled={isBusy}
+              className="w-full flex items-center justify-center gap-2 py-2 rounded-xl font-bold text-[12px] transition-all disabled:opacity-50 disabled:cursor-not-allowed bg-slate-700 hover:bg-slate-600 text-slate-300 border border-slate-600">
+              {isRendering
+                ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Remotion render...</>
+                : <><RefreshCw className="w-3.5 h-3.5" /> Re-render (không gọi Gemini)</>}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* ── RIGHT PANEL — Chat Interface ── */}
+      <div className="flex-1 flex flex-col h-full overflow-hidden bg-[#0a0f18]">
+
+        {/* Header */}
+        <div className="h-11 border-b border-slate-800 px-5 flex items-center justify-between shrink-0 bg-[#0d1424]">
+          <span className="flex items-center gap-2 text-[12px] font-bold text-slate-400">
+            {isBusy && <Loader2 className="w-4 h-4 animate-spin text-violet-400" />}
+            {isGenerating ? '⏳ Gemini đang viết code...'
+             : isRendering  ? '🎞️ Remotion đang render...'
+             : isDone       ? '✅ Video render thành công!'
+             : messages.length > 0 ? `💬 ${messages.filter(m => m.role === 'user').length} lệnh đã gửi${generatedCode ? ' • Code sẵn sàng' : ''}`
+             : '💡 Chat với AI để tạo/chỉnh sửa video'}
+          </span>
+          {generatedCode && (
+            <button onClick={() => setCodeOpen(v => !v)}
+              className="flex items-center gap-1 text-[10px] text-slate-500 hover:text-violet-400 border border-slate-700 px-2 py-1 rounded transition-colors">
+              <Code2 className="w-3 h-3" /> {codeOpen ? 'Ẩn code' : 'Xem code'}
+            </button>
+          )}
+        </div>
+
+        {/* Code viewer (collapsible) */}
+        {generatedCode && codeOpen && (
+          <div className="px-4 pt-3 shrink-0 max-h-72 overflow-y-auto custom-scrollbar">
+            <CodeViewer code={generatedCode} open={true} onToggle={() => setCodeOpen(false)} />
+          </div>
+        )}
+
+        {/* Messages area */}
+        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3 custom-scrollbar">
+          {messages.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center text-slate-700 py-8">
+              <MessageSquare className="w-12 h-12 mb-4 opacity-20" />
+              <p className="text-[14px] font-bold text-slate-600">Bắt đầu chat với AI Video Editor</p>
+              <p className="text-[11px] mt-1 text-slate-700 text-center max-w-xs">
+                {srcVideo ? 'Mô tả cách chỉnh sửa video nguồn' : 'Mô tả video muốn tạo, AI tự viết code và render'}
+              </p>
+              <div className="mt-6 grid grid-cols-2 gap-2 w-full max-w-lg">
+                {(srcVideo ? EXAMPLE_EDIT_PROMPTS : EXAMPLE_PROMPTS).slice(0, 4).map((ex, i) => (
+                  <button key={i} onClick={() => setChatInput(ex)}
+                    className="text-left text-[10px] text-slate-500 hover:text-slate-300 bg-slate-800/40 hover:bg-slate-800 border border-slate-800 rounded-lg px-3 py-2.5 transition-all line-clamp-2 leading-relaxed">
                     {ex}
                   </button>
                 ))}
               </div>
             </div>
-          </div>
-
-          {/* Error */}
-          {errorMsg && (
-            <div className="flex items-start gap-2 bg-red-900/20 border border-red-700/40 rounded-lg px-3 py-2.5">
-              <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-              <p className="text-[11px] text-red-300">{errorMsg}</p>
-            </div>
-          )}
-
-          {/* Action buttons */}
-          <div className="space-y-2">
-            <button onClick={handleGenerate} disabled={isBusy}
-              className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl font-black text-[13px] transition-all disabled:opacity-50 disabled:cursor-not-allowed bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-500 hover:to-purple-500 text-white shadow-lg shadow-violet-900/30">
-              {isGenerating
-                ? <><Loader2 className="w-4 h-4 animate-spin" /> Đang tạo code...</>
-                : <><Sparkles className="w-4 h-4" /> Tạo Code{readyRefCount + pendingCount > 0 ? ` + ${readyRefCount + pendingCount} tham chiếu` : ' (Gemini)'}</>}
-            </button>
-            {generatedCode && (
-              <button onClick={handleRender} disabled={isBusy}
-                className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl font-black text-[13px] transition-all disabled:opacity-50 disabled:cursor-not-allowed bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-white shadow-lg shadow-orange-900/30">
-                {isRendering
-                  ? <><Loader2 className="w-4 h-4 animate-spin" /> Remotion render...</>
-                  : <><Play className="w-4 h-4" /> Render Video (Remotion)</>}
-              </button>
-            )}
-          </div>
-
-          {/* Audio Mixer — luôn hiển thị trong left panel */}
-          <AudioMixerPanel collapsed={true} />
-
-          {/* Done */}
-          {isDone && videoPath && (
-            <div className="bg-emerald-900/20 border border-emerald-700/40 rounded-xl p-3 space-y-2">
-              <p className="flex items-center gap-2 text-[12px] text-emerald-400 font-bold">
-                <CheckCircle2 className="w-4 h-4" /> Video render xong!
-              </p>
-              <p className="text-[10px] text-slate-500 font-mono break-all">{videoPath}</p>
-              <div className="flex gap-2">
-                <button onClick={() => window.electronAPI?.remotionOpenVideo?.(videoPath)}
-                  className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-[11px] font-bold bg-emerald-700 hover:bg-emerald-600 text-white transition-all">
-                  <Play className="w-3.5 h-3.5" /> Phát video
-                </button>
-                <button onClick={() => window.electronAPI?.remotionOpenDir?.(outputDir)}
-                  className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-[11px] font-bold bg-slate-700 hover:bg-slate-600 text-white transition-all">
-                  <FolderOpen className="w-3.5 h-3.5" /> Thư mục
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* ── RIGHT PANEL ── */}
-      <div className="flex-1 flex flex-col h-full overflow-hidden bg-[#0a0f18]">
-        <div className="h-11 border-b border-slate-800 px-5 flex items-center gap-3 shrink-0 bg-[#0d1424]">
-          <span className="text-[12px] font-bold text-slate-400">
-            {isGenerating ? '⏳ Đang upload tham chiếu + Gemini viết code...'
-             : isRendering ? '🎞️ Remotion render — xem Log bên dưới...'
-             : isDone      ? '✅ Video render thành công!'
-             : isGenerated ? '✅ Code sẵn sàng — nhấn "Render Video" để xuất MP4'
-             : '💡 Mô tả video, thêm tham chiếu (tuỳ chọn), nhấn "Tạo Code"'}
-          </span>
-          {isBusy && <Loader2 className="w-4 h-4 animate-spin text-violet-400" />}
-        </div>
-
-        {isGenerating && streamBuffer && (
-          <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
-            <div className="bg-[#0e1628] border border-slate-800 rounded-xl p-4 h-full overflow-y-auto custom-scrollbar">
-              <p className="text-[10px] text-violet-400 font-bold mb-2 flex items-center gap-2">
-                <Loader2 className="w-3 h-3 animate-spin" /> Gemini đang viết code...
-              </p>
-              <pre className="text-[11px] font-mono text-slate-300 whitespace-pre-wrap">{streamBuffer}</pre>
-            </div>
-          </div>
-        )}
-
-        {!isGenerating && generatedCode && (
-          <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar">
-            <CodeViewer code={generatedCode} open={codeOpen} onToggle={() => setCodeOpen(v => !v)} />
-            {isGenerated && (
-              <div className="bg-amber-900/20 border border-amber-700/30 rounded-lg px-4 py-3 text-[11px] text-amber-400">
-                💡 Nhấn <strong>Render Video</strong> để Remotion CLI xuất MP4.
-                {!outputDir && <span className="block mt-1 text-orange-400">⚠ Chưa chọn thư mục — sẽ lưu vào thư mục mặc định Remotion.</span>}
-              </div>
-            )}
-
-            {/* ── Missing AI Assets panel ── */}
-            {missingAssets.length > 0 && (
-              <div className="bg-[#0e1628] border border-sky-800/40 rounded-xl p-4">
-                <p className="text-[11px] font-black text-sky-400 mb-3 flex items-center gap-2">
-                  <Wand2 className="w-4 h-4" /> Assets AI cần tạo
-                  <span className="text-[9px] text-slate-600 font-normal">Code tham chiếu file chưa có — tạo bằng AI</span>
-                </p>
-                <div className="space-y-2">
-                  {missingAssets.map((asset, i) => (
-                    <div key={i} className="bg-[#0a0f1a] border border-slate-800 rounded-lg p-3">
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="flex items-center gap-2">
-                          {asset.type === 'video'
-                            ? <Film className="w-3.5 h-3.5 text-violet-400" />
-                            : <ImagePlus className="w-3.5 h-3.5 text-emerald-400" />}
-                          <span className="text-[11px] font-bold text-slate-300">{asset.name}</span>
-                          <span className={`text-[9px] px-1.5 py-0.5 rounded-full ${asset.type === 'video' ? 'bg-violet-900/40 text-violet-400' : 'bg-emerald-900/40 text-emerald-400'}`}>
-                            {asset.type === 'video' ? 'Video' : 'Ảnh'}
-                          </span>
-                        </div>
-                        {asset.status === 'done' && <CheckCircle2 className="w-4 h-4 text-emerald-400" />}
-                        {asset.status === 'generating' && <Loader2 className="w-4 h-4 animate-spin text-amber-400" />}
+          ) : (
+            <>
+              {messages.map(msg => (
+                <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[85%] rounded-2xl px-4 py-3 ${
+                    msg.role === 'user'
+                      ? 'bg-violet-600/25 border border-violet-600/40 text-slate-200'
+                      : 'bg-[#0d1424] border border-slate-700/80 text-slate-300'
+                  }`}>
+                    {msg.role === 'user' && (
+                      <p className="text-[12px] whitespace-pre-wrap">{msg.content}</p>
+                    )}
+                    {msg.role === 'ai' && msg.phase === 'generating' && (
+                      <div>
+                        <p className="text-[10px] text-violet-400 font-bold mb-1.5 flex items-center gap-1.5">
+                          <Loader2 className="w-3 h-3 animate-spin" /> Gemini đang viết code...
+                        </p>
+                        {streamBuffer && (
+                          <pre className="text-[10px] font-mono text-slate-500 whitespace-pre-wrap max-h-32 overflow-hidden">
+                            {streamBuffer.slice(-600)}
+                          </pre>
+                        )}
                       </div>
-
-                      {/* Prompt input */}
-                      {asset.type === 'image' && asset.status !== 'done' && (
-                        <div className="space-y-2">
-                          <input
-                            value={asset.prompt}
-                            onChange={e => setMissingAssets(prev => prev.map((a, j) => j === i ? { ...a, prompt: e.target.value } : a))}
-                            placeholder={`Mô tả ảnh "${asset.name}" cần tạo bằng AI...`}
-                            className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-[10px] rounded px-2 py-1.5 focus:outline-none focus:border-emerald-500 placeholder-slate-600"
-                          />
-                          <button
-                            onClick={() => generateAiImage(asset.name, asset.prompt)}
-                            disabled={!asset.prompt.trim() || asset.status === 'generating' || !publicDir}
-                            className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-[10px] font-bold bg-emerald-700 hover:bg-emerald-600 text-white transition-all disabled:opacity-40 disabled:cursor-not-allowed">
-                            <Wand2 className="w-3 h-3" />
-                            {asset.status === 'generating' ? 'Đang tạo...' : 'Tạo bằng Imagen AI'}
+                    )}
+                    {msg.role === 'ai' && msg.phase === 'rendering' && (
+                      <p className="text-[11px] text-amber-400 flex items-center gap-2">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" /> Remotion đang render video...
+                      </p>
+                    )}
+                    {msg.role === 'ai' && msg.phase === 'done' && (
+                      <div className="space-y-2">
+                        <p className="text-[11px] text-emerald-400 font-bold flex items-center gap-2">
+                          <CheckCircle2 className="w-4 h-4" /> Video render xong!
+                        </p>
+                        <p className="text-[10px] font-mono text-slate-500 break-all">{msg.videoPath}</p>
+                        <div className="flex gap-2 mt-1">
+                          <button onClick={() => window.electronAPI?.remotionOpenVideo?.(msg.videoPath)}
+                            className="flex items-center gap-1.5 py-1.5 px-3 rounded-lg text-[10px] font-bold bg-emerald-700 hover:bg-emerald-600 text-white transition-all">
+                            <Play className="w-3 h-3" /> Phát video
+                          </button>
+                          <button onClick={() => window.electronAPI?.remotionOpenDir?.(outputDir || '')}
+                            className="flex items-center gap-1.5 py-1.5 px-3 rounded-lg text-[10px] font-bold bg-slate-700 hover:bg-slate-600 text-white transition-all">
+                            <FolderOpen className="w-3 h-3" /> Thư mục
                           </button>
                         </div>
-                      )}
-                      {asset.type === 'video' && asset.status !== 'done' && (
-                        <div className="bg-violet-900/20 border border-violet-800/40 rounded px-2 py-2">
-                          <p className="text-[9px] text-violet-400">Video AI cần tạo qua <strong>Veo Studio</strong>:</p>
-                          <p className="text-[9px] text-slate-500 mt-0.5">1. Vào tab Veo Studio → tạo video → lưu vào <code className="text-violet-300">remotion\public\{asset.name}</code></p>
-                          <button onClick={() => window.electronAPI?.remotionOpenDir?.(publicDir)}
-                            className="mt-1.5 text-[9px] text-violet-400 hover:text-violet-300 transition-colors">
-                            → Mở thư mục public
-                          </button>
-                        </div>
-                      )}
-                      {asset.status === 'done' && <p className="text-[10px] text-emerald-400">✅ Đã lưu vào public/{asset.name}</p>}
-                      {asset.status === 'error' && <p className="text-[10px] text-red-400">❌ {asset.error || 'Thất bại'}</p>}
-                    </div>
-                  ))}
+                      </div>
+                    )}
+                    {msg.role === 'ai' && msg.phase === 'error' && (
+                      <div className="flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                        <p className="text-[11px] text-red-300">{msg.content}</p>
+                      </div>
+                    )}
+                  </div>
                 </div>
-                <p className="text-[9px] text-slate-600 mt-2">Tạo xong assets → nhấn Render Video để xuất</p>
-              </div>
-            )}
+              ))}
+              <div ref={chatEndRef} />
+            </>
+          )}
+        </div>
+
+        {/* Missing AI Assets */}
+        {missingAssets.length > 0 && (
+          <div className="mx-4 mb-2 bg-[#0e1628] border border-sky-800/40 rounded-xl p-3 shrink-0">
+            <p className="text-[10px] font-black text-sky-400 mb-2 flex items-center gap-1.5">
+              <Wand2 className="w-3.5 h-3.5" /> Assets cần tạo ({missingAssets.length})
+            </p>
+            <div className="space-y-1.5">
+              {missingAssets.map((asset, i) => (
+                <div key={i} className="flex items-center gap-2 bg-[#0a0f1a] border border-slate-800 rounded-lg px-3 py-2">
+                  {asset.type === 'video' ? <Film className="w-3.5 h-3.5 text-violet-400 shrink-0" /> : <ImagePlus className="w-3.5 h-3.5 text-emerald-400 shrink-0" />}
+                  <span className="text-[10px] font-bold text-slate-300 flex-1 truncate">{asset.name}</span>
+                  {asset.status === 'done' && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />}
+                  {asset.status === 'generating' && <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />}
+                  {asset.type === 'image' && asset.status !== 'done' && (
+                    <div className="flex gap-1.5 flex-1">
+                      <input value={asset.prompt}
+                        onChange={e => setMissingAssets(prev => prev.map((a, j) => j === i ? { ...a, prompt: e.target.value } : a))}
+                        placeholder={`Mô tả ảnh...`}
+                        className="flex-1 bg-slate-800 border border-slate-700 text-slate-200 text-[10px] rounded px-2 py-1 focus:outline-none focus:border-emerald-500 placeholder-slate-600" />
+                      <button onClick={() => generateAiImage(asset.name, asset.prompt)}
+                        disabled={!asset.prompt.trim() || asset.status === 'generating' || !publicDir}
+                        className="px-2 py-1 rounded text-[9px] font-bold bg-emerald-700 hover:bg-emerald-600 text-white disabled:opacity-40">
+                        {asset.status === 'generating' ? '...' : 'Tạo'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
-        {!isGenerating && !generatedCode && (
-          <div className="flex-1 flex flex-col items-center justify-center text-slate-700">
-            <Code2 className="w-14 h-14 mb-4 opacity-20" />
-            <p className="text-[14px] font-bold text-slate-600">Code Gemini tạo ra sẽ hiện ở đây</p>
-            <p className="text-[11px] mt-1 text-slate-700">Nhập mô tả + thêm tham chiếu → nhấn "Tạo Code"</p>
-            <button onClick={() => setShowHelp(true)} className="mt-4 flex items-center gap-2 text-[11px] font-bold text-violet-500 hover:text-violet-300 transition-colors">
-              <BookOpen className="w-4 h-4" /> Xem hướng dẫn sử dụng
+        {/* Render Log */}
+        <LogPanel logs={logs} open={logOpen} onToggle={() => setLogOpen(v => !v)} onClear={() => setLogs([])} />
+
+        {/* Chat Input */}
+        <div className="border-t border-slate-800 px-4 py-3 bg-[#0d1424] shrink-0">
+          <div className="flex gap-2 items-end">
+            <textarea
+              ref={chatInputRef}
+              value={chatInput}
+              onChange={e => setChatInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleChat(); } }}
+              placeholder={
+                generatedCode
+                  ? 'Tiếp tục: "Thêm watermark", "Đổi màu đỏ", "Tăng tốc 1.2x", "Thêm text kênh"...'
+                  : srcVideo
+                    ? 'Mô tả chỉnh sửa: "Thêm color grading kinh dị, tiêu đề, zoom in chậm..."'
+                    : 'Mô tả video: "Intro YouTube neon tím 10s, tên kênh xuất hiện từng chữ..."'
+              }
+              rows={2}
+              disabled={isBusy}
+              className="flex-1 bg-[#131d30] border border-slate-700 text-slate-200 text-[12px] rounded-xl px-3 py-2.5 focus:outline-none focus:border-violet-500 resize-none custom-scrollbar placeholder-slate-600 disabled:opacity-50 disabled:cursor-not-allowed"
+            />
+            <button onClick={handleChat} disabled={isBusy || !chatInput.trim()}
+              className="shrink-0 w-11 h-11 flex items-center justify-center rounded-xl bg-violet-600 hover:bg-violet-500 disabled:bg-slate-700 disabled:opacity-50 text-white transition-all">
+              {isBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
             </button>
           </div>
-        )}
-
-        <LogPanel logs={logs} open={logOpen} onToggle={() => setLogOpen(v => !v)} onClear={() => setLogs([])} />
+          <p className="text-[9px] text-slate-700 mt-1.5">Enter để gửi • Shift+Enter xuống dòng • Mỗi tin nhắn tự động render video hoàn chỉnh</p>
+        </div>
       </div>
     </div>
   );

@@ -1,144 +1,302 @@
-console.log("AutoFlow V66 Main World Interceptor Loaded — Cookie + AT token (batchexecute)");
+console.log("AutoFlow V70 Main World Interceptor — AT token + recaptcha only");
 
-// ── Scan response body cho video URL (R2V voice video) ──────────────────────────
-// Chạy ở document_start → bắt MỌI response từ đầu, kể cả load trang ban đầu
-// Chỉ capture URL từ các domain Google AI video đã biết (tránh false positive từ banner/promo)
-const _FLUXY_VIDEO_DOMAINS = ['flow-content.google/video/', 'flow-content.google/image/', 'storage.googleapis.com/ais-', 'lh3.googleusercontent.com/ais'];
-function _fluxyIsVideoUrl(url) {
-    return _FLUXY_VIDEO_DOMAINS.some(d => url.includes(d));
-}
-function _fluxyCapture(txt) {
-    if (!txt || txt.length < 20) return;
-    // Bắt video/image URL từ MỌI response
-    const pats = [
-        /"(https:(?:\\\/|\/){2}flow-content\.google\/(?:video|image)\/[^"]{10,})"/g,
-        /"(https:(?:\\\/|\/){2}storage\.googleapis\.com\/ais-[^"]{10,})"/g,
-        /"(https:(?:\\\/|\/){2}lh3\.googleusercontent\.com\/ais[^"]{10,})"/g,
-    ];
-    for (const pat of pats) {
-        for (const m of txt.matchAll(pat)) {
-            const raw = m[1]
-                .replace(/\\\//g,'/')
-                .replace(/\\{1,2}u003d/g,'=')
-                .replace(/\\{1,2}u0026/g,'&')
-                .replace(/\\{1,2}u002f/g,'/')
-                .replace(/\\+$/, '');
-            // Không lọc '?' — flow-content.google/video/ URLs thường không có query string
-            if (!window._fluxyCapturedUrls) window._fluxyCapturedUrls = [];
-            if (!window._fluxyCapturedUrls.some(c => c.url === raw)) {
-                window._fluxyCapturedUrls.push({ url: raw, ts: Date.now() });
-                console.log('[Fluxy] captured:', raw.substring(0, 90));
-            }
-        }
-    }
-    // Bắt workflowId từ MỌI response chứa pattern [mediaId, projId, workflowId, "CAE"]
-    // Gồm cả tRARke, HTrJv, jwpduf, as29s, v.v.
-    try {
-        const _wfPat = /\\"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\",\\"[0-9a-f-]{36}\\",\\"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\",\\"CAE\\"/gi;
-        for (const wm of txt.matchAll(_wfPat)) {
-            const _mid = wm[1], _wid = wm[2];
-            if (!window._fluxyWorkflowIds) window._fluxyWorkflowIds = {};
-            if (!window._fluxyWorkflowIds[_mid]) {
-                window._fluxyWorkflowIds[_mid] = _wid;
-                console.log('[Fluxy] wid captured:', _wid.substring(0,8), 'for:', _mid.substring(0,8));
-            }
-        }
-    } catch(_) {}
-}
-
-// ── Intercept HTMLMediaElement.src setter + currentSrc → bắt URL video gán vào <video> ──
+// ── Intercept grecaptcha.enterprise.execute → bắt action+sitekey cho image gen ──
 (function() {
-    const _d = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-    if (_d?.set) {
-        Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-            get: _d.get,
-            set: function(val) {
-                if (val && typeof val === 'string') {
-                    if (!val.startsWith('blob:') && !val.startsWith('data:') && _fluxyIsVideoUrl(val)) {
-                        _fluxyCapture('"' + val + '"');
-                    }
-                    // Log blob URLs too — so we know the app is using MSE/blob
-                    if (val.startsWith('blob:')) {
-                        window.dispatchEvent(new CustomEvent('AutoFlow_VIDEO_SRC', { detail: { src: val, isBlobUrl: true, ts: Date.now() } }));
-                    }
-                }
-                return _d.set.call(this, val);
-            },
-            configurable: true,
-        });
+    let _orig = null;
+
+    function _isOurWrapper(fn) {
+        if (!fn) return false;
+        const n = fn.name || '';
+        return n === 'fluxyRcWrapper' || n.includes('fluxyRcWrapper');
     }
-    // Intercept URL.createObjectURL → detect blob creation for video
-    const _origCOBU = URL.createObjectURL;
-    URL.createObjectURL = function(obj) {
-        const result = _origCOBU.call(URL, obj);
+
+    // Reject Google's anti-extension poison wrapper: (e,f)=>d(e,{...f,action:"extension_hijack_detected"})
+    // If accepted as _orig, it creates a circular: arrowFn→d(=wrapper)→_callOrig→arrowFn→∞
+    function _isHijackWrapper(fn) {
+        if (!fn) return false;
+        try { return fn.toString().includes('extension_hijack_detected'); } catch(_) { return false; }
+    }
+
+    // Gọi _orig với TEMP-REPLACE: tạm thay execute = _orig (plain value) trước khi gọi
+    // Lý do: _orig có thể gọi enterprise.execute nội bộ. Nếu execute là getter→wrapper thì đệ quy vô hạn.
+    // Temp-replace đảm bảo _orig thấy enterprise.execute = _orig (bản thân), không phải wrapper.
+    function _callOrig(sitekey, params) {
+        const grc = window.grecaptcha?.enterprise;
+        if (!grc || !_orig || _isOurWrapper(_orig) || _isHijackWrapper(_orig))
+            return Promise.reject(new Error('orig_invalid'));
+        const savedDesc = Object.getOwnPropertyDescriptor(grc, 'execute');
+        let result;
         try {
-            const t = (obj instanceof Blob || obj instanceof File) ? obj.type : (obj instanceof MediaSource ? 'mediasource' : '?');
-            if (t && (t.startsWith('video/') || t === 'mediasource' || t.startsWith('audio/'))) {
-                window.dispatchEvent(new CustomEvent('AutoFlow_VIDEO_BLOB', { detail: { blobUrl: result, type: t, size: obj.size || 0, ts: Date.now() } }));
+            // TEMP-REPLACE: expose _orig as plain value so self-check (enterprise.execute===_orig) succeeds
+            Object.defineProperty(grc, 'execute', { value: _orig, writable: true, configurable: true });
+            result = _orig.call(grc, sitekey, params);
+            // Capture lazy-init: if _orig replaced itself with realImpl
+            const nd = Object.getOwnPropertyDescriptor(grc, 'execute');
+            if (nd?.value && nd.value !== _orig && !_isOurWrapper(nd.value) && !_isHijackWrapper(nd.value)) {
+                console.log('[Fluxy-RC] _orig upgraded to impl:', nd.value.name || 'anon');
+                _orig = nd.value;
             }
-        } catch(_) {}
-        return result;
-    };
-})();
-
-// ── Intercept EventSource (SSE) → bắt real-time update từ Flow ──
-(function() {
-    if (typeof EventSource === 'undefined') return;
-    const _O = EventSource;
-    function _FES(url, opts) {
-        const es = opts ? new _O(url, opts) : new _O(url);
-        es.addEventListener('message', function(evt) {
-            try { if (evt.data) _fluxyCapture(evt.data); } catch(_) {}
-        });
-        return es;
+        } finally {
+            // Restore wrapper accessor
+            try {
+                const w = _makeWrapper();
+                Object.defineProperty(grc, 'execute', {
+                    get: () => w,
+                    set: _makeSetter(),
+                    configurable: true
+                });
+            } catch(_) {}
+        }
+        return Promise.resolve(result);
     }
-    _FES.prototype = _O.prototype;
-    _FES.CONNECTING = 0; _FES.OPEN = 1; _FES.CLOSED = 2;
-    window.EventSource = _FES;
-})();
 
-// ── Intercept WebSocket → bắt message chứa URL video ──
-(function() {
-    if (typeof WebSocket === 'undefined') return;
-    const _O = WebSocket;
-    function _FWS(url, protocols) {
-        const ws = protocols != null ? new _O(url, protocols) : new _O(url);
-        ws.addEventListener('message', function(evt) {
-            try { if (typeof evt.data === 'string') _fluxyCapture(evt.data); } catch(_) {}
-        });
-        return ws;
-    }
-    _FWS.prototype = _O.prototype;
-    _FWS.CONNECTING = 0; _FWS.OPEN = 1; _FWS.CLOSING = 2; _FWS.CLOSED = 3;
-    window.WebSocket = _FWS;
-})();
-
-// ── MutationObserver: bắt <video src="..."> được thêm vào DOM ──
-(function() {
-    function _chk(n) {
-        if (!n || !n.tagName) return;
-        const vids = n.tagName === 'VIDEO' ? [n] : Array.from(n.querySelectorAll ? n.querySelectorAll('video[src]') : []);
-        for (const v of vids) {
-            if (v.src && !v.src.startsWith('blob:') && !v.src.startsWith('data:') && _fluxyIsVideoUrl(v.src)) {
-                _fluxyCapture('"' + v.src + '"');
+    function _makeSetter() {
+        return (newFn) => {
+            if (!newFn || _isOurWrapper(newFn)) return;
+            // Reject Google's anti-extension wrapper — if accepted, creates circular reference
+            if (_isHijackWrapper(newFn)) {
+                console.log('[Fluxy-RC] rejected hijack-detect wrapper, _orig unchanged');
+                return;
             }
+            _orig = newFn;
+            console.log('[Fluxy-RC] execute replaced, new _orig:', newFn.name || 'anon');
+        };
+    }
+
+    function _makeWrapper() {
+        return function fluxyRcWrapper(sitekey, params) {
+            const action = params?.action || '?';
+            const isHijackDetect = action === 'extension_hijack_detected';
+            if (!isHijackDetect) {
+                window._lastRcSitekey = sitekey || '';
+                window._lastRcAction = action;
+            }
+            if (!_orig || _isOurWrapper(_orig)) return Promise.reject(new Error('no_orig_execute'));
+            const prom = _callOrig(sitekey, params);
+            Promise.resolve(prom).then(token => {
+                if (token && token.length > 100 && !isHijackDetect) {
+                    window._lastRcToken = token;
+                    window._lastRcTokenTs = Date.now();
+                    console.log('[Fluxy-RC] captured action=', action, ' len=', token.length);
+                    // Generate own token (dùng _callOrig không qua wrapper để tránh vòng lặp)
+                    _callOrig(sitekey, params).then(ownToken => {
+                        if (ownToken && ownToken.length > 100) {
+                            window._ownFreshToken = ownToken;
+                            window._ownFreshTokenTs = Date.now();
+                            window._ownFreshTokenAction = action;
+                            console.log('[Fluxy-RC] own token action=', action, ' len=', ownToken.length);
+                        }
+                    }).catch(() => {});
+                } else if (isHijackDetect) {
+                    console.log('[Fluxy-RC] hijack-detect ignored');
+                }
+            }).catch(() => {});
+            window.dispatchEvent(new CustomEvent('AutoFlow_RC_EXEC', { detail: { action, sitekey: sitekey||'', ts: Date.now() } }));
+            return prom;
+        };
+    }
+
+    function _patchGrc() {
+        if (!window.grecaptcha?.enterprise) return false;
+        const currentExec = window.grecaptcha.enterprise.execute;
+        if (!currentExec) return false;
+        if (_isOurWrapper(currentExec)) return true;
+        // Reject hijack wrapper — install defineProperty so our setter captures future real execute
+        if (_isHijackWrapper(currentExec)) {
+            console.log('[Fluxy-RC] patchGrc: hijack in execute, installing setter only');
+            const wrapper = _makeWrapper();
+            try {
+                Object.defineProperty(window.grecaptcha.enterprise, 'execute', {
+                    get: () => wrapper, set: _makeSetter(), configurable: true
+                });
+            } catch(_) {}
+            return false;
+        }
+        _orig = currentExec;
+        const wrapper = _makeWrapper();
+        try {
+            Object.defineProperty(window.grecaptcha.enterprise, 'execute', {
+                get: () => wrapper,
+                set: _makeSetter(),
+                configurable: true
+            });
+        } catch(_) {
+            window.grecaptcha.enterprise.execute = wrapper;
+        }
+        console.log('[Fluxy-RC] patched execute, _orig:', _orig.name || 'anon');
+        return true;
+    }
+
+    function _tryPatch() {
+        if (!_patchGrc()) {
+            setTimeout(_tryPatch, 500);
+        } else {
+            setInterval(() => {
+                const cur = window.grecaptcha?.enterprise?.execute;
+                if (cur && !_isOurWrapper(cur)) {
+                    console.log('[Fluxy-RC] execute lost, re-patching...');
+                    _patchGrc();
+                }
+            }, 2000);
         }
     }
-    const _obs = new MutationObserver(function(muts) {
-        for (const m of muts) {
-            for (let i = 0; i < m.addedNodes.length; i++) _chk(m.addedNodes[i]);
-            if (m.type === 'attributes' && m.target.tagName === 'VIDEO') _chk(m.target);
-        }
+
+    _tryPatch();
+    const _mo = new MutationObserver(() => {
+        const cur = window.grecaptcha?.enterprise?.execute;
+        if (cur && !_isOurWrapper(cur)) _patchGrc();
     });
-    _obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+    _mo.observe(document.documentElement, { childList: true, subtree: true });
+
+    // Proactive pre-warm: generate _ownFreshToken on page load + every 60s
+    window._fluxyPreWarmBusy = false;
+    const FLUXY_SK = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
+
+    async function _ensureRecaptcha() {
+        // _orig phải tồn tại VÀ không phải wrapper của mình
+        if (_orig && !_isOurWrapper(_orig)) return true;
+        if (window.grecaptcha?.enterprise?.execute) {
+            _patchGrc();
+            return _orig && !_isOurWrapper(_orig);
+        }
+        // Load script nếu chưa có
+        if (!document.querySelector('script[src*="recaptcha/enterprise.js"]')) {
+            await new Promise((resolve) => {
+                const s = document.createElement('script');
+                s.src = `https://www.google.com/recaptcha/enterprise.js?render=${FLUXY_SK}`;
+                s.onload = () => setTimeout(resolve, 1500);
+                s.onerror = resolve;
+                document.head.appendChild(s);
+                setTimeout(resolve, 6000);
+            });
+        } else {
+            await new Promise(r => setTimeout(r, 2500));
+        }
+        _patchGrc();
+        const ok = _orig && !_isOurWrapper(_orig);
+        console.log('[Fluxy-RC] ensure: loaded=', ok, ' _orig:', _orig?.name || 'null');
+        return ok;
+    }
+
+    async function _preWarmToken(force) {
+        if (window._fluxyPreWarmBusy) return;
+        window._fluxyPreWarmBusy = true;
+        try {
+            const age = Date.now() - (window._ownFreshTokenTs || 0);
+            if (!force && window._ownFreshToken && window._ownFreshTokenAction === 'IMAGE_GENERATION' && age < 90000) return;
+            const ok = await _ensureRecaptcha();
+            if (!ok) { console.log('[Fluxy-RC] pre-warm: no valid _orig'); return; }
+            const sk = window._lastRcSitekey || FLUXY_SK;
+            const tok = await _callOrig(sk, { action: 'IMAGE_GENERATION' });
+            if (tok && tok.length > 100) {
+                window._ownFreshToken = tok;
+                window._ownFreshTokenTs = Date.now();
+                window._ownFreshTokenAction = 'IMAGE_GENERATION';
+                console.log('[Fluxy-RC] pre-warm OK len=', tok.length);
+            } else {
+                console.log('[Fluxy-RC] pre-warm: empty token');
+            }
+        } catch(e) { console.log('[Fluxy-RC] pre-warm err:', e.message); }
+        finally { window._fluxyPreWarmBusy = false; }
+    }
+    // First warm-up 3s after page load
+    setTimeout(_preWarmToken, 3000);
+    // Refresh every 60s
+    setInterval(_preWarmToken, 60000);
+    // Tab visible → refresh
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') setTimeout(_preWarmToken, 500);
+    });
+    // On-demand: background.js dispatches this when it needs a token NOW
+    window.addEventListener('fluxyPreWarmNow', () => _preWarmToken(true));
+})();
+
+// ── Seed _flowAuthData từ WIZ_global_data (chạy SAU khi inline scripts đã set WIZ) ──
+function _seedFromWIZ() {
+    try {
+        const wiz = window.WIZ_global_data || {};
+        // Scan tất cả values thay vì hardcode key — key name thay đổi theo version Google
+        let wizAt = '', wizBl = '', wizFsid = '';
+        for (const [k, v] of Object.entries(wiz)) {
+            if (!wizAt  && typeof v === 'string' && v.startsWith('AIQ-') && v.length > 30) wizAt = v;
+            if (!wizBl  && typeof v === 'string' && v.startsWith('boq_') && v.length > 10) wizBl = v;
+            if (!wizFsid && typeof v === 'string' && /^-?\d{10,}$/.test(v)) wizFsid = v;
+        }
+        const wizHl = wiz['hl'] || '';
+        if (wizAt) {
+            window._flowAuthData = { at: wizAt, bl: wizBl, fsid: wizFsid, hl: wizHl, src: 'WIZ' };
+            window.dispatchEvent(new CustomEvent('AutoFlow_FLOW_AUTH', { detail: { at: wizAt, bl: wizBl, fsid: wizFsid } }));
+            console.log('[AutoFlow] Seeded AT from WIZ_global_data, len=', wizAt.length, ' bl=', wizBl.substring(0, 30));
+        }
+    } catch (_) {}
+}
+// Chạy khi DOM sẵn sàng (inline <script> tags đã được parse và WIZ đã set)
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _seedFromWIZ, { once: true });
+} else {
+    _seedFromWIZ();
+}
+
+// ── Intercept XMLHttpRequest — Angular thường dùng XHR thay vì fetch ──
+(function() {
+    const _origOpen = XMLHttpRequest.prototype.open;
+    const _origSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this._fluxyUrl = typeof url === 'string' ? url : (url ? String(url) : '');
+        return _origOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function(body) {
+        const _url = this._fluxyUrl || '';
+        const isFlowBatch = (_url.includes('batchexecute') && (_url.includes('flow.google') || _url.includes('AiSandbox')));
+        if (isFlowBatch) {
+            try {
+                let at = null;
+                if (body) {
+                    if (typeof body === 'string') at = new URLSearchParams(body).get('at');
+                    else if (body instanceof URLSearchParams) at = body.get('at');
+                    else if (body instanceof FormData) at = body.get('at');
+                }
+                let bl = '', fsid = '', hl = '';
+                try {
+                    const u = new URL(_url, window.location.origin);
+                    bl = u.searchParams.get('bl') || '';
+                    fsid = u.searchParams.get('f.sid') || '';
+                    hl = u.searchParams.get('hl') || '';
+                } catch (_) {}
+                if (at && at.length > 10) {
+                    window._flowAuthData = { at, bl, fsid, ...(hl ? { hl } : {}), src: 'XHR-REQ' };
+                    window.dispatchEvent(new CustomEvent('AutoFlow_FLOW_AUTH', { detail: { at, bl, fsid } }));
+                    console.log('[AutoFlow-XHR] Captured AT from request body len=', at.length, ' bl=', bl.substring(0, 30));
+                }
+                // Bắt AT mới từ response
+                this.addEventListener('load', function() {
+                    try {
+                        const text = this.responseText || '';
+                        const atMatch = text.match(/"xsrf","(AIQ-[^"]{20,})"/);
+                        if (atMatch) {
+                            const newAt = atMatch[1];
+                            const cur = window._flowAuthData;
+                            if (!cur || newAt !== cur.at) {
+                                window._flowAuthData = { at: newAt, bl: cur?.bl || bl, fsid: cur?.fsid || fsid, src: 'XHR-RESP' };
+                                window.dispatchEvent(new CustomEvent('AutoFlow_FLOW_AUTH', { detail: { at: newAt, bl: window._flowAuthData.bl, fsid: window._flowAuthData.fsid } }));
+                                console.log('[AutoFlow-XHR] Fresh AT from response len=', newAt.length);
+                            }
+                        }
+                    } catch (_) {}
+                });
+            } catch (_) {}
+        }
+        return _origSend.apply(this, arguments);
+    };
 })();
 
 const originalFetch = window.fetch;
 window.fetch = async function (...args) {
     const url = args[0] && typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
 
-    // ── Bắt AT token từ batchexecute (flow.google.com — cookie-based auth) ───
-    // Xử lý cả absolute URL (https://flow.google.com/...) lẫn relative URL (/_/AiSandbox...)
+    // ── Bắt AT token từ batchexecute (flow.google.com — cookie-based auth) ──
     const isFlowBatch = (url.includes('flow.google.com') && url.includes('batchexecute')) ||
                         (url.includes('batchexecute') && url.includes('AiSandbox'));
     if (isFlowBatch) {
@@ -146,40 +304,35 @@ window.fetch = async function (...args) {
             const body = args[1]?.body;
             let at = null;
             if (body) {
-                if (typeof body === 'string') {
-                    at = new URLSearchParams(body).get('at');
-                } else if (body instanceof URLSearchParams) {
-                    at = body.get('at');
-                } else if (body instanceof FormData) {
-                    at = body.get('at');
-                }
+                if (typeof body === 'string') at = new URLSearchParams(body).get('at');
+                else if (body instanceof URLSearchParams) at = body.get('at');
+                else if (body instanceof FormData) at = body.get('at');
             }
-            let bl = '', fsid = '';
+            let bl = '', fsid = '', hl = '';
             try {
                 const absUrl = url.startsWith('/') ? (window.location.origin + url) : url;
-                bl = new URL(absUrl).searchParams.get('bl') || '';
-                fsid = new URL(absUrl).searchParams.get('f.sid') || '';
+                const u = new URL(absUrl);
+                bl = u.searchParams.get('bl') || '';
+                fsid = u.searchParams.get('f.sid') || '';
+                hl = u.searchParams.get('hl') || '';
             } catch (_) {}
             if (at && at.length > 10) {
-                window._flowAuthData = { at, bl, fsid };
-                window.dispatchEvent(new CustomEvent('AutoFlow_FLOW_AUTH', { detail: { at, bl, fsid } }));
-                console.log('[AutoFlow] Captured batchexecute AT len=', at.length, ' bl=', bl.substring(0,40), ' fsid=', fsid.substring(0,15));
+                window._flowAuthData = { at, bl, fsid, ...(hl ? { hl } : {}) };
+                window.dispatchEvent(new CustomEvent('AutoFlow_FLOW_AUTH', { detail: { at, bl, fsid, hl } }));
+                console.log('[AutoFlow] Captured batchexecute AT len=', at.length, ' bl=', bl.substring(0,40));
             }
         } catch (_) {}
     }
 
-    // ── Bắt Bearer token từ googleapis.com outgoing (labs.google fallback) ──
+    // ── Bắt Bearer token từ googleapis.com (labs.google fallback) ──
     if (url.includes('googleapis.com') || url.includes('labs.google')) {
         try {
             const init = args[1];
             let bearer = null;
             if (init?.headers) {
                 const h = init.headers;
-                if (typeof h.get === 'function') {
-                    bearer = h.get('authorization') || h.get('Authorization');
-                } else if (typeof h === 'object') {
-                    bearer = h['authorization'] || h['Authorization'];
-                }
+                if (typeof h.get === 'function') bearer = h.get('authorization') || h.get('Authorization');
+                else if (typeof h === 'object') bearer = h['authorization'] || h['Authorization'];
             }
             if (bearer && bearer.startsWith('Bearer ') && bearer.length > 57) {
                 window.dispatchEvent(new CustomEvent('AutoFlow_BEARER', { detail: bearer.replace('Bearer ', '') }));
@@ -187,85 +340,38 @@ window.fetch = async function (...args) {
         } catch (_) {}
     }
 
-    // ── Bắt FULL request tới flow-content.google — cần biết auth headers ──
-    if (url.includes('flow-content.google') || url.includes('flow.google.com/video')) {
-        try {
-            const init = args[1] || {};
-            const hdrs = {};
-            if (init.headers) {
-                const h = init.headers;
-                if (typeof h.forEach === 'function') { h.forEach((v, k) => { hdrs[k] = v.substring(0, 80); }); }
-                else if (typeof h.get === 'function') { ['authorization','Authorization','cookie','Cookie','x-goog-authuser'].forEach(k => { const v = h.get(k); if (v) hdrs[k] = v.substring(0, 80); }); }
-                else if (typeof h === 'object') { Object.keys(h).forEach(k => { hdrs[k] = String(h[k]).substring(0, 80); }); }
-            }
-            window.dispatchEvent(new CustomEvent('AutoFlow_FC_REQUEST', {
-                detail: { url: url.substring(0, 200), method: init.method || 'GET', credentials: init.credentials || 'default', headers: hdrs, ts: Date.now() }
-            }));
-        } catch (_) {}
-    }
-
     const response = await originalFetch.apply(this, args);
 
-    // ── Scan MỌI response từ flow.google.com cho video URL ──────────────────────
-    if (response.ok) {
-        const isFlowOrigin = url.includes('flow.google.com') || url.includes('labs.google') || url.includes('googleapis.com');
-        if (isFlowOrigin) {
-            try {
-                const respClone = response.clone();
-                respClone.text().then(respText => { _fluxyCapture(respText); }).catch(() => {});
-            } catch (_) {}
-        }
-    }
-
-    // ── Bắt AT mới + jwpduf workflowId từ RESPONSE batchexecute ────────────
+    // ── Bắt AT mới từ batchexecute RESPONSE ──
     if (isFlowBatch && response.ok) {
         try {
-            const respClone2 = response.clone();
-            respClone2.text().then(respText => {
+            const respClone = response.clone();
+            respClone.text().then(respText => {
                 const atMatch = respText.match(/"xsrf","(AIQ-[^"]+)"/);
                 if (atMatch && atMatch[1].length > 20) {
                     const newAt = atMatch[1];
                     if (!window._flowAuthData || newAt !== window._flowAuthData.at) {
                         window._flowAuthData = {
                             at: newAt,
-                            bl: window._flowAuthData?.bl || bl,
-                            fsid: window._flowAuthData?.fsid || fsid
+                            bl: window._flowAuthData?.bl || '',
+                            fsid: window._flowAuthData?.fsid || ''
                         };
-                        console.log('[AutoFlow] Fresh AT from RESPONSE, len=', newAt.length, ' bl=', (window._flowAuthData.bl || '').substring(0,40));
+                        console.log('[AutoFlow] Fresh AT from RESPONSE, len=', newAt.length);
                         window.dispatchEvent(new CustomEvent('AutoFlow_FLOW_AUTH', { detail: { at: newAt, bl: window._flowAuthData.bl, fsid: window._flowAuthData.fsid } }));
                     }
                 }
-                // Bắt workflowId từ jwpduf FETCH response (Angular dùng fetch, không phải XHR)
-                // Đồng thời: khi WuwhI/jwpduf trả về COMPLETE signal → gửi raw body lên SW để debug URL
+                // Log RPC calls của Angular để debug
                 try {
-                    const _absUrl = url.startsWith('/') ? (window.location.origin + url) : url;
-                    if (new URL(_absUrl).searchParams.get('rpcids') === 'jwpduf') {
-                        // Pattern trong raw batchexecute text: \"mediaId\",\"projId\",\"workflowId\",\"CAE\"
-                        const _jwpPat = /\\"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\",\\"[0-9a-f-]{36}\\",\\"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\",\\"CAE\\"/gi;
-                        for (const _jm of respText.matchAll(_jwpPat)) {
-                            const _mid = _jm[1], _wid = _jm[2];
-                            if (!window._fluxyWorkflowIds) window._fluxyWorkflowIds = {};
-                            if (!window._fluxyWorkflowIds[_mid]) {
-                                window._fluxyWorkflowIds[_mid] = _wid;
-                                console.log('[Fluxy] fetch jwpduf wid:', _wid.substring(0,8), 'for:', _mid.substring(0,8));
-                            }
-                        }
-                        // Nếu response KHÔNG phải "[3]" pending → có thể là complete signal, gửi raw để debug
-                        if (!respText.includes('[3]') && respText.length > 50) {
-                            window.dispatchEvent(new CustomEvent('AutoFlow_JWPDUF_RESP', { detail: { raw: respText.substring(0, 2000), ts: Date.now() } }));
-                        }
-                    }
+                    const _rpcAbsUrl = url.startsWith('/') ? (window.location.origin + url) : url;
+                    const _rpcName = new URL(_rpcAbsUrl).searchParams.get('rpcids') || '?';
+                    window.dispatchEvent(new CustomEvent('AutoFlow_RPC_RESP', {
+                        detail: { rpc: _rpcName, len: respText.length, snip: respText.substring(0, 500), ts: Date.now() }
+                    }));
                 } catch(_) {}
             }).catch(() => {});
         } catch (_) {}
     }
 
-    // ── Bắt CAUS token từ response ─────────────────────────────────────────────
-    if (url.includes('aisandbox-pa.googleapis.com')) {
-        console.log("AutoFlow: Intercepting Fetch to -> ", url);
-        const clone = response.clone();
-        clone.text().then(text => processCausText(text)).catch(e => { console.error("AutoFlow Clone Error", e); });
-    }
     return response;
 };
 
@@ -278,23 +384,20 @@ XMLHttpRequest.prototype.open = function (method, url, ...rest) {
 };
 
 XMLHttpRequest.prototype.send = function (...args) {
-    // Bắt AT token từ XHR batchexecute (absolute và relative URL)
     const _isFlowBatch = this._url && (
         (this._url.includes('flow.google.com') && this._url.includes('batchexecute')) ||
         (this._url.includes('batchexecute') && this._url.includes('AiSandbox'))
     );
+
+    // Bắt AT token từ XHR batchexecute
     if (_isFlowBatch) {
         try {
             const body = args[0];
             let at = null;
             if (body) {
-                if (typeof body === 'string') {
-                    at = new URLSearchParams(body).get('at');
-                } else if (body instanceof URLSearchParams) {
-                    at = body.get('at');
-                } else if (body instanceof FormData) {
-                    at = body.get('at');
-                }
+                if (typeof body === 'string') at = new URLSearchParams(body).get('at');
+                else if (body instanceof URLSearchParams) at = body.get('at');
+                else if (body instanceof FormData) at = body.get('at');
             }
             let bl = '', fsid = '';
             try {
@@ -309,47 +412,13 @@ XMLHttpRequest.prototype.send = function (...args) {
         } catch (_) {}
     }
 
-    // Bắt workflowId từ as29s XHR REQUEST body (Flow gọi khi video hoàn thành)
-    if (_isFlowBatch) {
-        try {
-            const absUrl = this._url.startsWith('/') ? (window.location.origin + this._url) : this._url;
-            const rpcids = new URL(absUrl).searchParams.get('rpcids');
-            if (rpcids === 'as29s' && args[0]) {
-                const freq = new URLSearchParams(typeof args[0] === 'string' ? args[0] : '').get('f.req');
-                if (freq) {
-                    const outer = JSON.parse(freq);
-                    const inner = JSON.parse(outer?.[0]?.[0]?.[1] || '[]');
-                    // inner = [mediaId, projectId, workflowId, stepId]
-                    if (inner.length >= 3 && typeof inner[2] === 'string' && inner[2].includes('-')) {
-                        if (!window._fluxyWorkflowIds) window._fluxyWorkflowIds = {};
-                        window._fluxyWorkflowIds[inner[0]] = inner[2];
-                        window._fluxyProjectWorkflowId = inner[2];
-                        console.log('[Fluxy] workflowId captured:', inner[2].substring(0,8), 'for media:', inner[0].substring(0,8));
-                    }
-                }
-            }
-        } catch(_) {}
-    }
-
     this.addEventListener('load', function () {
-        // Lấy response text — handle cả text lẫn arraybuffer (gRPC-Web / protobuf)
         let _rt = '';
         try {
-            if (this.responseText) {
-                _rt = this.responseText;
-            } else if (this.responseType === 'arraybuffer' && this.response instanceof ArrayBuffer) {
+            if (this.responseText) _rt = this.responseText;
+            else if (this.responseType === 'arraybuffer' && this.response instanceof ArrayBuffer)
                 _rt = new TextDecoder('utf-8', { fatal: false }).decode(this.response);
-            }
         } catch (_) {}
-
-        // Scan MỌI response từ Google/Flow cho video URL
-        if (_rt) {
-            const _xu = this._url || '';
-            const _isGoogle = _xu.includes('flow.google.com') || _xu.includes('googleapis.com') || _xu.includes('labs.google') || _xu.includes('AiSandbox');
-            if (_isGoogle) {
-                try { _fluxyCapture(_rt); } catch(_) {}
-            }
-        }
 
         // Bắt AT mới từ batchexecute XHR response
         if (_isFlowBatch && _rt) {
@@ -370,114 +439,23 @@ XMLHttpRequest.prototype.send = function (...args) {
                     }
                 }
             } catch (_) {}
-        }
-        // Bắt workflowId từ jwpduf RESPONSE (Angular poll → [mediaId, projectId, workflowId, "CAE"])
-        if (_isFlowBatch && _rt) {
+            // Capture flow-content.google image URLs (signed URL với ?Expires=...&Signature=...)
             try {
-                const _rpcUrl = this._url.startsWith('/') ? (window.location.origin + this._url) : this._url;
-                if (new URL(_rpcUrl).searchParams.get('rpcids') === 'jwpduf') {
-                    // Raw batchexecute text có dạng: \"mediaId\",\"projId\",\"workflowId\",\"CAE\"
-                    const _jwpPat = /\\"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\",\\"[0-9a-f-]{36}\\",\\"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\",\\"CAE\\"/gi;
-                    for (const _jm of _rt.matchAll(_jwpPat)) {
-                        const _mid = _jm[1], _wid = _jm[2];
-                        if (!window._fluxyWorkflowIds) window._fluxyWorkflowIds = {};
-                        if (!window._fluxyWorkflowIds[_mid]) {
-                            window._fluxyWorkflowIds[_mid] = _wid;
-                            console.log('[Fluxy] jwpduf wid:', _wid.substring(0,8), 'for:', _mid.substring(0,8));
-                        }
-                    }
-                    // Complete signal (không phải [3] pending) → gửi raw body lên SW
-                    if (!_rt.includes('[3]') && _rt.length > 50) {
-                        window.dispatchEvent(new CustomEvent('AutoFlow_JWPDUF_RESP', { detail: { raw: _rt.substring(0, 2000), ts: Date.now() } }));
+                // Không dừng ở '\' để capture full signed URL kể cả = (= = '=')
+                const imgUrls = _rt.match(/https:\\?\/\\?\/flow-content\.google\\?\/image\\?\/[^\s",\]]+/g);
+                if (imgUrls && imgUrls.length) {
+                    const unescUrl = (s) => s
+                        .replace(/\\u003d/gi, '=').replace(/\\u0026/gi, '&')
+                        .replace(/\\u002f/gi, '/').replace(/\\u003f/gi, '?')
+                        .replace(/\\\//g, '/').replace(/\\n/g, '').replace(/\\/g, '');
+                    const clean = [...new Set(imgUrls.map(unescUrl))].filter(u => u.startsWith('https://'));
+                    if (clean.length) {
+                        window._fluxyLatestImageUrls = { urls: clean, ts: Date.now() };
+                        console.log('[Fluxy-IMG] XHR captured', clean.length, 'img URLs, url0_len=', clean[0]?.length);
                     }
                 }
-            } catch(_) {}
-        }
-
-        if (this._url && this._url.includes('aisandbox-pa.googleapis.com')) {
-            console.log("AutoFlow: Intercepting XHR to -> ", this._url);
-            if (_rt) processCausText(_rt);
+            } catch (_) {}
         }
     });
     return originalXhrSend.apply(this, args);
 };
-
-function processCausText(text) {
-    const matches = text.match(/CAUS[A-Za-z0-9_-]{30,}/g);
-    if (matches && matches.length > 0) {
-        console.log("AutoFlow: CAPTURED DIRECT CAUS!", matches);
-        window.dispatchEvent(new CustomEvent('AutoFlow_CAUS', { detail: [...new Set(matches)] }));
-    }
-
-    if (text.includes('"projectId"') && (text.includes('"workflowId"') || text.includes('"name"'))) {
-        try {
-            const mediaMatch = text.match(/"name"\s*:\s*"([0-9a-f-]{36})"/);
-            const projectMatch = text.match(/"projectId"\s*:\s*"([0-9a-f-]{36})"/);
-            const workflowMatch = text.match(/"workflowId"\s*:\s*"([0-9a-f-]{36})"/);
-            const stepMatch = text.match(/"workflowStepId"\s*:\s*"([^"]+)"/);
-
-            if (mediaMatch && projectMatch && workflowMatch) {
-                const mediaId = mediaMatch[1];
-                const projectId = projectMatch[1];
-                const workflowId = workflowMatch[1];
-                const stepId = stepMatch ? stepMatch[1] : 'CAE';
-
-                const buf = [];
-                buf.push(0x08, 0x05);
-                buf.push(0x12, projectId.length);
-                for (let i = 0; i < projectId.length; i++) buf.push(projectId.charCodeAt(i));
-                buf.push(0x1a, mediaId.length);
-                for (let i = 0; i < mediaId.length; i++) buf.push(mediaId.charCodeAt(i));
-                buf.push(0x22, stepId.length);
-                for (let i = 0; i < stepId.length; i++) buf.push(stepId.charCodeAt(i));
-                buf.push(0x2a, workflowId.length);
-                for (let i = 0; i < workflowId.length; i++) buf.push(workflowId.charCodeAt(i));
-
-                const b64 = btoa(String.fromCharCode.apply(null, buf)).replace(/=+$/, '');
-                console.log("AutoFlow: RECONSTRUCTED CAUS FROM JSON!", b64);
-                window.dispatchEvent(new CustomEvent('AutoFlow_CAUS', { detail: [b64] }));
-            }
-        } catch (e) { console.error("AutoFlow CAUS Build Error", e); }
-    }
-}
-
-function buildCausString(projectId, mediaId, workflowId, stepId = 'CAE') {
-    const buf = [];
-    buf.push(0x08, 0x05);
-    buf.push(0x12, projectId.length);
-    for (let i = 0; i < projectId.length; i++) buf.push(projectId.charCodeAt(i));
-    buf.push(0x1a, mediaId.length);
-    for (let i = 0; i < mediaId.length; i++) buf.push(mediaId.charCodeAt(i));
-    buf.push(0x22, stepId.length);
-    for (let i = 0; i < stepId.length; i++) buf.push(stepId.charCodeAt(i));
-    buf.push(0x2a, workflowId.length);
-    for (let i = 0; i < workflowId.length; i++) buf.push(workflowId.charCodeAt(i));
-    return btoa(String.fromCharCode.apply(null, buf)).replace(/=+$/, '');
-}
-
-// Quét project ID từ URL và DOM
-setInterval(() => {
-    const loc = window.location.href;
-    const projectMatch = loc.match(/project\/([0-9a-f-]{36})/);
-    const mediaMatch = loc.match(/edit\/([0-9a-f-]{36})/);
-
-    let workflowId = null;
-    let fallbackRegex = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi;
-
-    if (projectMatch && mediaMatch && document.body) {
-        let rootState = document.body.innerHTML;
-        let m;
-        while ((m = fallbackRegex.exec(rootState)) !== null) {
-            let id = m[1];
-            if (id !== projectMatch[1] && id !== mediaMatch[1]) {
-                workflowId = id;
-                break;
-            }
-        }
-
-        if (workflowId) {
-            const b64 = buildCausString(projectMatch[1], mediaMatch[1], workflowId, 'CAE');
-            window.dispatchEvent(new CustomEvent('AutoFlow_CAUS', { detail: [b64] }));
-        }
-    }
-}, 3000);

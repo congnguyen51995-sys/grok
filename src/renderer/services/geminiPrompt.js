@@ -51,9 +51,6 @@ async function geminiJSON(apiKeys, prompt, schema, maxTokens = 32768, onSwitch) 
         maxOutputTokens: maxTokens,
         responseMimeType: 'application/json',
         responseSchema: schema,
-        // Tắt thinking mode — tiết kiệm 20-50K token/lần gọi
-        // Gemini 2.5 Flash bật thinking mặc định, làm cạn quota rất nhanh
-        thinkingConfig: { thinkingBudget: 0 },
       }
     });
     const candidate = response?.candidates?.[0];

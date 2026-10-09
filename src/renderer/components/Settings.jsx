@@ -9,7 +9,7 @@ import {
 const SECTIONS = [
     { id: 'extension', label: 'Extension',   sub: 'Cài vào Chrome',              icon: '🧩' },
     { id: 'apikey',    label: 'API Key',      sub: 'Gemini, Claude & ElevenLabs', icon: '🔑' },
-    { id: 'stockvideo',label: 'Stock Video',  sub: 'Pexels & Pixabay',            icon: '🎬' },
+    { id: 'stockvideo',label: 'Stock Video',  sub: 'Pexels, Pixabay & DVIDS',     icon: '🎬' },
 ];
 
 export default function Settings({ dark = true }) {
@@ -281,7 +281,10 @@ export default function Settings({ dark = true }) {
     const [pixabayInput,   setPixabayInput]   = useState('');
     const [pixabaySaved,   setPixabaySaved]   = useState(false);
     const [pixabayCopied,  setPixabayCopied]  = useState(false);
-    const [stockTesting,   setStockTesting]   = useState(null); // 'pexels'|'pixabay'|null
+    const [dvidsKey,       setDvidsKey]       = useState('');
+    const [dvidsInput,     setDvidsInput]     = useState('');
+    const [dvidsSaved,     setDvidsSaved]     = useState(false);
+    const [stockTesting,   setStockTesting]   = useState(null); // 'pexels'|'pixabay'|'dvids'|null
     const [stockTestResult,setStockTestResult]= useState({}); // { pexels: 'ok'|'fail', pixabay: ... }
 
     // Load saved config on mount
@@ -291,6 +294,8 @@ export default function Settings({ dark = true }) {
         const DEFAULT_PIXABAY = '56053263-d50fe3d92779b295085043216';
         window.electronAPI?.getSetting?.('pexels_api_key', '').then(k => { const v = k || DEFAULT_PEXELS; setPexelsKey(v); setPexelsInput(v); }).catch(() => { setPexelsKey(DEFAULT_PEXELS); setPexelsInput(DEFAULT_PEXELS); });
         window.electronAPI?.getSetting?.('pixabay_api_key', '').then(k => { const v = k || DEFAULT_PIXABAY; setPixabayKey(v); setPixabayInput(v); }).catch(() => { setPixabayKey(DEFAULT_PIXABAY); setPixabayInput(DEFAULT_PIXABAY); });
+        const DEFAULT_DVIDS = 'key-6ab75f1e17922';
+        window.electronAPI?.getSetting?.('dvids_api_key', '').then(k => { const v = k || DEFAULT_DVIDS; setDvidsKey(v); setDvidsInput(v); }).catch(() => { setDvidsKey(DEFAULT_DVIDS); setDvidsInput(DEFAULT_DVIDS); });
     }, []);
 
     const handleStockSave = async (provider) => {
@@ -300,6 +305,12 @@ export default function Settings({ dark = true }) {
             await window.electronAPI?.setSetting?.('pexels_api_key', k);
             setPexelsSaved(true);
             setTimeout(() => setPexelsSaved(false), 2500);
+        } else if (provider === 'dvids') {
+            const k = dvidsInput.trim();
+            setDvidsKey(k);
+            await window.electronAPI?.setSetting?.('dvids_api_key', k);
+            setDvidsSaved(true);
+            setTimeout(() => setDvidsSaved(false), 2500);
         } else {
             const k = pixabayInput.trim();
             setPixabayKey(k);
@@ -310,12 +321,12 @@ export default function Settings({ dark = true }) {
     };
 
     const handleStockTest = async (provider) => {
-        const key = provider === 'pexels' ? pexelsKey : pixabayKey;
+        const key = provider === 'pexels' ? pexelsKey : provider === 'dvids' ? dvidsKey : pixabayKey;
         if (!key) return;
         setStockTesting(provider);
         setStockTestResult(r => ({ ...r, [provider]: null }));
         const res = await window.electronAPI?.stockVideoSearch?.({
-            keyword: 'nature',
+            keyword: provider === 'dvids' ? 'aircraft' : 'nature',
             provider,
             apiKey: key,
             perPage: 1,
@@ -1345,6 +1356,62 @@ export default function Settings({ dark = true }) {
                                             <span className="text-xs font-bold text-emerald-400">✓ OK</span>
                                         )}
                                         {stockTestResult['pixabay'] === 'fail' && (
+                                            <span className="text-xs font-bold text-red-400">✗ Lỗi</span>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* ── DVIDS card ── */}
+                        <div className="bg-slate-800/60 border border-slate-700/50 rounded-2xl overflow-hidden">
+                            <div className="flex items-center gap-3 px-5 py-4 border-b border-slate-700/40">
+                                <span className="text-xl">🎖️</span>
+                                <div>
+                                    <p className="text-sm font-bold text-white">DVIDS <span className="text-xs font-normal text-slate-400">— video quân sự mới nhất</span></p>
+                                    <p className="text-xs text-slate-400">Footage quân đội Mỹ, public domain. AI Agent tự dùng cho chủ đề quân sự.</p>
+                                </div>
+                                <a
+                                    href="#"
+                                    onClick={e => { e.preventDefault(); window.electronAPI?.openExternal?.('https://api.dvidshub.net/'); }}
+                                    className="ml-auto text-xs text-blue-400 hover:text-blue-300 underline"
+                                >Lấy API key ↗</a>
+                            </div>
+                            <div className="px-5 py-4 space-y-3">
+                                <div className="flex gap-2">
+                                    <input
+                                        type="password"
+                                        value={dvidsInput}
+                                        onChange={e => setDvidsInput(e.target.value)}
+                                        placeholder="key-xxxxxxxxxxxxx"
+                                        className="flex-1 bg-slate-900/60 border border-slate-600/50 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500/60"
+                                    />
+                                    <button
+                                        onClick={() => handleStockSave('dvids')}
+                                        disabled={!dvidsInput.trim()}
+                                        className="px-4 py-2.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-bold rounded-xl transition-colors whitespace-nowrap"
+                                    >
+                                        {dvidsSaved ? '✓ Đã lưu' : 'Lưu'}
+                                    </button>
+                                </div>
+                                {dvidsKey && (
+                                    <div className="flex items-center gap-3">
+                                        <div className="flex-1 text-xs text-slate-400 truncate">
+                                            Key hiện tại: <span className="text-slate-300 font-mono">{dvidsKey.slice(0, 8)}{'•'.repeat(Math.max(0, Math.min(16, dvidsKey.length - 8)))}…</span>
+                                        </div>
+                                        <button
+                                            onClick={() => handleStockTest('dvids')}
+                                            disabled={stockTesting === 'dvids'}
+                                            className="px-4 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 border border-slate-600/50 text-xs text-white font-bold rounded-lg transition-colors flex items-center gap-1.5"
+                                        >
+                                            {stockTesting === 'dvids'
+                                                ? <><Loader2 size={12} className="animate-spin"/> Đang test...</>
+                                                : 'Test kết nối'}
+                                        </button>
+                                        {stockTestResult['dvids'] === 'ok' && (
+                                            <span className="text-xs font-bold text-emerald-400">✓ OK</span>
+                                        )}
+                                        {stockTestResult['dvids'] === 'fail' && (
                                             <span className="text-xs font-bold text-red-400">✗ Lỗi</span>
                                         )}
                                     </div>

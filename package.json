@@ -1,7 +1,7 @@
 {
   "name": "fluxy-thanh-cong-media",
-  "version": "5.2.4",
-  "description": "Fluxy - ThÃ nh CÃ´ng Media - Desktop app for AI content automation",
+  "version": "5.4.5",
+  "description": "Fluxy - Thanh Cong Media - Desktop app for AI content automation",
   "main": "src/main/main.js",
   "type": "commonjs",
   "scripts": {
@@ -49,7 +49,7 @@
   },
   "build": {
     "appId": "com.fluxy.thanhcongmedia",
-    "productName": "Fluxy",
+    "productName": "Fluxy - Thanh Cong Media",
     "asar": false,
     "directories": {
       "output": "release"
@@ -64,13 +64,6 @@
       {
         "from": "FluxyExtension-main",
         "to": "FluxyExtension"
-      },
-      {
-        "from": "omnivoice_server",
-        "to": "omnivoice_server",
-        "filter": [
-          "**/*"
-        ]
       }
     ],
     "win": {

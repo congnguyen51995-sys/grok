@@ -27,6 +27,8 @@ debug/
 .env.local
 src/main/system-keys.json
 groq-keys.json
+src/main/fb-config.js
+Key
 
 # OS files
 .DS_Store

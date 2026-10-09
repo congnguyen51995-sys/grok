@@ -54,9 +54,9 @@ const MC_GEMINI_VOICES = [
 ];
 
 const GEMINI_MODELS = [
-  { id: 'gemini-2.0-flash',               label: 'Gemini 2.0 Flash'         },
-  { id: 'gemini-2.5-flash-preview-05-20', label: 'Gemini 2.5 Flash Preview' },
-  { id: 'gemini-2.5-pro',                 label: 'Gemini 2.5 Pro'           },
+  { id: 'gemini-3.5-flash',      label: 'Gemini 3.5 Flash'      },
+  { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite' },
+  { id: 'gemini-3-flash-preview',label: 'Gemini 3.0 Preview'    },
 ];
 
 const STORY_LANGS   = ['Tiếng Việt','English','Tiếng Nhật','Tiếng Hàn','Tiếng Trung'];

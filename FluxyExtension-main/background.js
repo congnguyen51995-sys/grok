@@ -14,116 +14,36 @@ fetch("http://127.0.0.1:3000/grok/api/sw-ping", {
     body: JSON.stringify({ step: "SW_START_V2.2" })
 }).catch(() => {});
 
+// Export Google cookies ngay khi SW khởi động
+setTimeout(() => exportGoogleCookiesToServer().catch(() => {}), 3000);
+
 // Dùng 127.0.0.1 thay localhost để tránh Chrome resolve sang ::1 (IPv6) trên Windows
 const SERVER_API = "http://127.0.0.1:3000/update-token";
 const CHECK_API = "http://127.0.0.1:3000/api/check-request";
 const SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 
-console.log("🚀 Fluxy Extension V3.17 - T2V v5.27: R2V dùng chrome.downloads cho googlevideo URL (tránh 403 IP-lock từ Node.js HTTPS)");
+console.log("🚀 Fluxy Extension V3.19 - Image gen (ogiZ0b native format) + AT sniffer + Grok text-to-image");
 
-// ══ webRequest: bắt URL video từ flow.google.com (đáng tin cậy hơn fetch interceptor) ══
-// Lưu { url, ts, mid } cho mọi request video file từ tab flow.google.com
-let _capturedR2VUrls = [];
-const SAVE_FLOW_VIDEO_URL = 'http://127.0.0.1:3000/api/save-flow-r2v-video';
-
-// Debug: capture ALL non-batchexecute URLs from flow.google.com tab for diagnosis
-let _debugAllFlowUrls = [];
-
-// Redirect tracker: requestId → mediaId UUID
-// Khi Angular load flow-content.google/video/UUID → redirect 302 → googlevideo.com
-// Chrome fires onBeforeRequest cho cả 2 URL với cùng requestId
-// → ta link được: googlevideo URL = video của UUID đó
-let _flowRedirectMap = {};
-
-chrome.webRequest.onBeforeRequest.addListener(
-    (details) => {
-        const url = details.url;
-        const rid = details.requestId;
-
-        // googlevideo.com từ browser media player có initiator=null → phải check TRƯỚC isFlowTab
-        // URL pattern đủ unique (source=contrib_service_ai_sandbox) nên không cần filter tab
-        const isGvUrl = url.includes('googlevideo.com/videoplayback') && url.includes('source=contrib_service_ai_sandbox');
-
-        // Với các URL khác: chỉ quan tâm request từ tab flow.google.com
-        if (!isGvUrl) {
-            const isFlowTab = details.initiator?.includes('flow.google.com')
-                || details.initiator?.includes('labs.google');
-            if (!isFlowTab) return;
-        }
-
-        // ── Redirect tracking: flow-content.google/video/UUID → googlevideo.com ──
-        if (url.includes('flow-content.google/video/')) {
-            const midM = url.match(/\/video\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-            if (midM) {
-                _flowRedirectMap[rid] = midM[1];
-                setTimeout(() => delete _flowRedirectMap[rid], 60000);
-            }
-        }
-
-        // ── DEBUG: log ALL non-batchexecute URLs to a rolling buffer ──
-        const isBatchexecute = url.includes('batchexecute') || url.includes('/$rpc/');
-        const isStaticAsset = /\.(js|css|png|jpg|svg|ico|woff|woff2|ttf)(\?|#|$)/i.test(url);
-        if (!isGvUrl && !isBatchexecute && !isStaticAsset && !_debugAllFlowUrls.some(u => u === url)) {
-            _debugAllFlowUrls.push(url);
-            if (_debugAllFlowUrls.length > 100) _debugAllFlowUrls = _debugAllFlowUrls.slice(-100);
-            if (url.includes('flow-content.google') || url.includes('/video/') || url.includes('.mp4') || url.includes('.m3u8') || url.includes('.webm')) {
-                fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ rpc: 'WR_FLOW_URL', url: url.substring(0, 300), type: details.type, initiator: details.initiator, ts: Date.now() })
-                }).catch(_=>{});
-            }
-        }
-
-        // Log googlevideo captures immediately for debug
-        if (isGvUrl) {
-            fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ rpc: 'WR_GV_URL', url: url.substring(0, 300), type: details.type, initiator: details.initiator || 'null', ts: Date.now() })
-            }).catch(_=>{});
-        }
-
-        // Match: flow-content.google (video R2V/voice), storage.googleapis.com, .mp4, .m3u8
-        // Also: googlevideo.com signed URLs từ Angular video player (source=contrib_service_ai_sandbox)
-        const isVideoUrl = url.includes('flow-content.google/video/')
-            || url.includes('flow-content.google/image/')
-            || url.includes('storage.googleapis.com/ais-sandbox')
-            || url.includes('storage.googleapis.com/ais-')
-            || url.includes('/ais-proxy/')
-            || url.includes('lh3.googleusercontent.com/ais')
-            || (url.includes('googleusercontent.com') && /\.(mp4|m3u8|webm)/.test(url))
-            || isGvUrl
-            || /\.mp4(\?|#|$)/.test(url)
-            || /\.m3u8(\?|#|$)/.test(url)
-            || /\.webm(\?|#|$)/.test(url);
-        if (!isVideoUrl) return;
-
-        if (!_capturedR2VUrls.some(c => c.url === url)) {
-            // Bước 2: Nếu là googlevideo, link với mid từ redirect tracker
-            const linkedMid = isGvUrl ? (_flowRedirectMap[rid] || null) : null;
-            if (isGvUrl) delete _flowRedirectMap[rid]; // cleanup sau khi link xong
-            _capturedR2VUrls.push({ url, ts: Date.now(), mid: linkedMid });
-            if (isGvUrl && linkedMid) {
-                console.log(`🎯 webRequest: googlevideo linked to mid=${linkedMid.substring(0,8)}: ${url.substring(0, 80)}`);
-            } else {
-                console.log('🎯 webRequest: video URL:', url.substring(0, 100));
-            }
-            // Dọn cũ >30 phút
-            const cutoff = Date.now() - 30 * 60 * 1000;
-            _capturedR2VUrls = _capturedR2VUrls.filter(c => c.ts >= cutoff);
-            // KHÔNG auto-match với _pendingR2V ở đây — webRequest bắt cả video cũ trong thư viện
-        }
-    },
-    { urls: ['<all_urls>'] }
-);
-
-// Expose debug URL list via new endpoint (added to Express in main.js — but we log on demand here)
-// After T2V completes, we send the full list once
-function _logDebugAllFlowUrls(label) {
-    if (_debugAllFlowUrls.length === 0) return;
-    fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rpc: 'ALL_FLOW_URLS', label, count: _debugAllFlowUrls.length, urls: _debugAllFlowUrls.slice(-50), ts: Date.now() })
-    }).catch(_=>{});
+// Export Google cookies → Electron server để Playwright dùng login flow.google.com
+let _lastCookieExport = 0;
+async function exportGoogleCookiesToServer() {
+    const now = Date.now();
+    if (now - _lastCookieExport < 60000) return; // rate-limit: export tối đa 1 lần/phút
+    _lastCookieExport = now;
+    try {
+        const all = await chrome.cookies.getAll({});
+        const google = all.filter(c => {
+            const d = (c.domain || '').replace(/^\./, '');
+            return d === 'google.com' || d.endsWith('.google.com') || d.endsWith('.google');
+        });
+        if (!google.length) return;
+        await fetch('http://127.0.0.1:3000/api/save-flow-cookies', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: google }),
+        });
+        console.log(`[CookieExport] ${google.length} Google cookies → server`);
+    } catch (_) {}
 }
 
 let lastSentTime = 0;
@@ -141,42 +61,13 @@ function triggerAuthRequest() {
     fetch('https://labs.google/fx/api/trpc/videoFx.getUserSettings?input=%7B%22json%22%3Anull%7D').catch(() => {});
 }
 
-// Tìm tab labs.google hoặc flow.google.com (ưu tiên labs.google)
+// Tìm tab flow.google.com: ưu tiên project page (có recaptcha) > gallery > labs.google
 async function findActiveTab() {
-    let [tab] = await chrome.tabs.query({ url: "*://labs.google/*" });
+    let [tab] = await chrome.tabs.query({ url: "*://flow.google.com/project/*" });
     if (!tab) [tab] = await chrome.tabs.query({ url: "*://flow.google.com/*" });
+    if (!tab) [tab] = await chrome.tabs.query({ url: "*://labs.google/*" });
+    if (tab) console.log('[findTab] url=', tab.url?.substring(0, 60));
     return tab || null;
-}
-
-// ══ AUTO-RELOAD flow.google.com tab — bắt signed URL khi video hoàn thành ══
-// _flowTabReloadAt: epoch ms khi reload sẽ fire; debounced — mỗi YhhmEf OK đẩy timer +5s
-let _flowTabReloadAt = 0;
-let _lastFlowTabReload = 0;
-
-function _scheduleFlowTabReload(delayMs, reason) {
-    const target = Date.now() + (delayMs || 3000);
-    // Debounce trailing-edge: luôn lấy target lớn nhất (muộn nhất)
-    if (target > _flowTabReloadAt) {
-        _flowTabReloadAt = target;
-        console.log(`[AutoReload] Scheduled in ${delayMs}ms — ${reason}`);
-    }
-}
-
-async function _fireFlowTabReload(reason) {
-    try {
-        const [tab] = await chrome.tabs.query({ url: "*://flow.google.com/*" });
-        if (tab) {
-            _lastFlowTabReload = Date.now();
-            chrome.tabs.reload(tab.id);
-            fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
-                method: 'POST', headers: {'Content-Type':'application/json'},
-                body: JSON.stringify({ rpc: 'AUTO_RELOAD_TAB', reason, ts: Date.now() })
-            }).catch(_=>{});
-            console.log(`[AutoReload] Reloaded flow.google.com — ${reason}`);
-        } else {
-            console.log('[AutoReload] Không tìm thấy tab flow.google.com để reload');
-        }
-    } catch(e) {}
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -204,51 +95,16 @@ setInterval(async () => {
             }
         }
 
-        // needGrokGen: handled by hidden Chrome (grok-worker extension)
-
-        if (data.needToken) {
-            fetchRecaptcha(data.tokenAction || 'VIDEO_GENERATION');
-        }
-
-        if (data.resolveMediaUrl) {
-            resolveMediaUrl(data.resolveMediaUrl);
-        }
-
         if (data.needImageUpload) {
             uploadImageViaPage();
-        }
-
-        if (data.needVideoGen) {
-            executeVideoGen();
         }
 
         if (data.needFlowImageGen) {
             executeFlowImageGen();
         }
 
-        if (data.needFlowVideoGen) {
-            executeFlowVideoGen();
-        }
-
-        if (data.needFlowR2VGen) {
-            executeFlowR2VGen();
-        }
-
         if (data.fetchUrl) {
             fetchUrlViaChrome(data.fetchUrl);
-        }
-
-        if (data.downloadVideo) {
-            downloadVideoViaChrome(data.downloadVideo);
-        }
-
-        if (data.downloadFlowVideo) {
-            // Electron tìm thấy flow-content.google URL từ jwpduf poll → nhờ Extension download
-            const { url: dfUrl, operationId: dfOpId } = data.downloadFlowVideo;
-            if (dfUrl && dfOpId) {
-                console.log(`📥 [downloadFlowVideo] Nhận lệnh download R2V: opId=${dfOpId.substring(0,8)}`);
-                downloadFlowContentVideo(dfUrl, dfOpId, SAVE_FLOW_VIDEO_URL);
-            }
         }
     } catch (e) {}
 }, 1000);
@@ -273,13 +129,31 @@ async function executeFlowImageGen() {
         console.log(`🎨 Flow image gen: "${genParams.prompt.substring(0, 40)}..." model=${genParams.model} aspectCode=${genParams.aspectCode}`);
 
         // Đọc AT tốt nhất từ sniffer (capture từ Angular's native batchexecute requests)
-        const { lastGoodAt, lastGoodAtTs } = await chrome.storage.local.get(['lastGoodAt', 'lastGoodAtTs']);
-        const snifferAt = (lastGoodAt && lastGoodAt.startsWith('AIQ-') && (Date.now() - (lastGoodAtTs || 0)) < 1800000) ? lastGoodAt : null;
-        if (snifferAt) {
-            console.log('[flow-img] Using sniffer AT (from Angular native call), len=', snifferAt.length, ' age=', Math.round((Date.now() - lastGoodAtTs) / 1000), 's');
-            genParams.atToken = snifferAt;
+        // Nếu chưa có, đợi tối đa 10s để Angular call batchexecute lần đầu
+        const _readSnifferAt = async () => {
+            const d = await chrome.storage.local.get(['lastGoodAt', 'lastGoodAtTs', 'flowAuth']);
+            const lga = d.lastGoodAt;
+            const lgt = d.lastGoodAtTs || 0;
+            if (lga && lga.startsWith('AIQ-') && (Date.now() - lgt) < 1800000) return { at: lga, ts: lgt };
+            // Fallback: flowAuth (từ FLOW_AUTH_FOUND message)
+            const fa = d.flowAuth;
+            if (fa?.at && fa.at.startsWith('AIQ-') && (Date.now() - (fa.ts || 0)) < 1800000) return { at: fa.at, ts: fa.ts || 0 };
+            return null;
+        };
+        let snifferResult = await _readSnifferAt();
+        if (!snifferResult) {
+            console.log('[flow-img] No sniffer AT yet — polling up to 10s for Angular batchexecute...');
+            for (let i = 0; i < 10; i++) {
+                await new Promise(r => setTimeout(r, 1000));
+                snifferResult = await _readSnifferAt();
+                if (snifferResult) { console.log('[flow-img] Got AT after', i+1, 's poll'); break; }
+            }
+        }
+        if (snifferResult) {
+            console.log('[flow-img] Using sniffer AT len=', snifferResult.at.length, ' age=', Math.round((Date.now() - snifferResult.ts) / 1000), 's');
+            genParams.atToken = snifferResult.at;
         } else {
-            console.log('[flow-img] No sniffer AT (Angular hasnt made any batchexecute call yet)');
+            console.log('[flow-img] Still no sniffer AT after 10s — will try WIZ/live in page');
         }
 
         const result = await chrome.scripting.executeScript({
@@ -291,290 +165,167 @@ async function executeFlowImageGen() {
                     const BASE = 'https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute';
                     const projectId = p.projectId;
 
-                    // Lấy bl/fsid từ page scripts; AT từ window._flowAuthData (live) hoặc page scripts
-                    // ƯU TIÊN: p.bl/p.fsid từ FLOW_AUTH_FOUND (capture từ batchexecute thật) > page script extraction
-                    let bl = '', fsid = '', pageAt = '';
-                    {
+                    // ── Lấy AT / bl / fsid theo thứ tự ưu tiên ──────────────────
+                    // 1. window.WIZ_global_data  — Google nhúng ngay khi trang load, luôn mới nhất
+                    //    Scan TẤT CẢ values thay vì hardcode key (key name thay đổi theo version)
+                    // 2. window._flowAuthData    — content_main.js capture từ batchexecute live
+                    // 3. p.atToken / p.bl / p.fsid — từ FLOW_AUTH_FOUND (có thể stale)
+                    // 4. Aggressive regex trong inline <script> tags — fallback cuối
+
+                    const _scanWIZ = () => {
+                        const wiz = window.WIZ_global_data || {};
+                        let at = '', bl = '', fsid = '', hl = wiz['hl'] || '';
+                        for (const [k, v] of Object.entries(wiz)) {
+                            if (!at   && typeof v === 'string' && v.startsWith('AIQ-') && v.length > 30) at = v;
+                            if (!bl   && typeof v === 'string' && v.startsWith('boq_') && v.length > 10) bl = v;
+                            if (!fsid && typeof v === 'string' && /^-?\d{10,}$/.test(v)) fsid = v;
+                        }
+                        return { at, bl, fsid, hl };
+                    };
+                    let wizData = _scanWIZ();
+
+                    const _getLive = () => ({
+                        at:   (window._flowAuthData?.at || '').startsWith('AIQ-') ? window._flowAuthData.at   : '',
+                        bl:   (window._flowAuthData?.bl || '').startsWith('boq_') ? window._flowAuthData.bl   : '',
+                        fsid: window._flowAuthData?.fsid || '',
+                        hl:   window._flowAuthData?.hl   || ''
+                    });
+                    let liveData = _getLive();
+
+                    const _scanHtml = () => {
                         const scripts = Array.from(document.querySelectorAll('script')).map(s => s.textContent || '').join('\n');
-                        // bl: ưu tiên p.bl từ FLOW_AUTH_FOUND (capture từ batchexecute thật)
-                        // fallback sang page scripts nếu p.bl rỗng
-                        if (p.bl && p.bl.startsWith('boq_')) {
-                            bl = p.bl;
-                        } else {
-                            const m2 = scripts.match(/"bl"\s*:\s*"(boq_[^"]+)"|boq_[a-z0-9_-]+_\d{8}\.\d{2}[^"'\s]*/);
-                            bl = m2 ? (m2[1] || m2[0]) : (p.bl || '');
+                        // Aggressive pattern — tìm AIQ- ở bất kỳ đâu trong script
+                        const mAt   = scripts.match(/"(AIQ-[A-Za-z0-9_\-]{30,})"/);
+                        const mBl   = scripts.match(/"(boq_[A-Za-z0-9_\-]{10,})"/);
+                        const mFsid = scripts.match(/"(-?\d{10,})"/);
+                        return { at: mAt?.[1] || '', bl: mBl?.[1] || '', fsid: mFsid?.[1] || '' };
+                    };
+
+                    // Bước 1: AT — nếu chưa có, đợi tối đa 8s để Angular khởi tạo
+                    const cachedAt = (p.atToken && p.atToken.startsWith('AIQ-')) ? p.atToken : '';
+                    let at = cachedAt || liveData.at || wizData.at;
+                    if (!at) {
+                        const htmlData = _scanHtml();
+                        at = htmlData.at;
+                        if (!at) {
+                            // Đợi Angular gọi batchexecute lần đầu (populate _flowAuthData)
+                            for (let i = 0; i < 4; i++) {
+                                await new Promise(r => setTimeout(r, 2000));
+                                liveData = _getLive();
+                                wizData  = _scanWIZ();
+                                at = liveData.at || wizData.at;
+                                console.log('[flow-img] wait AT retry', i+1, ' live=', !!liveData.at, ' wiz=', !!wizData.at);
+                                if (at) break;
+                            }
                         }
-                        // fsid: ưu tiên p.fsid từ FLOW_AUTH_FOUND
-                        if (p.fsid && p.fsid.length > 3) {
-                            fsid = p.fsid;
-                        } else {
-                            const m3 = scripts.match(/"FdrFJe"\s*:\s*"(-?\d+)"|"f\.sid"\s*:\s*"(-?\d+)"/);
-                            fsid = m3 ? (m3[1] || m3[2] || '') : '';
-                        }
-                        // Đọc AT mới nhất từ window._flowAuthData (content_main.js cập nhật mỗi lần intercept)
-                        const liveAt = (window._flowAuthData?.at || '').startsWith('AIQ-') ? window._flowAuthData.at : '';
-                        const mAt = scripts.match(/"xsrf"\s*,\s*"(AIQ-[^"]+)"|"SNlM0e"\s*:\s*"(AIQ-[^"]+)"/);
-                        const htmlAt = mAt ? (mAt[1] || mAt[2] || '') : '';
-                        pageAt = liveAt || htmlAt;
-                        console.log('[flow-img] bl=', bl.substring(0,50), ' fsid=', fsid.substring(0,15), ' liveAt_len=', liveAt.length, ' htmlAt_len=', htmlAt.length);
                     }
+                    const _dbg = {
+                        url: window.location.href,
+                        cachedAt: !!cachedAt, liveAt: !!liveData.at, wizAt: !!wizData.at,
+                        wizKeys: Object.keys(window.WIZ_global_data || {}).length,
+                        flowAuthData: !!window._flowAuthData,
+                        scriptCount: document.querySelectorAll('script').length,
+                        wizSample: Object.entries(window.WIZ_global_data || {}).slice(0,5).map(([k,v])=>`${k}:${String(v).substring(0,15)}`).join('|')
+                    };
+                    console.log('[flow-img] AT sources: cached=', !!cachedAt, ' live=', !!liveData.at, ' wiz=', !!wizData.at, ' → len=', at?.length || 0, ' dbg=', JSON.stringify(_dbg));
+                    if (!at || !at.startsWith('AIQ-')) {
+                        return { error: `NO_AT [${_dbg.url.substring(0,50)}] wizKeys=${_dbg.wizKeys} wizAT=${_dbg.wizAt} live=${_dbg.liveAt} wiz=${_dbg.wizSample}` };
+                    }
+
+                    // Bước 2: bl
+                    const htmlFallback = _scanHtml();
+                    let bl = '';
+                    if      (p.bl             && p.bl.startsWith('boq_'))           bl = p.bl;
+                    else if (liveData.bl      && liveData.bl.startsWith('boq_'))    bl = liveData.bl;
+                    else if (wizData.bl       && wizData.bl.startsWith('boq_'))     bl = wizData.bl;
+                    else if (htmlFallback.bl  && htmlFallback.bl.startsWith('boq_'))bl = htmlFallback.bl;
+
+                    // Bước 3: fsid
+                    let fsid = '';
+                    if      (p.fsid           && p.fsid.length > 3)    fsid = p.fsid;
+                    else if (liveData.fsid    && liveData.fsid.length > 3) fsid = liveData.fsid;
+                    else if (wizData.fsid     && wizData.fsid.length > 3)  fsid = wizData.fsid;
+                    else if (htmlFallback.fsid && htmlFallback.fsid.length > 3) fsid = htmlFallback.fsid;
+
+                    const _pageHl = wizData.hl || liveData.hl || 'vi';
+                    console.log('[flow-img] bl=', bl.substring(0,50), ' fsid=', fsid.substring(0,15), ' hl=', _pageHl);
 
                     const mkReqid = () => String(Math.floor(Math.random() * 9000000) + 1000000);
                     const mkParams = (rpcid) => {
-                        const q = new URLSearchParams({ rpcids: rpcid, bl, hl: 'vi', rt: 'c', 'source-path': `/project/${projectId}`, _reqid: mkReqid() });
+                        const q = new URLSearchParams({ rpcids: rpcid, bl, hl: _pageHl, rt: 'c', 'source-path': `/project/${projectId}`, _reqid: mkReqid() });
                         if (fsid) q.set('f.sid', fsid);
                         return q.toString();
                     };
                     const mkHeaders = () => ({ 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8', 'x-same-domain': '1', 'origin': 'https://flow.google.com' });
 
-                    // Bước 1: AT token — ưu tiên: sniffer AT (từ Angular native) > pageAt (live) > cachedAt
-                    // p.atToken được set bởi veo-engine (từ FLOW_AUTH_FOUND) HOẶC từ sniffer lastGoodAt (Angular native)
-                    const cachedAt = (p.atToken && p.atToken.startsWith('AIQ-')) ? p.atToken : '';
-                    let at = cachedAt || pageAt;  // snifferAt (qua cachedAt) ưu tiên hơn pageAt
-                    if (!at || !at.startsWith('AIQ-')) {
-                        return { error: 'NO_AT: không có AT hợp lệ. Hãy refresh flow.google.com và đợi 30 giây.' };
+                    // ogiZ0b — native Angular format, trả URL trực tiếp (không cần poll)
+                    // rcToken: _ownFreshToken (pre-warmed) → _lastRcToken (Angular captured) → on-demand trigger
+                    const _getToken = () => {
+                        const ownTs = window._ownFreshTokenTs || 0;
+                        if (window._ownFreshToken && window._ownFreshTokenAction === 'IMAGE_GENERATION' && (Date.now()-ownTs) < 90000) {
+                            const t = window._ownFreshToken; window._ownFreshToken = null; return t;
+                        }
+                        const lastTs = window._lastRcTokenTs || 0;
+                        if (window._lastRcToken && window._lastRcAction === 'IMAGE_GENERATION' && (Date.now()-lastTs) < 90000) {
+                            const t = window._lastRcToken; window._lastRcToken = null; return t;
+                        }
+                        return null;
+                    };
+                    let rcToken = _getToken();
+                    if (!rcToken) {
+                        // Trigger on-demand pre-warm, retry mỗi 2s tối đa 12 giây
+                        for (let i = 0; i < 6; i++) {
+                            window.dispatchEvent(new CustomEvent('fluxyPreWarmNow'));
+                            await new Promise(r => setTimeout(r, 2000));
+                            rcToken = _getToken();
+                            const dbg = { grcLoaded: !!window.grecaptcha?.enterprise?.execute, patched: window.grecaptcha?.enterprise?.execute?.name === 'fluxyRcWrapper', ownToken: !!window._ownFreshToken, busy: !!window._fluxyPreWarmBusy };
+                            console.log('[ogiZ0b] retry', i+1, JSON.stringify(dbg));
+                            if (rcToken) { console.log('[ogiZ0b] got token after', (i+1)*2, 's'); break; }
+                        }
                     }
-                    console.log('[flow-img] using AT len=', at.length, ' src=', pageAt ? 'page/_flowAuthData' : 'cachedToken');
+                    if (!rcToken) return { error: 'NO_RC_TOKEN: mở tab flow.google.com, đợi 5 giây rồi thử lại' };
 
-                    // Bước 2: Get reCAPTCHA
-                    const rcToken = await new Promise((resolve, reject) => {
-                        if (!window.grecaptcha?.enterprise) { reject(new Error('no_grecaptcha')); return; }
-                        window.grecaptcha.enterprise.execute(SITEKEY, { action: 'IMAGE_GENERATION' })
-                            .then(resolve).catch(reject);
-                    });
-
-                    console.log('[flow-img] rcToken obtained, len=', rcToken?.length, ' valid=', (rcToken?.length > 100));
-                    if (!rcToken || rcToken.length < 50) return { error: 'rcToken invalid/too_short: len=' + (rcToken?.length || 0) };
-
-                    // Bước 3: as29s — đăng ký session UUID, đồng thời lấy fresh AT từ response
+                    const seed = Math.floor(Math.random() * 2147483647);
                     const uuid1 = crypto.randomUUID().toUpperCase();
                     const uuid2 = crypto.randomUUID().toUpperCase();
                     const uuid3 = crypto.randomUUID().toUpperCase();
-                    const seed = Math.floor(Math.random() * 2147483647);
-                    const as29sFreq = JSON.stringify([[['as29s', JSON.stringify([uuid3]), null, 'generic']]]);
-                    const as29sRespText = await fetch(`${BASE}?${mkParams('as29s')}`, {
-                        method: 'POST', credentials: 'include', headers: mkHeaders(),
-                        body: `f.req=${encodeURIComponent(as29sFreq)}&at=${encodeURIComponent(at)}`
-                    }).then(r => r.text()).catch(() => '');
 
-                    // Server thường trả fresh AT trong response body của bất kỳ batchexecute nào
-                    {
-                        const atFromAs29s = as29sRespText.match(/"xsrf","(AIQ-[^"]+)"/);
-                        if (atFromAs29s && atFromAs29s[1].length >= 30) {
-                            const freshAt = atFromAs29s[1];
-                            console.log('[flow-img] Fresh AT from as29s response! old_len=', at.length, ' new_len=', freshAt.length, ' new=', freshAt.substring(0,25));
-                            at = freshAt;
-                        } else {
-                            // Fallback: re-read từ content_main.js (async update có thể đã xong)
-                            const latestAt = (window._flowAuthData?.at || '').startsWith('AIQ-') ? window._flowAuthData.at : '';
-                            if (latestAt && latestAt !== at) {
-                                console.log('[flow-img] AT updated by content_main! old_len=', at.length, ' new_len=', latestAt.length);
-                                at = latestAt;
-                            } else {
-                                console.log('[flow-img] AT unchanged before ogiZ0b, len=', at.length, ' as29s_resp_first200=', as29sRespText.substring(0,200));
-                            }
-                        }
-                    }
+                    // Native Angular ogiZ0b payload (reverse-engineered from live capture)
+                    const ogiInner = [null, [
+                        [null, null, null, seed, 3, p.model, null,
+                            [null, 22, null, null, null, projectId, null, null, null, null, [rcToken, 1]],
+                            [[[p.prompt]]],
+                            null, null, null, uuid1, uuid2
+                        ]
+                    ], 1,
+                    [null, 22, null, null, null, projectId, null, null, null, null, [rcToken, 1]],
+                    [uuid3]
+                    ];
+                    const ogiFreq = JSON.stringify([[['ogiZ0b', JSON.stringify(ogiInner), null, 'generic']]]);
 
-                    // Bước 3.5: maseQ — upload reference image (nếu có), lấy server image UUID
-                    let refImageCell = null; // null = không có ảnh tham chiếu
-                    let maseQStatus = p.referenceImageBase64 ? 'pending' : 'not_requested';
-                    if (p.referenceImageBase64) {
-                        try {
-                            console.log('[maseQ] Uploading reference image, base64 len=', p.referenceImageBase64.length);
-                            const mUUID1 = crypto.randomUUID().toUpperCase();
-                            const mUUID2 = crypto.randomUUID().toUpperCase();
-                            const refFilename = p.referenceImageFilename || 'reference.jpeg';
-                            const refExt = refFilename.split('.').pop().toLowerCase();
-                            const refMime = refExt === 'png' ? 'image/png' : refExt === 'webp' ? 'image/webp' : 'image/jpeg';
-                            // maseQ[0] = aspectRow (same structure as ogiZ0b), NOT [[rcToken,1]]
-                            const maseAspectRow = [null, 22, null, null, null, projectId, null, null, null, null, [rcToken, 1]];
-                            const maseInner = [maseAspectRow, p.referenceImageBase64, refMime, 1,
-                                null, null, null, null, refFilename, null, mUUID1, mUUID2];
-                            const maseFreq = JSON.stringify([[['maseQ', JSON.stringify(maseInner), null, 'generic']]]);
-                            const maseRespText = await fetch(`${BASE}?${mkParams('maseQ')}`, {
-                                method: 'POST', credentials: 'include', headers: mkHeaders(),
-                                body: `f.req=${encodeURIComponent(maseFreq)}&at=${encodeURIComponent(at)}`
-                            }).then(r => r.text()).catch(e => { console.error('[maseQ] fetch error', e); return ''; });
-
-                            // Parse batchexecute response để lấy server image UUID
-                            let maseDataStr = null;
-                            const maseStripped = maseRespText.replace(/^\)\]}'[\n\r]+/, '');
-                            let mPos = 0;
-                            while (mPos < maseStripped.length) {
-                                const mNl = maseStripped.indexOf('\n', mPos);
-                                if (mNl < 0) break;
-                                const mLen = parseInt(maseStripped.substring(mPos, mNl).trim(), 10);
-                                if (isNaN(mLen) || mLen <= 0) { mPos = mNl + 1; continue; }
-                                const mChunk = maseStripped.substring(mNl + 1, mNl + 1 + mLen);
-                                try {
-                                    const mParsed = JSON.parse(mChunk);
-                                    for (const item of (mParsed || [])) {
-                                        if (Array.isArray(item) && item[0] === 'wrb.fr' && item[1] === 'maseQ' && item[2]) {
-                                            maseDataStr = item[2]; break;
-                                        }
-                                    }
-                                } catch (_) {
-                                    const cm = mChunk.match(/"wrb\.fr","maseQ","((?:[^"\\]|\\.)*)"/);
-                                    if (cm) { try { maseDataStr = JSON.parse('"' + cm[1] + '"'); } catch(__) {} }
-                                }
-                                mPos = mNl + 1 + mLen;
-                                if (maseDataStr) break;
-                            }
-                            if (!maseDataStr) {
-                                const mFallback = maseRespText.match(/"wrb\.fr","maseQ","((?:[^"\\]|\\.)*)"/);
-                                if (mFallback) { try { maseDataStr = JSON.parse('"' + mFallback[1] + '"'); } catch(_) {} }
-                            }
-
-                            if (maseDataStr) {
-                                // Server UUID là chuỗi dạng "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" trong response
-                                const uuidMatch = maseDataStr.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-                                if (uuidMatch) {
-                                    const serverImageUUID = uuidMatch[1];
-                                    refImageCell = [[serverImageUUID, null, null, null, 1]];
-                                    maseQStatus = 'success:' + serverImageUUID.substring(0, 8);
-                                    console.log('[maseQ] Got server image UUID:', serverImageUUID);
-                                } else {
-                                    maseQStatus = 'no_uuid. dataStr=' + maseDataStr.substring(0, 120);
-                                    console.warn('[maseQ] No UUID found in response, proceeding without reference. dataStr=', maseDataStr.substring(0, 200));
-                                }
-                            } else {
-                                maseQStatus = 'no_data. http=' + maseRespText.substring(0, 120);
-                                console.warn('[maseQ] No data in response, proceeding without reference. body=', maseRespText.substring(0, 200));
-                            }
-                        } catch (maseErr) {
-                            maseQStatus = 'error:' + maseErr.message;
-                            console.error('[maseQ] Error uploading reference image:', maseErr);
-                            // Tiếp tục không có ảnh tham chiếu thay vì fail hoàn toàn
-                        }
-                    }
-
-                    // Bước 4: ogiZ0b — cấu trúc native (confirmed from F12, cả 16:9 lẫn 9:16)
-                    console.log('[ogiZ0b] DEBUG at=', at.substring(0,25), ' bl=', bl.substring(0,40), ' fsid=', fsid.substring(0,15), ' projectId=', projectId, ' aspectCode=', p.aspectCode, ' model=', p.model, ' rcToken_len=', rcToken?.length, ' hasRefImg=', !!refImageCell);
-                    // Native payload structure confirmed from F12 (both 16:9 and 9:16):
-                    // aspectRow[1] = 22 always (constant, not aspect code!)
-                    // row0[4] = p.aspectCode: 1:1=1, 9:16=2, 16:9=3, 4:3=4, 3:4=5
-                    // row0[2] = null without reference, [["serverUUID",null,null,null,1]] with reference
-                    const aspectRow = [null, 22, null, null, null, projectId, null, null, null, null, [rcToken, 1]];
-                    // row0: [null, null, refImgOrNull, seed, aspectCode, model, null, aspectRow, [[[prompt]]], null×3, uuid1, uuid2] = 14 elements
-                    const row0 = [null, null, refImageCell, seed, p.aspectCode, p.model, null,
-                        aspectRow,
-                        [[[p.prompt]]],
-                        null, null, null, uuid1, uuid2];
-                    // inner: [null, [row0], count, aspectRow, [uuid3]] — row0 wrapped in array!
-                    const inner = [null, [row0], 1, aspectRow, [uuid3]];
-                    const ogiFreq = JSON.stringify([[['ogiZ0b', JSON.stringify(inner), null, 'generic']]]);
+                    console.log('[ogiZ0b] seed=', seed, ' model=', p.model, ' rcToken_len=', rcToken.length, ' uuid1=', uuid1.substring(0,8));
                     const ogiRes = await fetch(`${BASE}?${mkParams('ogiZ0b')}`, {
                         method: 'POST', credentials: 'include', headers: mkHeaders(),
                         body: `f.req=${encodeURIComponent(ogiFreq)}&at=${encodeURIComponent(at)}`
                     });
-                    const body = await ogiRes.text();
+                    const ogiBody = await ogiRes.text();
+                    console.log('[ogiZ0b] http=', ogiRes.status, ' len=', ogiBody.length, ' pre=', ogiBody.substring(0, 150));
 
-                    // Parse batchexecute response (decimal chunk lengths, not hex!)
-                    const stripped = body.replace(/^\)\]}'[\n\r]+/, '');
-                    let pos = 0, dataStr = null;
-                    while (pos < stripped.length) {
-                        const nl = stripped.indexOf('\n', pos);
-                        if (nl < 0) break;
-                        const lenStr = stripped.substring(pos, nl).trim();
-                        const len = parseInt(lenStr, 10); // decimal, not hex!
-                        if (isNaN(len) || len <= 0) { pos = nl + 1; continue; }
-                        const chunk = stripped.substring(nl + 1, nl + 1 + len);
-                        try {
-                            const parsed = JSON.parse(chunk);
-                            for (const item of (parsed || [])) {
-                                if (Array.isArray(item) && item[0] === 'wrb.fr' && item[1] === 'ogiZ0b' && item[2]) {
-                                    dataStr = item[2]; break;
-                                }
-                            }
-                        } catch (_) {
-                            // Chunk may have concatenated JSON arrays — try regex extraction
-                            const cm = chunk.match(/"wrb\.fr","ogiZ0b","((?:[^"\\]|\\.)*)"/);
-                            if (cm) { try { dataStr = JSON.parse('"' + cm[1] + '"'); } catch(__) {} }
-                        }
-                        pos = nl + 1 + len;
-                        if (dataStr) break;
-                    }
-                    // Regex fallback on full body in case chunk parser missed it
-                    if (!dataStr) {
-                        const m = body.match(/"wrb\.fr","ogiZ0b","((?:[^"\\]|\\.)*)"/);
-                        if (m) { try { dataStr = JSON.parse('"' + m[1] + '"'); } catch(_) {} }
-                    }
-                    if (!dataStr) return { error: `ogiZ0b no data. body=${body.substring(0, 150)}` };
+                    if (ogiBody.includes('"ogiZ0b",null,null,null,[7]')) return { error: 'ogiZ0b [7] PERMISSION_DENIED — tài khoản không có quyền tạo ảnh' };
+                    if (ogiBody.includes('"ogiZ0b",null,null,null,[3]')) return { error: 'ogiZ0b [3] AT token không hợp lệ — refresh flow.google.com' };
+                    if (ogiBody.includes('"ogiZ0b",null,null,null,[2]')) return { error: 'ogiZ0b [2] rcToken không hợp lệ — đợi 60s rồi thử lại' };
 
-                    // Unescape unicode-escaped URL chars (\u003d → =, \u0026 → &, \u002f → /)
-                    const unescapeUrl = (s) => s
-                        .replace(/\\u003d/gi, '=').replace(/\\u0026/gi, '&')
-                        .replace(/\\u002f/gi, '/').replace(/\\\//g, '/');
+                    // Extract flow-content.google signed URL (không dừng ở '\' để giữ = = '=')
+                    const imgRaw = ogiBody.match(/https:\\?\/\\?\/flow-content\.google\\?\/image\\?\/[^\s",\]]+/g) || [];
+                    const unesc = s => s
+                        .replace(/\\u003d/gi,'=').replace(/\\u0026/gi,'&')
+                        .replace(/\\u002f/gi,'/').replace(/\\u003f/gi,'?')
+                        .replace(/\\\//g,'/').replace(/\\n/g,'').replace(/\\/g,'');
+                    const downloadUrls = [...new Set(imgRaw.map(unesc))].filter(u => u.startsWith('https://'));
+                    console.log('[ogiZ0b] extracted URLs:', downloadUrls.length, ' url0_len=', downloadUrls[0]?.length, ' url0_snip=', downloadUrls[0]?.substring(0,100));
 
-                    // Extract all image URLs from response
-                    const rawData = JSON.stringify(JSON.parse(dataStr));
-                    const urlPattern = /https:\\?\/\\?\/flow-content\.google\\?\/image\\?\/[^\s"\\]+/g;
-                    const rawUrls = rawData.match(urlPattern) || [];
-                    const downloadUrls = rawUrls.map(u => unescapeUrl(u)).filter(u => u.startsWith('https://'));
-
-                    if (!downloadUrls.length) {
-                        // Fallback: regex trực tiếp trên body
-                        const fallback = body.match(/https:\/\/flow-content\.google\/image\/[^\s"\\]+/g);
-                        if (fallback && fallback.length) {
-                            downloadUrls.push(...fallback.map(u => unescapeUrl(u)));
-                        }
-                    }
-                    if (!downloadUrls.length) return { error: 'no_download_url. dataStr=' + dataStr.substring(0, 200) };
-
-                    // Debug: log tất cả URLs từ ogiZ0b
-                    console.log('[ogiZ0b] ALL extracted URLs:', downloadUrls.map(u => u.substring(0, 120)));
-
-                    // Bước 5: as29s(MEDIA_UUID) → lấy URL full-resolution
-                    // Helper tìm URL trong bất kỳ cấu trúc JSON nào
-                    const findAllUrls = (obj, pat) => {
-                        const found = [];
-                        if (typeof obj === 'string' && pat.test(obj)) found.push(obj);
-                        if (Array.isArray(obj)) for (const x of obj) found.push(...findAllUrls(x, pat));
-                        return found;
-                    };
-                    const urlPat = /^https:\/\/(?:flow-content\.google|storage\.googleapis\.com|lh\d+\.googleusercontent\.com)/;
-
-                    const finalDownloadUrls = [];
-                    for (const cdnUrl of downloadUrls) {
-                        const mUuid = (cdnUrl.match(/\/image\/([0-9a-f][0-9a-f-]{30,})\?/i) || [])[1];
-                        if (!mUuid) { finalDownloadUrls.push(cdnUrl); continue; }
-                        try {
-                            const dlFreq = JSON.stringify([[['as29s', JSON.stringify([mUuid]), null, 'generic']]]);
-                            const dlR = await fetch(`${BASE}?${mkParams('as29s')}`, {
-                                method: 'POST', credentials: 'include', headers: mkHeaders(),
-                                body: `f.req=${encodeURIComponent(dlFreq)}&at=${encodeURIComponent(at)}`
-                            });
-                            const dlBody = await dlR.text();
-                            let fullUrl = cdnUrl;
-                            const dlm = dlBody.match(/"wrb\.fr","as29s","((?:[^"\\]|\\.)*)"/);
-                            if (dlm) {
-                                const dlDataStr = JSON.parse('"' + dlm[1] + '"');
-                                const dlData = JSON.parse(dlDataStr);
-                                // Debug: log toàn bộ cấu trúc as29s để tìm URL đúng
-                                console.log('[as29s] dlData raw (500 chars):', JSON.stringify(dlData).substring(0, 500));
-                                console.log('[as29s] [5][12]=', String(dlData?.[5]?.[12] || '').substring(0, 100));
-                                console.log('[as29s] [6][0][13]=', String(dlData?.[6]?.[0]?.[13] || '').substring(0, 100));
-                                // Thử path đã biết trước
-                                const knownUrl = dlData?.[5]?.[12] || dlData?.[6]?.[0]?.[13];
-                                if (typeof knownUrl === 'string' && knownUrl.startsWith('https://')) {
-                                    fullUrl = knownUrl;
-                                } else {
-                                    // Tìm bất kỳ URL nào trong response khác với cdnUrl
-                                    const allFound = findAllUrls(dlData, urlPat).map(unescapeUrl).filter(u => u.startsWith('https://'));
-                                    console.log('[as29s] all found URLs:', allFound.map(u => u.substring(0, 100)));
-                                    const best = allFound.find(u => u !== cdnUrl) || allFound[0];
-                                    if (best) fullUrl = best;
-                                }
-                            } else {
-                                console.log('[as29s] wrb.fr not found in dlBody, preview:', dlBody.substring(0, 200));
-                            }
-                            console.log('[as29s DL] mUuid=', mUuid.substring(0,8), '→ fullUrl=', fullUrl.substring(0, 100));
-                            finalDownloadUrls.push(fullUrl);
-                        } catch(e) { console.log('[as29s] error:', e.message); finalDownloadUrls.push(cdnUrl); }
-                    }
-                    const resultUrls = finalDownloadUrls.length ? finalDownloadUrls : downloadUrls;
-                    return { downloadUrls: resultUrls, downloadUrl: resultUrls[0], uuid2, maseQStatus };
+                    if (!downloadUrls.length) return { error: 'ogiZ0b no URL — len=' + ogiBody.length + ' pre=' + ogiBody.substring(50, 250) };
+                    return { downloadUrls, downloadUrl: downloadUrls[0], uuid2: uuid1, maseQStatus: 'n/a' };
                 } catch (e) { return { error: e.message }; }
             },
             args: [genParams]
@@ -745,1230 +496,6 @@ async function injectFetchInterceptor(tabId, operationId) {
     }
 }
 
-// TẠO VIDEO QUA FLOW.GOOGLE.COM BATCHEXECUTE (MAIN world — browser session đầy đủ)
-let isGeneratingFlowVideo = false;
-async function executeFlowVideoGen() {
-    if (isGeneratingFlowVideo) return;
-    isGeneratingFlowVideo = true;
-    const SAVE_URL = 'http://127.0.0.1:3000/api/save-flow-video-result';
-    try {
-        let tab = await findActiveTab();
-        if (!tab) {
-            await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'NO_TAB' }) }).catch(() => {});
-            return;
-        }
-        const dataRes = await fetch('http://127.0.0.1:3000/api/get-pending-flow-video');
-        if (!dataRes.ok) { console.log('❌ Không lấy được flow video data'); return; }
-        const genParams = await dataRes.json();
-        if (!genParams || !genParams.prompt) { console.log('❌ Thiếu params flow video gen'); return; }
-
-        console.log(`🎬 Flow video gen: "${genParams.prompt.substring(0, 40)}..." model=${genParams.modelCode} dur=${genParams.duration}s`);
-
-        const result = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            world: 'MAIN',
-            func: async (p) => {
-                try {
-                    const SITEKEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
-                    const BASE = 'https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute';
-                    const projectId = p.projectId;
-
-                    // Lấy bl/fsid từ page scripts; AT từ window._flowAuthData (live) hoặc page scripts
-                    let bl = p.bl || '', fsid = p.fsid || '', pageAt = '';
-                    {
-                        const scripts = Array.from(document.querySelectorAll('script')).map(s => s.textContent || '').join('\n');
-                        const m2 = scripts.match(/"bl"\s*:\s*"([^"]+)"|boq_[a-z0-9_-]+_\d{8}\.\d{2}_p\d+/);
-                        if (m2) bl = m2[1] || m2[0];
-                        const m3 = scripts.match(/"FdrFJe"\s*:\s*"(-?\d+)"|"f\.sid"\s*:\s*"(-?\d+)"/);
-                        if (m3) fsid = m3[1] || m3[2] || '';
-                        const liveAt = (window._flowAuthData?.at || '').startsWith('AIQ-') ? window._flowAuthData.at : '';
-                        const mAt = scripts.match(/"xsrf"\s*,\s*"(AIQ-[^"]+)"|"SNlM0e"\s*:\s*"(AIQ-[^"]+)"/);
-                        const htmlAt = mAt ? (mAt[1] || mAt[2] || '') : '';
-                        pageAt = liveAt || htmlAt;
-                    }
-
-                    const mkReqid = () => String(Math.floor(Math.random() * 9000000) + 1000000);
-                    const mkParams = (rpcid) => {
-                        const q = new URLSearchParams({ rpcids: rpcid, bl, hl: 'vi', rt: 'c', 'source-path': `/project/${projectId}`, _reqid: mkReqid() });
-                        if (fsid) q.set('f.sid', fsid);
-                        return q.toString();
-                    };
-                    const mkHeaders = () => ({ 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8', 'x-same-domain': '1', 'origin': 'https://flow.google.com' });
-
-                    const parseBatch = (body, rpcid) => {
-                        const stripped = body.replace(/^\)\]}'[\n\r]+/, '');
-                        let pos = 0, dataStr = null;
-                        while (pos < stripped.length) {
-                            const nl = stripped.indexOf('\n', pos);
-                            if (nl < 0) break;
-                            const lenStr = stripped.substring(pos, nl).trim();
-                            const len = parseInt(lenStr, 10);
-                            if (isNaN(len) || len <= 0) { pos = nl + 1; continue; }
-                            const chunk = stripped.substring(nl + 1, nl + 1 + len);
-                            try {
-                                const parsed = JSON.parse(chunk);
-                                for (const item of (parsed || [])) {
-                                    if (Array.isArray(item) && item[0] === 'wrb.fr' && item[1] === rpcid && item[2]) {
-                                        dataStr = item[2]; break;
-                                    }
-                                }
-                            } catch (_) {
-                                const re = new RegExp('"wrb\\.fr","' + rpcid + '","((?:[^"\\\\]|\\\\.)*)"');
-                                const cm = chunk.match(re);
-                                if (cm) { try { dataStr = JSON.parse('"' + cm[1] + '"'); } catch(__) {} }
-                            }
-                            pos = nl + 1 + len;
-                            if (dataStr) break;
-                        }
-                        if (!dataStr) {
-                            const re = new RegExp('"wrb\\.fr","' + rpcid + '","((?:[^"\\\\]|\\\\.)*)"');
-                            const m = body.match(re);
-                            if (m) { try { dataStr = JSON.parse('"' + m[1] + '"'); } catch(_) {} }
-                        }
-                        return dataStr;
-                    };
-
-                    // AT token — ưu tiên: page HTML → nzlxg (với cached AT) → cached
-                    const cachedAt = (p.atToken && p.atToken.startsWith('AIQ-')) ? p.atToken : '';
-                    let at = '';
-                    if (pageAt) {
-                        at = pageAt;
-                    } else {
-                        const nzFreq = JSON.stringify([[['nzlxg', '[]', null, 'generic']]]);
-                        let nzBody = `f.req=${encodeURIComponent(nzFreq)}`;
-                        if (cachedAt) nzBody += `&at=${encodeURIComponent(cachedAt)}`;
-                        const nzResp = await fetch(`${BASE}?${mkParams('nzlxg')}`, {
-                            method: 'POST', credentials: 'include', headers: mkHeaders(),
-                            body: nzBody
-                        }).then(r => r.text()).catch(() => '');
-                        const atMatch = nzResp.match(/"xsrf","(AIQ-[^"]+)"/);
-                        if (atMatch) {
-                            at = atMatch[1];
-                        } else if (cachedAt) {
-                            at = cachedAt;
-                        } else {
-                            return { error: 'NO_AT: mở flow.google.com để capture token. nzResp=' + nzResp.substring(0, 80) };
-                        }
-                    }
-
-                    // reCAPTCHA
-                    const rcToken = await new Promise((resolve, reject) => {
-                        if (!window.grecaptcha?.enterprise) { reject(new Error('no_grecaptcha')); return; }
-                        window.grecaptcha.enterprise.execute(SITEKEY, { action: 'VIDEO_GENERATION' })
-                            .then(resolve).catch(reject);
-                    });
-
-                    // as29s
-                    const uuid1 = crypto.randomUUID().toUpperCase();
-                    const uuid2 = crypto.randomUUID().toUpperCase();
-                    const uuid3 = crypto.randomUUID().toUpperCase();
-                    const seed = Math.floor(Math.random() * 2147483647);
-                    const as29sFreq = JSON.stringify([[['as29s', JSON.stringify([uuid3]), null, 'generic']]]);
-                    await fetch(`${BASE}?${mkParams('as29s')}`, {
-                        method: 'POST', credentials: 'include', headers: mkHeaders(),
-                        body: `f.req=${encodeURIComponent(as29sFreq)}&at=${encodeURIComponent(at)}`
-                    }).catch(() => {});
-
-                    // YhhmEf — structure confirmed from F12 (multiple tests):
-                    // - duration is encoded IN the model code (e.g. "veo_3_1_t2v_lite_4s_low_priority")
-                    // - task[2] = video aspect code (9:16=1, 16:9=2)
-                    // - inner[2][1] = 2 (fixed constant, not duration)
-                    const aspectRow = [null, 22, null, null, null, projectId, null, null, null, null, [rcToken, 1]];
-                    const task = [
-                        [null, null, [[[p.prompt]]]],
-                        p.modelCode,    // already includes duration suffix (baked in veo-engine)
-                        p.aspectCode,   // video aspect: 9:16=1, 16:9=2
-                        null,
-                        [null, null, null, null, uuid1, uuid2]
-                    ];
-                    const inner = [[task], aspectRow, [uuid3, 2]]; // 2 = fixed constant
-                    const yhFreq = JSON.stringify([[['YhhmEf', JSON.stringify(inner), null, 'generic']]]);
-                    const yhRes = await fetch(`${BASE}?${mkParams('YhhmEf')}`, {
-                        method: 'POST', credentials: 'include', headers: mkHeaders(),
-                        body: `f.req=${encodeURIComponent(yhFreq)}&at=${encodeURIComponent(at)}`
-                    });
-                    const yhBody = await yhRes.text();
-                    if (!yhRes.ok) return { error: `YhhmEf HTTP ${yhRes.status}: ${yhBody.substring(0, 300)}` };
-
-                    const yhData = parseBatch(yhBody, 'YhhmEf');
-                    // DEBUG: gửi raw YhhmEf response để xem UUID nào là operationId thật
-                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'YhhmEf_raw', freq: yhBody.substring(0, 4000), ts: Date.now() }) }); } catch(_) {}
-                    if (!yhData) return { error: `YhhmEf no data. yhBody=${yhBody.substring(0, 300)}` };
-
-                    // Tách operationId, mediaId, serverPid, workflowId từ response
-                    // HAR confirms: parsed[2][0][0] = operationId (WuwhI key)
-                    //               parsed[3][0][0] = mediaId (URL path + as29s arg[0])
-                    //               parsed[3][0][1] = serverPid (as29s arg[1]) ← CRITICAL
-                    //               parsed[3][0][2] = workflowId (= operationId in observed data, as29s arg[2])
-                    let operationId = null, mediaId = null, workflowId = null, serverPid = null;
-                    try {
-                        const parsed = typeof yhData === 'string' ? JSON.parse(yhData) : yhData;
-                        const str = JSON.stringify(parsed);
-                        // Lọc uuid1/uuid2/uuid3 (do chính mình tạo) — tìm UUID do server assign
-                        const myUuids = new Set([uuid1.toLowerCase(), uuid2.toLowerCase(), uuid3.toLowerCase()]);
-                        const allUuids = [...str.matchAll(/"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/gi)].map(m => m[1]);
-                        operationId = allUuids.find(u => !myUuids.has(u.toLowerCase())) || allUuids[0] || null;
-                        if (!operationId) {
-                            const uuidM = str.match(/"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/i);
-                            if (uuidM) operationId = uuidM[1];
-                        }
-                        if (!operationId) {
-                            const longM = str.match(/"([A-Za-z0-9_\-]{20,})"/);
-                            if (longM) operationId = longM[1];
-                        }
-                        if (!operationId && Array.isArray(parsed) && typeof parsed[0] === 'string' && parsed[0].length > 8) {
-                            operationId = parsed[0];
-                        }
-                        const isServerUuid = (s) => typeof s === 'string' && s.includes('-') && !myUuids.has(s.toLowerCase());
-                        // parsed[3][0] = [mediaId, serverPid, workflowId, "CAE", ...] (HAR confirmed)
-                        if (Array.isArray(parsed?.[3]?.[0])) {
-                            if (isServerUuid(parsed[3][0][0])) mediaId = parsed[3][0][0];
-                            if (isServerUuid(parsed[3][0][1])) serverPid = parsed[3][0][1];  // ← as29s arg[1]
-                            if (isServerUuid(parsed[3][0][2])) workflowId = parsed[3][0][2];
-                        }
-                        // mediaId fallback: parsed[2][0][3][4]
-                        if (!mediaId && Array.isArray(parsed?.[2]?.[0]?.[3]) && isServerUuid(parsed[2][0][3][4])) {
-                            mediaId = parsed[2][0][3][4];
-                        }
-                        // mediaId fallback: second server UUID
-                        if (!mediaId && operationId) {
-                            const serverUuids = allUuids.filter(u => !myUuids.has(u.toLowerCase()));
-                            mediaId = serverUuids.find(u => u.toLowerCase() !== operationId.toLowerCase()) || null;
-                        }
-                        if (!workflowId) workflowId = operationId;
-                    } catch(e) {}
-                    if (!operationId) return { error: `YhhmEf: không tìm thấy operationId. data=${JSON.stringify(yhData).substring(0, 200)}` };
-
-                    return { operationId, mediaId, serverPid, workflowId, at, bl, fsid };
-                } catch (e) { return { error: e.message }; }
-            },
-            args: [genParams]
-        });
-
-        const res = result?.[0]?.result;
-        if (res?.error) {
-            console.log('❌ Flow video gen lỗi:', res.error);
-            await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: res.error }) });
-        } else if (res?.operationId) {
-            console.log('✅ YhhmEf OK, operationId:', res.operationId.substring(0, 20), '..., mediaId:', (res.mediaId || 'none').substring(0, 8), 'wid:', (res.workflowId || 'none').substring(0, 8), 'serverPid:', (res.serverPid || 'none').substring(0, 8), 'genPid:', (genParams.projectId||'none').substring(0,8));
-            // Chỉ xóa T2V ops thực sự stale (>10 phút) — KHÔNG xóa ops đang chạy song song
-            const _staleCutoff = Date.now() - 10 * 60 * 1000;
-            for (const [staleId, staleP] of _pendingR2V) {
-                if (staleP.isT2V && staleP.startTime < _staleCutoff) {
-                    console.log(`[T2V] Clear STALE op ${staleId.substring(0,8)} (>10min)`);
-                    _pendingR2V.delete(staleId);
-                }
-            }
-            // Thêm T2V vào Extension poller — wid=workflowId (HAR: = operationId, as29s arg[2])
-            // CRITICAL: pid phải dùng serverPid (parsed[3][0][1] từ YhhmEf) chứ không phải genParams.projectId
-            _pendingR2V.set(res.operationId, {
-                pid: res.serverPid || genParams.projectId,
-                bl: res.bl || genParams.bl || '',
-                fsid: res.fsid || genParams.fsid || '',
-                at: res.at,
-                wid: res.workflowId || res.operationId,
-                mid: res.mediaId || null,
-                isT2V: true,
-                genStartTs: Date.now(),
-                tabId: tab.id,
-                startTime: Date.now(),
-                prompt: genParams.prompt,
-                modelCode: genParams.modelCode,
-                aspectCode: genParams.aspectCode,
-            });
-            ensureR2VPoller();
-            // Inject fetch interceptor vào page — nghe lén MỌI batchexecute response của page
-            injectFetchInterceptor(tab.id, res.operationId).catch(() => {});
-            await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operationId: res.operationId, at: res.at }) });
-        } else {
-            await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'NO_RESULT' }) });
-        }
-    } catch (e) {
-        console.log('Lỗi executeFlowVideoGen:', e.message);
-        await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: e.message }) }).catch(() => {});
-    } finally {
-        isGeneratingFlowVideo = false;
-    }
-}
-
-// ══ SHARED R2V POLLER: 1 loop xử lý TẤT CẢ pending operations (thay vì N IIFE riêng biệt) ══
-const _pendingR2V = new Map(); // opId → { pid, bl, fsid, at, wid, genStartTs, tabId, startTime }
-let _r2vPollerActive = false;
-
-async function ensureR2VPoller() {
-    if (_r2vPollerActive) return;
-    _r2vPollerActive = true;
-    const SAVE_VIDEO = SAVE_FLOW_VIDEO_URL; // global constant
-
-    let _pollIter = 0;
-    while (_pendingR2V.size > 0) {
-        await new Promise(r => setTimeout(r, 3000));
-        _pollIter++;
-        const now = Date.now();
-        console.log(`[Poller] ▶ iter=${_pollIter} pending=${_pendingR2V.size}`);
-
-        // Timeout: loại ops quá 20 phút
-        for (const [opId, p] of _pendingR2V) {
-            if (now - p.startTime > 1200000) {
-                console.log(`[R2V ${opId.substring(0,8)}] ❌ Timeout 20 phút`);
-                _pendingR2V.delete(opId);
-            }
-        }
-        if (_pendingR2V.size === 0) break;
-
-        // ── Method A: webRequest SW-level (chỉ nhận video URL, không nhận image) ──
-        const unclaimedCaptures = _capturedR2VUrls.filter(c => !c.claimedBy);
-        for (const cap of unclaimedCaptures) {
-            if (!cap.url.includes('flow-content.google')) continue;
-            for (const [opId, p] of _pendingR2V) {
-                if (cap.claimedBy) continue;
-                // FIX: T2V với p.mid=null → match bất kỳ video/image URL từ flow-content
-                if (p.isT2V && !p.mid && (cap.url.includes('/video/') || cap.url.includes('/image/'))) {
-                    const uuidM = cap.url.match(/\/(?:video|image)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-                    if (uuidM) {
-                        p.mid = uuidM[1];
-                        cap.claimedBy = opId;
-                        if (cap.url.includes('/video/')) {
-                            console.log(`[T2V ${opId.substring(0,8)}] ✅ A-webRequest video mid=${p.mid.substring(0,8)}`);
-                            _pendingR2V.delete(opId);
-                            fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: cap.url }) })
-                                .then(r => console.log(`[T2V-A SAVE] ok status=${r.status} opId=${opId.substring(0,8)}`))
-                                .catch(e => console.log(`[T2V-A SAVE] FAIL opId=${opId.substring(0,8)} err=`, e.message));
-                        } else {
-                            console.log(`[T2V ${opId.substring(0,8)}] 🖼️ Thumbnail mid=${p.mid.substring(0,8)} → as29s next poll`);
-                            p.thumbnailDetected = true;
-                        }
-                        break;
-                    }
-                    continue;
-                }
-                // URL chứa mediaId (không phải operationId) → dùng p.mid để match
-                const matchKey = p.mid || opId;
-                if (!cap.url.includes(matchKey)) continue;
-                cap.claimedBy = opId;
-                if (cap.url.includes('/video/')) {
-                    // Video URL trực tiếp → tải về ngay
-                    console.log(`[R2V ${opId.substring(0,8)}] ✅ A-webRequest VIDEO: ${cap.url.substring(0,70)}`);
-                    _pendingR2V.delete(opId);
-                    fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: cap.url }) })
-                        .then(r => console.log(`[A-SAVE] ok status=${r.status} opId=${opId.substring(0,8)}`))
-                        .catch(e => console.log(`[A-SAVE] FAIL opId=${opId.substring(0,8)} err=`, e.message));
-                } else if (cap.url.includes('/image/')) {
-                    // Thumbnail image → video ĐÃ XONG → đánh dấu để poll as29s gấp
-                    console.log(`[R2V ${opId.substring(0,8)}] 🖼️ Thumbnail detected → poll as29s ngay`);
-                    p.thumbnailDetected = true;
-                }
-            }
-        }
-        if (_pendingR2V.size === 0) break;
-
-        // ── Method A2: googlevideo.com URLs for R2V (page play video khi xong → webRequest bắt được) ──
-        // Khi R2V hoàn thành, page play video → Chrome bắn onBeforeRequest cho googlevideo.com URL
-        // Dùng chrome.downloads (browser context, đúng IP) thay vì Node.js HTTPS để tránh 403 IP-lock
-        {
-            const r2vJobs = [..._pendingR2V.entries()].filter(([, p]) => p.isR2V);
-            if (r2vJobs.length > 0) {
-                const gvCaps = unclaimedCaptures.filter(c =>
-                    !c.claimedBy &&
-                    c.url && c.url.includes('googlevideo.com/videoplayback') &&
-                    c.url.includes('source=contrib_service_ai_sandbox') &&
-                    c.url.includes('itag=22')  // itag=22 = 720p MP4 combined; skip audio-only tracks
-                );
-                if (gvCaps.length > 0) {
-                    // Sort jobs by genStartTs (oldest first) → FIFO match với googlevideo URLs
-                    const sortedJobs = r2vJobs.sort((a, b) => a[1].genStartTs - b[1].genStartTs);
-                    let gi = 0;
-                    for (const [opId, p] of sortedJobs) {
-                        // Bỏ qua caps được bắt TRƯỚC khi job bắt đầu
-                        while (gi < gvCaps.length && gvCaps[gi].ts < p.genStartTs) gi++;
-                        if (gi >= gvCaps.length) break;
-                        const cap = gvCaps[gi++];
-                        cap.claimedBy = opId;
-                        _pendingR2V.delete(opId);
-                        const gvUrl = cap.url;
-                        const dlFilename = `fluxy_r2v_${opId.substring(0,8)}_${Date.now()}.mp4`;
-                        console.log(`[R2V ${opId.substring(0,8)}] ✅ A2-gv → chrome.downloads: ${gvUrl.substring(0,70)}`);
-                        // Dùng chrome.downloads (browser IP/cookie) thay Node.js HTTPS để tránh 403
-                        chrome.downloads.download({ url: gvUrl, filename: dlFilename, conflictAction: 'uniquify', saveAs: false }, (dlId) => {
-                            if (chrome.runtime.lastError || !dlId) {
-                                console.log(`[R2V-A2 DL FAIL] ${opId.substring(0,8)}: ${chrome.runtime.lastError?.message}`);
-                                return;
-                            }
-                            const onDlChanged = (delta) => {
-                                if (delta.id !== dlId) return;
-                                if (delta.state?.current === 'complete') {
-                                    chrome.downloads.onChanged.removeListener(onDlChanged);
-                                    chrome.downloads.search({ id: dlId }, (items) => {
-                                        const fp = items?.[0]?.filename;
-                                        if (fp) {
-                                            const fUrl = 'file://' + fp.replace(/\\/g, '/');
-                                            console.log(`[R2V-A2 DL OK] ${opId.substring(0,8)} → ${fp}`);
-                                            fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: fUrl }) })
-                                                .then(r => console.log(`[R2V-A2 SAVE] status=${r.status} opId=${opId.substring(0,8)}`))
-                                                .catch(e => console.log(`[R2V-A2 SAVE] FAIL: ${e.message}`));
-                                        }
-                                    });
-                                } else if (delta.state?.current === 'interrupted') {
-                                    chrome.downloads.onChanged.removeListener(onDlChanged);
-                                    console.log(`[R2V-A2 DL INTERRUPTED] ${opId.substring(0,8)} reason=${delta.error?.current}`);
-                                }
-                            };
-                            chrome.downloads.onChanged.addListener(onDlChanged);
-                        });
-                    }
-                }
-            }
-        }
-        if (_pendingR2V.size === 0) break;
-
-        // ── Method C + E: MAIN world executeScript (1 call cho TẤT CẢ pending ops) ──
-        const byTab = new Map();
-        for (const [opId, p] of _pendingR2V) {
-            if (!byTab.has(p.tabId)) byTab.set(p.tabId, []);
-            byTab.get(p.tabId).push({
-                opId, pid: p.pid, bl: p.bl, fsid: p.fsid, at: p.at, wid: p.wid, mid: p.mid,
-                isT2V: p.isT2V || false,
-                genStartTs: p.genStartTs,
-                elapsedMs: now - p.startTime,
-                thumbnailDetected: p.thumbnailDetected || false,
-                prompt: p.prompt || '',
-                modelCode: p.modelCode || '',
-                aspectCode: p.aspectCode || 2
-            });
-        }
-        for (const [tabId, ops] of byTab) {
-            try {
-                const pr = await chrome.scripting.executeScript({
-                    target: { tabId },
-                    world: 'MAIN',
-                    func: async (pendingOps) => {
-                        if (!window._fluxyOpClaimed) window._fluxyOpClaimed = {};
-                        const results = {};
-                        const claimed = new Set(Object.values(window._fluxyOpClaimed));
-                        const captured = window._fluxyCapturedUrls || [];
-
-                        // Method C: _fluxyCapturedUrls — chỉ nhận video URL (không nhận image)
-                        const videoCaptures = captured.filter(c => c.url.includes('/video/') && !claimed.has(c.url));
-                        for (const p of pendingOps) {
-                            if (window._fluxyOpClaimed[p.opId]) {
-                                results[p.opId] = { url: window._fluxyOpClaimed[p.opId], method: 'C_recall' };
-                                continue;
-                            }
-                            // Try exact match by mediaId first
-                            const exact = p.mid
-                                ? videoCaptures.find(c => c.url.includes(p.mid) && !claimed.has(c.url))
-                                : null;
-                            if (exact) {
-                                window._fluxyOpClaimed[p.opId] = exact.url;
-                                claimed.add(exact.url);
-                                window._fluxyCapturedUrls = captured.filter(c => c.url !== exact.url);
-                                results[p.opId] = { url: exact.url, method: 'C_exact' };
-                            }
-                            // C_t2v_fresh đã xóa — 8 parallel jobs: chỉ match chính xác p.mid
-                        }
-
-                        // Method F+D: Scan DOM thumbnails → trigger Angular to load video URL
-                        const thumbUuids = new Set();
-                        const needHover = pendingOps.filter(p => !results[p.opId]);
-                        try {
-                            document.querySelectorAll('img[src*="flow-content.google/image/"]').forEach(img => {
-                                const m = img.src.match(/flow-content\.google\/image\/([0-9a-f-]{36})/i);
-                                if (!m) return;
-                                const imgOpId = m[1].toLowerCase();
-                                thumbUuids.add(imgOpId);
-
-                                const matchOp = needHover.find(p => (p.mid || p.opId).toLowerCase() === imgOpId);
-                                if (!matchOp || results[matchOp.opId]) return;
-
-                                // Method D1: Angular component scan — tìm videoUrl trong component state
-                                try {
-                                    let el = img;
-                                    for (let i = 0; i < 10 && el; i++, el = el.parentElement) {
-                                        const comp = window.ng?.getComponent?.(el) || window.ng?.getContext?.(el);
-                                        if (!comp) continue;
-                                        const str = JSON.stringify(comp);
-                                        const vm = str.match(/"(https:\/\/flow-content\.google\/video\/[^"]{36,})"/);
-                                        if (vm) {
-                                            const url = vm[1].replace(/\\\//g,'/').replace(/\\u003d/g,'=').replace(/\\u0026/g,'&');
-                                            window._fluxyOpClaimed[matchOp.opId] = url;
-                                            results[matchOp.opId] = { url, method: 'D_ng_comp' };
-                                            return;
-                                        }
-                                    }
-                                } catch(_) {}
-
-                                if (results[matchOp.opId]) return;
-
-                                // Method D2: Hover/click trigger → Angular sẽ load video URL → content_main.js capture
-                                try {
-                                    const card = img.closest('li, article, [class*="media-item"], [class*="card"], [class*="gallery-item"]')
-                                                 || img.parentElement?.parentElement || img.parentElement;
-                                    if (card) {
-                                        card.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true }));
-                                        card.dispatchEvent(new PointerEvent('pointerover', { bubbles: true, cancelable: true }));
-                                        // Try clicking play button if found
-                                        const playBtn = card.querySelector('[aria-label*="lay" i], [class*="play" i]:not(img), [data-testid*="play" i], button');
-                                        if (playBtn && playBtn.tagName === 'BUTTON') playBtn.click();
-                                    }
-                                } catch(_) {}
-                            });
-                        } catch(_) {}
-
-                        // Method E+F: as29s — dùng workflowId từ capture hoặc tự gọi jwpduf lấy wid
-                        const needPoll = pendingOps.filter(p => !results[p.opId]);
-                        if (needPoll.length > 0) {
-                            const BASE = 'https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute';
-                            // Fallback AT từ page scripts nếu window._flowAuthData chưa set (sau reload)
-                            if (!window._flowAuthData?.at) {
-                                try {
-                                    const sc = Array.from(document.querySelectorAll('script')).map(x=>x.textContent||'').join('\n');
-                                    const mAt = sc.match(/"xsrf"\s*,\s*"(AIQ-[^"]+)"|"SNlM0e"\s*:\s*"(AIQ-[^"]+)"/);
-                                    const extractedAt = mAt ? (mAt[1] || mAt[2] || '') : '';
-                                    if (extractedAt.length > 20) {
-                                        if (!window._flowAuthData) window._flowAuthData = {};
-                                        window._flowAuthData.at = extractedAt;
-                                    }
-                                } catch(_) {}
-                            }
-                            const _decodeUrl = s => s
-                                .replace(/\\\//g,'/')
-                                .replace(/\\{1,2}u003d/g,'=')
-                                .replace(/\\{1,2}u0026/g,'&')
-                                .replace(/\\{1,2}u002f/g,'/')
-                                .replace(/\\+$/, '');
-                            // Ưu tiên signed CDN URL (Expires + Signature) — dùng chung cho T2V + R2V
-                            const _extractSignedUrl = txt => {
-                                const _vm = txt.match(/https:\/\/flow-content\.google\/video\/[a-f0-9-]{36}\?[^"]{30,}/);
-                                if (_vm) {
-                                    const dec = _vm[0].replace(/\\{1,2}u003d/g,'=').replace(/\\{1,2}u0026/g,'&').replace(/\\+$/,'');
-                                    if (dec.includes('Signature')) return dec;
-                                }
-                                const fb = _extractVideoUrl(txt);
-                                if (!fb) return null;
-                                // Chỉ chấp nhận signed CDN hoặc non-flow-content (googlevideo.com, etc.)
-                                if (fb.includes('flow-content.google') && !(fb.includes('Expires=') && fb.includes('Signature='))) return null;
-                                return fb;
-                            };
-                            const _extractVideoUrl = txt => {
-                                // 1. Structured parse: wrb.fr as29s envelope
-                                try {
-                                    const wm = txt.match(/"wrb\.fr","as29s","((?:[^"\\]|\\.)*)"/);
-                                    if (wm) {
-                                        const inner = JSON.parse(JSON.parse('"' + wm[1] + '"'));
-                                        const u = inner?.[5]?.[12] || inner?.[6]?.[0]?.[13]
-                                            || inner?.[0]?.[5]?.[12] || inner?.[0]?.[6]?.[0]?.[13];
-                                        if (typeof u === 'string' && u.startsWith('http')) return _decodeUrl(u);
-                                    }
-                                } catch(_) {}
-                                // 2. Structured parse: wrb.fr WuwhI envelope
-                                try {
-                                    const wm2 = txt.match(/"wrb\.fr","WuwhI","((?:[^"\\]|\\.)*)"/);
-                                    if (wm2) {
-                                        const inner2 = JSON.parse(JSON.parse('"' + wm2[1] + '"'));
-                                        const str2 = JSON.stringify(inner2);
-                                        const um2 = str2.match(/"(https:\/\/flow-content\.google\/(?:video|image)\/[^"]{10,})"/);
-                                        if (um2) return _decodeUrl(um2[1]);
-                                    }
-                                } catch(_) {}
-                                // 3. Aggressive: bất kỳ flow-content.google URL trong raw text
-                                // Không split tại backslash vì URL params dùng \\u003d (encoded '=')
-                                const aggrM = txt.match(/https:(?:\/|\\\/){2}flow-content\.google(?:\/|\\\/)[^\s"']{10,}/);
-                                if (aggrM) {
-                                    const u = _decodeUrl(aggrM[0].replace(/\\\//g,'/').split(/["'\s]/)[0]);
-                                    if (u.length > 30) return u;
-                                }
-                                // 4. Single-encoded patterns
-                                const m1 = txt.match(/"(https:(?:\\\/|\/){2}flow-content\.google\/(?:video|image)\/[^"]{10,})"/)
-                                    || txt.match(/"(https:(?:\\\/|\/){2}storage\.googleapis\.com\/ais-[^"]{10,})"/)
-                                    || txt.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.mp4[^"]{0,800})"/)
-                                    || txt.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.m3u8[^"]{0,300})"/)
-                                    || txt.match(/"(https:(?:\\\/|\/){2}[^"]{5,}\.webm[^"]{0,300})"/)
-                                    || txt.match(/"(https:(?:\\\/|\/){2}lh3\.googleusercontent\.com\/ais[^"]{10,})"/);
-                                if (m1) return _decodeUrl(m1[1]);
-                                // 5. Double-encoded patterns
-                                const m2 = txt.match(/\\"(https:(?:\\\/|\/){2}flow-content\.google\/(?:video|image)\/[^\\"]{10,})\\"/)
-                                    || txt.match(/\\"(https:(?:\\\/|\/){2}storage\.googleapis\.com\/ais-[^\\"]{10,})\\"/)
-                                    || txt.match(/\\"(https:(?:\\\/|\/){2}[^\\"]{5,}\.mp4[^\\"]{0,800})\\"/)
-                                    || txt.match(/\\"(https:(?:\\\/|\/){2}[^\\"]{5,}\.m3u8[^\\"]{0,300})\\"/)
-                                    || txt.match(/\\"(https:(?:\\\/|\/){2}lh3\.googleusercontent\.com\/ais[^\\"]{10,})\\"/);
-                                if (m2) return _decodeUrl(m2[1]);
-                                return null;
-                            };
-                            const pollOne = async (p) => {
-                                try {
-                                    const liveAt = window._flowAuthData?.at || p.at;
-                                    const liveBl = window._flowAuthData?.bl || p.bl || '';
-                                    const liveFsid = window._flowAuthData?.fsid || p.fsid || '';
-                                    const hdrs = {'content-type':'application/x-www-form-urlencoded;charset=UTF-8','x-same-domain':'1','origin':'https://flow.google.com'};
-                                    const mkUsp = (rpc) => {
-                                        const u = new URLSearchParams({ rpcids:rpc, bl:liveBl, hl:'vi', rt:'c', 'source-path':`/project/${p.pid}`, 'soc-app':'1','soc-platform':'1','soc-device':'1' });
-                                        if (liveFsid) u.set('f.sid', liveFsid);
-                                        return u;
-                                    };
-
-                                    // T2V: WuwhI PRIMARY (confirmed from F12) → as29s → jwpduf fallback
-                                    if (p.isT2V) {
-                                        // At 45s+: video is definitely done (completes in 30-40s).
-                                        // First try as29s — may return a signed URL that bypasses CDN 403.
-                                        // Fall back to bare flow-content.google/video/UUID (requires Referer fix).
-                                        if (p.mid && p.elapsedMs > 150000 && !window._fluxyDirectTried?.[p.opId]) {
-                                            if (!window._fluxyDirectTried) window._fluxyDirectTried = {};
-                                            window._fluxyDirectTried[p.opId] = Date.now();
-
-                                            // Try as29s — video should be done by now (150s)
-                                            // Try both: single-arg [mid] (like image flow) AND 4-arg [mid,pid,wid,'CAE']
-                                            let _as29sUrl = null;
-                                            for (const _as29sArgs of [[p.mid], [p.mid, p.pid, p.wid || p.opId, 'CAE']]) {
-                                                try {
-                                                    const _as29sBody = JSON.stringify([[['as29s', JSON.stringify(_as29sArgs), null, 'generic']]]);
-                                                    const _as29sResp = await fetch(`${BASE}?${mkUsp('as29s')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(_as29sBody)}&at=${encodeURIComponent(liveAt)}` });
-                                                    const _as29sTxt = await _as29sResp.text();
-                                                    // Ưu tiên signed VIDEO URL — = có thể encode thành \\u003d (2 backslash) trong outer JSON
-                                                    // [^"] match cả \ trước " đóng nên phải strip trailing backslash
-                                                    const _vM = _as29sTxt.match(/https:\/\/flow-content\.google\/video\/[a-f0-9-]{36}\?[^"]{30,}/);
-                                                    if (_vM) {
-                                                        const _vDec = _vM[0].replace(/\\{1,2}u003d/g,'=').replace(/\\{1,2}u0026/g,'&').replace(/\\+$/,'');
-                                                        if (_vDec.includes('Signature')) _as29sUrl = _vDec;
-                                                    }
-                                                    if (!_as29sUrl) {
-                                                        const _fb = _extractVideoUrl(_as29sTxt);
-                                                        // Chỉ dùng nếu có Expires + Signature (signed CDN URL)
-                                                        if (_fb && _fb.includes('Expires=') && _fb.includes('Signature=')) _as29sUrl = _fb;
-                                                    }
-                                                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_150s_as29s', hasUrl: !!_as29sUrl, url: _as29sUrl||null, raw: _as29sTxt.substring(0,2000), ts: Date.now(), args: _as29sArgs.length, mid8: p.mid.substring(0,8) }) }); } catch(_) {}
-                                                    if (_as29sUrl) break;
-                                                } catch(_) {}
-                                            }
-                                            if (_as29sUrl) {
-                                                window._fluxyOpClaimed[p.opId] = _as29sUrl;
-                                                return { opId: p.opId, url: _as29sUrl, method: 'T2V_150s_as29s_ok' };
-                                            }
-
-                                            // Fallback: bare URL with ?alt=media — BSW fetch sẽ thử dùng cookie thủ công
-                                            const directUrl = 'https://flow-content.google/video/' + p.mid + '?alt=media';
-                                            try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: 'elapsed_150s_as29s_null', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now(), mid8: p.mid.substring(0,8) }) }); } catch(_) {}
-                                            window._fluxyOpClaimed[p.opId] = directUrl;
-                                            return { opId: p.opId, url: directUrl, method: 'T2V_direct_mid_150s' };
-                                        }
-
-                                        // Method C: check fetch interceptor captured URLs (page's own RPCs)
-                                        const _cap = window._fluxyCapturedUrls || [];
-                                        // Log _fluxyCapturedUrls every ~30s for diagnosis
-                                        if (p.elapsedMs < 8000 || p.elapsedMs % 30000 < 4000) {
-                                            try { fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_cap_urls', count: _cap.length, urls: _cap.slice(-3).map(c=>c&&c.url?c.url.substring(0,100):'?'), ts: Date.now(), t: Math.round(p.elapsedMs/1000)+'s', intercepted: !!window._fluxyFetchIntercepted, mid8: (p.mid||'').substring(0,8), hasMatch: !!(p.mid && _cap.some(c=>c&&c.url&&c.url.includes(p.mid))) }) }); } catch(_) {}
-                                        }
-                                        if (_cap.length > 0 && p.mid) {
-                                            // ONLY match by mediaId — "intercepted_any" removed (causes wrong library URL)
-                                            for (const cu of _cap) {
-                                                if (!cu || !cu.url) continue;
-                                                if (cu.url.includes(p.mid) && (cu.url.includes('flow-content.google') || cu.url.includes('storage.googleapis.com') || cu.url.match(/\.mp4/))) {
-                                                    window._fluxyOpClaimed[p.opId] = cu.url;
-                                                    return { opId: p.opId, url: cu.url, method: 'T2V_intercepted_mid' };
-                                                }
-                                            }
-                                        }
-                                        // Fast path: thumbnail mid captured by webRequest → as29s ngay
-                                        if (p.thumbnailDetected && p.mid) {
-                                            try {
-                                                const thumbArgs = [p.mid, p.pid, p.wid || p.opId, 'CAE'];
-                                                const af0 = JSON.stringify([[['as29s', JSON.stringify(thumbArgs), null, 'generic']]]);
-                                                const ar0 = await fetch(`${BASE}?${mkUsp('as29s')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(af0)}&at=${encodeURIComponent(liveAt)}` });
-                                                const at0 = await ar0.text();
-                                                try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_thumb_as29s', freq: at0.substring(0,4000), ts: Date.now(), thumbArgs, mid8: p.mid.substring(0,8), pid8: (p.pid||'').substring(0,8), wid8: (p.wid||p.opId||'').substring(0,8) }) }); } catch(_) {}
-                                                const au0 = _extractSignedUrl(at0);
-                                                if (au0) { window._fluxyOpClaimed[p.opId] = au0; return { opId: p.opId, url: au0, method: 'T2V_thumb_as29s_ok' }; }
-                                                // as29s returned null — thumbnail detected but as29s has no URL yet
-                                                // Log full response for diagnosis
-                                                try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_thumb_as29s_null', at0: at0.substring(0,2000), ts: Date.now(), mid8: p.mid.substring(0,8) }) }); } catch(_) {}
-                                            } catch(_) {}
-                                        }
-
-                                        // Attempt 1: WuwhI — actual T2V polling endpoint (page calls every ~100ms)
-                                        // Full MEDIA_GENERATION payload confirmed from F12 capture 2026-09-15
-                                        if (p.prompt && p.modelCode) {
-                                            try {
-                                                const nowMs = Date.now();
-                                                const mediaSettingsJson = JSON.stringify({
-                                                    videoModelKey: p.modelCode,
-                                                    aspectRatio: p.aspectCode || 2,
-                                                    count: 1,
-                                                    structuredPrompt: { parts: [{ text: p.prompt }] }
-                                                });
-                                                let expIds = '';
-                                                try {
-                                                    const s = Array.from(document.querySelectorAll('script')).map(x=>x.textContent||'').join('\n');
-                                                    const em = s.match(/(\d{6,9}(?:,\d{6,9}){30,})/);
-                                                    if (em) expIds = em[1];
-                                                } catch(_) {}
-                                                if (!expIds) expIds = '106210719,106077941,106681111,106501717,106611001,106536612,119157484,1714245,106486771,106555492,106637415,106299202,106556077,106437280,106104244,1706538,106238955,106592798,106184493,106585383,106599983,106281924,106210711,105484652,106322568,106430149,106625630,106615367,106225453,106676866,106259075,105746691,106577881,106430287,106432686,106262194,106210380,106681103,106536604,106486763,106555484,106637407,106299194,106556069,106592790,106585375,106599975,106210378,106430141,106625362,106615359,106676858,106577873,106430279';
-                                                const wCaps = [
-                                                    ["IS_MOBILE", ["type.googleapis.com/google.protobuf.BoolValue", []]],
-                                                    ["IS_TABLET", ["type.googleapis.com/google.protobuf.BoolValue", []]],
-                                                    ["IS_DESKTOP", ["type.googleapis.com/google.protobuf.BoolValue", [1]]],
-                                                    ["IS_ANGULAR", ["type.googleapis.com/google.protobuf.BoolValue", [1]]],
-                                                    ["USER_AGENT", ["type.googleapis.com/google.protobuf.StringValue", [navigator.userAgent]]],
-                                                    ["TOOL_NAME", ["type.googleapis.com/google.protobuf.StringValue", ["PINHOLE"]]],
-                                                    ["MEDIA_GENERATION_TYPE", ["type.googleapis.com/google.protobuf.StringValue", ["video"]]],
-                                                    ["AUDIO_FAILURE_PREFERENCE", ["type.googleapis.com/google.protobuf.BoolValue", []]],
-                                                    ["MEDIA_GENERATION_SETTINGS", ["type.googleapis.com/google.protobuf.StringValue", [mediaSettingsJson]]],
-                                                    ["PROJECT_ID", ["type.googleapis.com/google.protobuf.StringValue", [p.pid]]],
-                                                    ["MEDIA_GENERATION_PAYGATE_TIER", ["type.googleapis.com/google.protobuf.StringValue", ["PAYGATE_TIER_TWO"]]]
-                                                ];
-                                                const wInner = [[["MEDIA_GENERATION", [p.opId, [Math.floor(nowMs/1000), (nowMs%1000)*1000000], null, wCaps, expIds]]]];
-                                                const wfreq = JSON.stringify([[['WuwhI', JSON.stringify(wInner), null, 'generic']]]);
-                                                const wresp = await fetch(`${BASE}?${mkUsp('WuwhI')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(wfreq)}&at=${encodeURIComponent(liveAt)}` });
-                                                const wtxt = await wresp.text();
-                                                // Capture: first poll (<7s), every 60s heartbeat, OR when non-empty/interesting
-                                                const wIsEmpty = wtxt.includes('"WuwhI",\\"[]"') || wtxt.includes('"WuwhI","[]"');
-                                                if (!wIsEmpty || wtxt.includes('GENERATION_COMPLETE') || wtxt.includes('flow-content.google') || p.elapsedMs < 7000 || p.elapsedMs % 60000 < 4000) {
-                                                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'WuwhI_resp', freq: wtxt.substring(0,6000), ts: Date.now(), http: wresp.status, t: Math.round(p.elapsedMs/1000)+'s', hasComplete: wtxt.includes('GENERATION_COMPLETE'), hasFlowContent: wtxt.includes('flow-content.google'), isEmpty: wIsEmpty }) }); } catch(_) {}
-                                                }
-                                                const wUrl = _extractSignedUrl(wtxt);
-                                                if (wUrl) {
-                                                    window._fluxyOpClaimed[p.opId] = wUrl;
-                                                    return { opId: p.opId, url: wUrl, method: 'T2V_WuwhI_ok' };
-                                                }
-                                                // Aggressive URL scan: tìm bất kỳ flow-content.google URL trong toàn bộ WuwhI text
-                                                const aggrM = wtxt.match(/https:(?:\/|\\\/){2}flow-content\.google(?:\/|\\\/)[^\s"'\\]{10,}/);
-                                                if (aggrM) {
-                                                    const aggrUrl = aggrM[0].replace(/\\\/|%2F/g, '/').replace(/\\u0026/gi,'&').replace(/\\u003d/gi,'=').split(/["'\s\\]/)[0];
-                                                    if (aggrUrl.includes('flow-content.google')) {
-                                                        window._fluxyOpClaimed[p.opId] = aggrUrl;
-                                                        return { opId: p.opId, url: aggrUrl, method: 'T2V_WuwhI_aggr' };
-                                                    }
-                                                }
-                                                // as29s fallback — thử ngay sau WuwhI (works when video is ready)
-                                                // T2V: workflowId = operationId (same UUID)
-                                                const asArgs = p.mid ? [p.mid, p.pid, p.wid || p.opId, 'CAE'] : [p.opId, p.pid, p.wid || p.opId, 'CAE'];
-                                                const asFreq = JSON.stringify([[['as29s', JSON.stringify(asArgs), null, 'generic']]]);
-                                                try {
-                                                    const ar = await fetch(`${BASE}?${mkUsp('as29s')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(asFreq)}&at=${encodeURIComponent(liveAt)}` });
-                                                    const atxt = await ar.text();
-                                                    // Capture as29s: only when non-null response (interesting) OR first poll
-                                                    const asIsNull = atxt.includes('"as29s",null') || atxt.includes('"as29s",\\"null\\"');
-                                                    if (!asIsNull || p.elapsedMs < 4000) {
-                                                        try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_as29s_debug', freq: atxt.substring(0,6000), ts: Date.now(), asArgs, mid8: (p.mid||'').substring(0,8), pid8: (p.pid||'').substring(0,8), wid8: (p.wid||p.opId||'').substring(0,8), t: Math.round(p.elapsedMs/1000)+'s', isNull: asIsNull }) }); } catch(_) {}
-                                                    }
-                                                    const aUrl = _extractSignedUrl(atxt);
-                                                    if (aUrl) {
-                                                        window._fluxyOpClaimed[p.opId] = aUrl;
-                                                        return { opId: p.opId, url: aUrl, method: 'T2V_WuwhI_as29s_ok' };
-                                                    }
-                                                } catch(ae) {
-                                                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_as29s_err', err: ae.message, ts: Date.now() }) }); } catch(_) {}
-                                                }
-                                                // jwpduf fallback: lấy [mediaId, serverPid, workflowId] thực từ server → as29s đúng args
-                                                // CRITICAL: jwpduf trả về [mediaId, serverPid, workflowId, 'CAE']
-                                                //           p.pid có thể là clientProjectId (sai) → phải dùng serverPid từ jwpduf
-                                                try {
-                                                    const jfreqFb = JSON.stringify([[['jwpduf', JSON.stringify([p.opId]), null, 'generic']]]);
-                                                    const jrespFb = await fetch(`${BASE}?${mkUsp('jwpduf')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(jfreqFb)}&at=${encodeURIComponent(liveAt)}` });
-                                                    const jtxtFb = await jrespFb.text();
-                                                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_jwpduf_fb', freq: jtxtFb.substring(0,4000), ts: Date.now(), opId8: p.opId.substring(0,8) }) }); } catch(_) {}
-                                                    const jUrlFb = _extractSignedUrl(jtxtFb);
-                                                    if (jUrlFb) { window._fluxyOpClaimed[p.opId] = jUrlFb; return { opId: p.opId, url: jUrlFb, method: 'T2V_WuwhI_jwpduf_direct' }; }
-                                                    // Bắt cả 3 UUID: [mediaId, serverPid, workflowId, 'CAE']
-                                                    const jmFb = jtxtFb.match(/\\"([0-9a-f-]{36})\\",\\"([0-9a-f-]{36})\\",\\"([0-9a-f-]{36})\\",\\"CAE\\"/i)
-                                                              || jtxtFb.match(/"([0-9a-f-]{36})","([0-9a-f-]{36})","([0-9a-f-]{36})","CAE"/i);
-                                                    if (jmFb) {
-                                                        const midFb = jmFb[1], pidFb = jmFb[2], widFb = jmFb[3];
-                                                        const afFb = JSON.stringify([[['as29s', JSON.stringify([midFb, pidFb, widFb, 'CAE']), null, 'generic']]]);
-                                                        const arFb = await fetch(`${BASE}?${mkUsp('as29s')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(afFb)}&at=${encodeURIComponent(liveAt)}` });
-                                                        const atxtFb = await arFb.text();
-                                                        try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_jwpduf_as29s_fb', freq: atxtFb.substring(0,4000), ts: Date.now(), mid8: midFb.substring(0,8), pid8: pidFb.substring(0,8), wid8: widFb.substring(0,8) }) }); } catch(_) {}
-                                                        const aUrlFb = _extractSignedUrl(atxtFb);
-                                                        if (aUrlFb) { window._fluxyOpClaimed[p.opId] = aUrlFb; return { opId: p.opId, url: aUrlFb, method: 'T2V_WuwhI_then_as29s' }; }
-                                                        // Trả về wid/mid/pid để SW cập nhật _pendingR2V cho poll tiếp theo
-                                                        const stM2 = wtxt.match(/"GENERATION_COMPLETE"|"state"[^:]*:[^"]*"([A-Z_]+)"/);
-                                                        return { opId: p.opId, url: null, method: 'T2V_WuwhI_wait', debug: `state=${stM2?stM2[1]||stM2[0]:'?'} http=${wresp.status} t=${Math.round(p.elapsedMs/1000)}s`, extractedMid: midFb, extractedPid: pidFb, extractedWid: widFb };
-                                                    }
-                                                } catch(_) {}
-                                                // Direct URL fallback case 1: WuwhI returned non-[] (video confirmed done)
-                                                if (p.mid && !wIsEmpty) {
-                                                    const directUrl = 'https://flow-content.google/video/' + p.mid;
-                                                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: 'wuwhi_nonempty', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now(), wtxtPre: wtxt.substring(0,200) }) }); } catch(_) {}
-                                                    window._fluxyOpClaimed[p.opId] = directUrl;
-                                                    return { opId: p.opId, url: directUrl, method: 'T2V_direct_mid_wuwhi_done' };
-                                                }
-                                                // Direct URL fallback case 2: 900s+ elapsed — video must be done by now even if WuwhI still []
-                                                if (p.mid && p.elapsedMs > 900000) {
-                                                    const directUrl = 'https://flow-content.google/video/' + p.mid;
-                                                    try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_direct_url', url: directUrl, trigger: 'timeout_900s', t: Math.round(p.elapsedMs/1000)+'s', ts: Date.now() }) }); } catch(_) {}
-                                                    window._fluxyOpClaimed[p.opId] = directUrl;
-                                                    return { opId: p.opId, url: directUrl, method: 'T2V_direct_mid_900s' };
-                                                }
-                                                const stM = wtxt.match(/"GENERATION_COMPLETE"|"state"[^:]*:[^"]*"([A-Z_]+)"/);
-                                                return { opId: p.opId, url: null, method: 'T2V_WuwhI_wait', debug: `state=${stM?stM[1]||stM[0]:'?'} http=${wresp.status} t=${Math.round(p.elapsedMs/1000)}s resp=${wtxt.substring(0,100)}` };
-                                            } catch(we) {
-                                                return { opId: p.opId, url: null, method: 'T2V_WuwhI_err', debug: we.message };
-                                            }
-                                        }
-
-                                        // Attempt 2: jwpduf — fallback khi không có prompt/modelCode
-                                        const jfreq = JSON.stringify([[['jwpduf', JSON.stringify([p.opId]), null, 'generic']]]);
-                                        const jresp = await fetch(`${BASE}?${mkUsp('jwpduf')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(jfreq)}&at=${encodeURIComponent(liveAt)}` });
-                                        const jtxt = await jresp.text();
-                                        if (p.elapsedMs < 30000) {
-                                            try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'T2V_jwpduf_debug', freq: jtxt.substring(0,3000), ts: Date.now(), http: jresp.status }) }); } catch(_) {}
-                                        }
-                                        const jUrl = _extractSignedUrl(jtxt);
-                                        if (jUrl) {
-                                            window._fluxyOpClaimed[p.opId] = jUrl;
-                                            return { opId: p.opId, url: jUrl, method: 'T2V_jwpduf' };
-                                        }
-                                        const jm = jtxt.match(/\\"([0-9a-f-]{36})\\",\\"[0-9a-f-]{36}\\",\\"([0-9a-f-]{36})\\",\\"CAE\\"/i)
-                                                 || jtxt.match(/"([0-9a-f-]{36})","[0-9a-f-]{36}","([0-9a-f-]{36})","CAE"/i);
-                                        if (jm) {
-                                            try {
-                                                const extractedWid = jm[2];
-                                                if (!window._fluxyWorkflowIds) window._fluxyWorkflowIds = {};
-                                                window._fluxyWorkflowIds[p.opId] = extractedWid;
-                                                const af = JSON.stringify([[['as29s', JSON.stringify([p.opId, p.pid, extractedWid, 'CAE']), null, 'generic']]]);
-                                                const aresp = await fetch(`${BASE}?${mkUsp('as29s')}`, { method:'POST', credentials:'include', headers:hdrs, body:`f.req=${encodeURIComponent(af)}&at=${encodeURIComponent(liveAt)}` });
-                                                const atxt = await aresp.text();
-                                                const aUrl = _extractSignedUrl(atxt);
-                                                if (aUrl) {
-                                                    window._fluxyOpClaimed[p.opId] = aUrl;
-                                                    return { opId: p.opId, url: aUrl, method: 'T2V_as29s' };
-                                                }
-                                            } catch(_) {}
-                                        }
-                                        const errM = jtxt.match(/\["e",(\d+)/);
-                                        return { opId: p.opId, url: null, method: 'T2V_jwpduf_null', debug: `err=${errM?errM[1]:'?'} http=${jresp.status} resp=${jtxt.substring(0,150)}`, rawResp: jtxt.substring(0,3000) };
-                                    }
-
-                                    // R2V: Check fetch-interceptor captured URLs trước (page's own polling)
-                                    const _r2vCap = window._fluxyCapturedUrls || [];
-                                    for (const cu of _r2vCap) {
-                                        if (!cu || !cu.url) continue;
-                                        if ((cu.url.includes(p.opId) || (p.mid && cu.url.includes(p.mid))) && (cu.url.includes('flow-content.google') || cu.url.match(/\.mp4/))) {
-                                            const _cu = _extractSignedUrl(cu.url) || cu.url;
-                                            window._fluxyOpClaimed[p.opId] = _cu;
-                                            return { opId: p.opId, url: _cu, method: 'R2V_intercepted' };
-                                        }
-                                    }
-
-                                    // R2V: LUÔN gọi jwpduf để lấy serverPid đúng (genParams.projectId là client ID, không dùng được cho as29s)
-                                    let capturedMid = p.mid || null;
-                                    let capturedServerPid = null; // server PID từ jwpduf (khác genParams.projectId)
-                                    let capturedWid = window._fluxyWorkflowIds?.[p.opId] || null;
-                                    let jIsError4 = false; // jwpduf trả về "e",4 = video đang render, chưa xong
-                                    try {
-                                        const jfreq = JSON.stringify([[['jwpduf', JSON.stringify([p.opId]), null, 'generic']]]);
-                                        const jbody = `f.req=${encodeURIComponent(jfreq)}&at=${encodeURIComponent(liveAt)}`;
-                                        const jresp = await fetch(`${BASE}?${mkUsp('jwpduf')}`, { method:'POST', credentials:'include', headers:hdrs, body:jbody });
-                                        const jtxt = await jresp.text();
-                                        try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'R2V_jwpduf_debug', freq: jtxt.substring(0,4000), ts: Date.now(), opId8: p.opId.substring(0,8), http: jresp.status }) }); } catch(_) {}
-                                        // Thử extract video URL trực tiếp từ jwpduf (có thể chứa URL khi video xong)
-                                        const jDirectUrl = _extractSignedUrl(jtxt);
-                                        if (jDirectUrl) {
-                                            window._fluxyOpClaimed[p.opId] = jDirectUrl;
-                                            return { opId: p.opId, url: jDirectUrl, method: 'R2V_jwpduf_direct' };
-                                        }
-                                        // Detect error 4 = "video đang render, chưa có URL" — bỏ qua as29s để tiết kiệm quota
-                                        if (jtxt.includes('["e",4')) { jIsError4 = true; }
-                                        // Lấy [mediaId, serverPid, workflowId, 'CAE'] từ jwpduf
-                                        const jm = jtxt.match(/\\"([0-9a-f-]{36})\\",\\"([0-9a-f-]{36})\\",\\"([0-9a-f-]{36})\\",\\"CAE\\"/i)
-                                                 || jtxt.match(/"([0-9a-f-]{36})","([0-9a-f-]{36})","([0-9a-f-]{36})","CAE"/i);
-                                        if (jm) {
-                                            capturedMid = jm[1];
-                                            capturedServerPid = jm[2]; // server PID — cần cho as29s
-                                            capturedWid = jm[3];
-                                            if (!window._fluxyWorkflowIds) window._fluxyWorkflowIds = {};
-                                            window._fluxyWorkflowIds[p.opId] = capturedWid;
-                                            try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'R2V_jwpduf_match', mid8: jm[1].substring(0,8), serverPid8: jm[2].substring(0,8), wid8: jm[3].substring(0,8), ts: Date.now() }) }); } catch(_) {}
-                                        }
-                                    } catch(_) {}
-                                    // Nếu jwpduf trả error 4 (video đang render) và chưa có serverPid → bỏ as29s, chờ poll tiếp
-                                    if (jIsError4 && !capturedServerPid) {
-                                        return { opId: p.opId, url: null, method: 'F_not_ready' };
-                                    }
-
-                                    // Dùng server PID từ jwpduf nếu có, fallback về genParams.projectId
-                                    const _r2vMid = capturedMid || p.opId;
-                                    const _r2vPid = capturedServerPid || p.wid || p.pid; // p.wid from MZZa6b dùng thay serverPid nếu chưa có jwpduf
-                                    const _r2vWid = capturedWid || p.wid;
-
-                                    if (!_r2vWid) {
-                                        return { opId: p.opId, url: null, method: 'skip_no_wid', debug: null };
-                                    }
-
-                                    // Thử 3 arg combo: server IDs từ jwpduf + fallback
-                                    const as29sCombos = [
-                                        capturedServerPid ? [_r2vMid, capturedServerPid, _r2vWid, 'CAE'] : null,
-                                        [_r2vMid, p.pid, _r2vWid, 'CAE'],
-                                        [p.opId, p.pid, p.wid || _r2vWid, 'CAE'],
-                                    ].filter(Boolean);
-                                    const usedCombos = new Set();
-                                    for (const asArgs2 of as29sCombos) {
-                                        const comboKey = asArgs2.join(',');
-                                        if (usedCombos.has(comboKey)) continue;
-                                        usedCombos.add(comboKey);
-                                        try {
-                                            const freq = JSON.stringify([[['as29s', JSON.stringify(asArgs2), null, 'generic']]]);
-                                            const body = `f.req=${encodeURIComponent(freq)}&at=${encodeURIComponent(liveAt)}`;
-                                            const resp = await fetch(`${BASE}?${mkUsp('as29s')}`, { method:'POST', credentials:'include', headers:hdrs, body });
-                                            const txt = await resp.text();
-                                            try { await fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'R2V_as29s_debug', freq: txt.substring(0,6000), ts: Date.now(), asArgs: asArgs2, mid8: asArgs2[0].substring(0,8), wid8: asArgs2[2].substring(0,8) }) }); } catch(_) {}
-                                            const videoUrl = _extractSignedUrl(txt);
-                                            if (videoUrl) {
-                                                window._fluxyOpClaimed[p.opId] = videoUrl;
-                                                return { opId: p.opId, url: videoUrl, method: 'F_as29s', debug: null };
-                                            }
-                                        } catch(_) {}
-                                    }
-                                    return { opId: p.opId, url: null, method: 'F_null', debug: `mid=${_r2vMid.substring(0,8)} wid=${_r2vWid.substring(0,8)} serverPid=${capturedServerPid?capturedServerPid.substring(0,8):'null'}` };
-                                } catch(e) {
-                                    return { opId: p.opId, url: null, method: 'F_err', debug: e.message };
-                                }
-                            };
-                            const batchResults = await Promise.allSettled(needPoll.map(pollOne));
-                            for (const r of batchResults) {
-                                if (r.status === 'fulfilled' && r.value) results[r.value.opId] = r.value;
-                            }
-                        }
-                        return results;
-                    },
-                    args: [ops]
-                });
-                const results = pr?.[0]?.result || {};
-                for (const [opId, result] of Object.entries(results)) {
-                    if (result?.url) {
-                        console.log(`[R2V ${opId.substring(0,8)}] ✅ ${result.method}: ${result.url.substring(0,70)}`);
-                        const dlTabId = _pendingR2V.get(opId)?.tabId || tabId;
-                        const _opMid = _pendingR2V.get(opId)?.mid; // lấy trước khi delete
-                        const _opStartTime = _pendingR2V.get(opId)?.startTime || 0; // để lọc video cũ
-                        _pendingR2V.delete(opId);
-                        // flow-content.google: check webRequest captures first, then chrome.downloads
-                        if (result.url.includes('flow-content.google')) {
-                            // Check if webRequest already captured a better URL (signed GCS or different format)
-                            const _webCapVideo = _capturedR2VUrls.find(c =>
-                                c.url.includes('/video/') &&
-                                (_opMid ? c.url.includes(_opMid) : c.url.includes(opId))
-                            );
-                            const _dlUrl = _webCapVideo?.url || result.url;
-                            _logDebugAllFlowUrls('at_dl_' + opId.substring(0, 8));
-                            try {
-                                await fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
-                                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                                    body: JSON.stringify({
-                                        rpc: 'capturedUrls_at_dl',
-                                        count: _capturedR2VUrls.length,
-                                        urls: _capturedR2VUrls.slice(-5).map(c => c.url.substring(0, 100)),
-                                        usedCaptured: !!_webCapVideo,
-                                        opId8: opId.substring(0, 8),
-                                        opMid8: (_opMid||'').substring(0, 8),
-                                        opStartTime: _opStartTime,
-                                        ts: Date.now()
-                                    })
-                                });
-                            } catch(_) {}
-                            console.log(`[T2V/R2V ${opId.substring(0,8)}] URL → download (tabId=${dlTabId}) usedCaptured=${!!_webCapVideo}`);
-                            downloadFlowContentVideo(_dlUrl, opId, SAVE_VIDEO, dlTabId, _opStartTime);
-                        } else {
-                            fetch(SAVE_VIDEO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ operationId: opId, videoUrl: result.url }) })
-                                .then(r => console.log(`[SAVE_VIDEO] ok status=${r.status} opId=${opId.substring(0,8)} method=${result.method}`))
-                                .catch(e => console.log(`[SAVE_VIDEO] FAIL opId=${opId.substring(0,8)} method=${result.method} err=`, e.message));
-                        }
-                    } else if (result) {
-                        // Cập nhật _pendingR2V với wid/mid thực nếu jwpduf trả về
-                        const pendingOp = _pendingR2V.get(opId);
-                        if (pendingOp) {
-                            if (result.extractedWid && !pendingOp.wid) { pendingOp.wid = result.extractedWid; console.log(`[R2V ${opId.substring(0,8)}] 🔧 wid: ${result.extractedWid.substring(0,8)}`); }
-                            if (result.extractedMid && !pendingOp.mid) { pendingOp.mid = result.extractedMid; console.log(`[R2V ${opId.substring(0,8)}] 🔧 mid: ${result.extractedMid.substring(0,8)}`); }
-                            if (result.extractedPid) { pendingOp.pid = result.extractedPid; console.log(`[R2V ${opId.substring(0,8)}] 🔧 pid: ${result.extractedPid.substring(0,8)}`); }
-                        }
-                        if (result.debug) {
-                            console.log(`[R2V ${opId.substring(0,8)}] ❌ ${result.method}: ${result.debug}`);
-                        }
-                        if (result.rawResp) {
-                            fetch('http://127.0.0.1:3000/api/capture-rpc-body', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ rpc:'jwpduf_response', freq: result.rawResp, ts: Date.now() }) }).catch(()=>{});
-                        }
-                    }
-                }
-            } catch(e) {
-                try { await chrome.tabs.get(tabId); } catch(_) {
-                    for (const [opId, p] of _pendingR2V) { if (p.tabId === tabId) _pendingR2V.delete(opId); }
-                }
-            }
-        }
-
-    }
-    _r2vPollerActive = false;
-}
-
-// TẠO VIDEO R2V (INGREDIENTS) QUA FLOW.GOOGLE.COM BATCHEXECUTE (MZZa6b)
-let isGeneratingFlowR2V = false;
-async function executeFlowR2VGen() {
-    if (isGeneratingFlowR2V) return;
-    isGeneratingFlowR2V = true;
-    const SAVE_URL = 'http://127.0.0.1:3000/api/save-flow-r2v-result';
-    try {
-        let tab = await findActiveTab();
-        if (!tab) {
-            await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'NO_TAB' }) }).catch(() => {});
-            return;
-        }
-        const dataRes = await fetch('http://127.0.0.1:3000/api/get-pending-flow-r2v');
-        if (!dataRes.ok) { console.log('❌ Không lấy được flow r2v data'); return; }
-        const genParams = await dataRes.json();
-        if (!genParams || !genParams.prompt) { console.log('❌ Thiếu params flow r2v gen'); return; }
-
-        console.log(`🎬 Flow R2V gen: "${genParams.prompt.substring(0, 40)}..." model=${genParams.modelCode}`);
-
-        const result = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            world: 'MAIN',
-            func: async (p) => {
-                try {
-                    const SITEKEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
-                    const BASE = 'https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute';
-                    const projectId = p.projectId;
-
-                    let bl = p.bl || '', fsid = p.fsid || '', pageAt = '';
-                    {
-                        const scripts = Array.from(document.querySelectorAll('script')).map(s => s.textContent || '').join('\n');
-                        const m2 = scripts.match(/"bl"\s*:\s*"([^"]+)"|boq_[a-z0-9_-]+_\d{8}\.\d{2}_p\d+/);
-                        if (m2) bl = m2[1] || m2[0];
-                        const m3 = scripts.match(/"FdrFJe"\s*:\s*"(-?\d+)"|"f\.sid"\s*:\s*"(-?\d+)"/);
-                        if (m3) fsid = m3[1] || m3[2] || '';
-                        const liveAt = (window._flowAuthData?.at || '').startsWith('AIQ-') ? window._flowAuthData.at : '';
-                        const mAt = scripts.match(/"xsrf"\s*,\s*"(AIQ-[^"]+)"|"SNlM0e"\s*:\s*"(AIQ-[^"]+)"/);
-                        const htmlAt = mAt ? (mAt[1] || mAt[2] || '') : '';
-                        pageAt = liveAt || htmlAt;
-                    }
-
-                    const mkReqid = () => String(Math.floor(Math.random() * 9000000) + 1000000);
-                    const mkParams = (rpcid) => {
-                        const q = new URLSearchParams({ rpcids: rpcid, bl, hl: 'vi', rt: 'c', 'source-path': `/project/${projectId}`, _reqid: mkReqid() });
-                        if (fsid) q.set('f.sid', fsid);
-                        return q.toString();
-                    };
-                    const mkHeaders = () => ({ 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8', 'x-same-domain': '1', 'origin': 'https://flow.google.com' });
-
-                    const parseBatch = (body, rpcid) => {
-                        const stripped = body.replace(/^\)\]}'[\n\r]+/, '');
-                        let pos = 0, dataStr = null;
-                        while (pos < stripped.length) {
-                            const nl = stripped.indexOf('\n', pos);
-                            if (nl < 0) break;
-                            const lenStr = stripped.substring(pos, nl).trim();
-                            const len = parseInt(lenStr, 10);
-                            if (isNaN(len) || len <= 0) { pos = nl + 1; continue; }
-                            const chunk = stripped.substring(nl + 1, nl + 1 + len);
-                            try {
-                                const parsed = JSON.parse(chunk);
-                                for (const item of (parsed || [])) {
-                                    if (Array.isArray(item) && item[0] === 'wrb.fr' && item[1] === rpcid && item[2]) {
-                                        dataStr = item[2]; break;
-                                    }
-                                }
-                            } catch (_) {
-                                const re = new RegExp('"wrb\\.fr","' + rpcid + '","((?:[^"\\\\]|\\\\.)*)"');
-                                const cm = chunk.match(re);
-                                if (cm) { try { dataStr = JSON.parse('"' + cm[1] + '"'); } catch(__) {} }
-                            }
-                            pos = nl + 1 + len;
-                            if (dataStr) break;
-                        }
-                        if (!dataStr) {
-                            const re = new RegExp('"wrb\\.fr","' + rpcid + '","((?:[^"\\\\]|\\\\.)*)"');
-                            const m = body.match(re);
-                            if (m) { try { dataStr = JSON.parse('"' + m[1] + '"'); } catch(_) {} }
-                        }
-                        return dataStr;
-                    };
-
-                    // AT token
-                    const cachedAt = (p.atToken && p.atToken.startsWith('AIQ-')) ? p.atToken : '';
-                    let at = '';
-                    if (pageAt) {
-                        at = pageAt;
-                    } else {
-                        const nzFreq = JSON.stringify([[['nzlxg', '[]', null, 'generic']]]);
-                        let nzBody = `f.req=${encodeURIComponent(nzFreq)}`;
-                        if (cachedAt) nzBody += `&at=${encodeURIComponent(cachedAt)}`;
-                        const nzResp = await fetch(`${BASE}?${mkParams('nzlxg')}`, {
-                            method: 'POST', credentials: 'include', headers: mkHeaders(), body: nzBody
-                        }).then(r => r.text()).catch(() => '');
-                        const atMatch = nzResp.match(/"xsrf","(AIQ-[^"]+)"/);
-                        if (atMatch) {
-                            at = atMatch[1];
-                        } else if (cachedAt) {
-                            at = cachedAt;
-                        } else {
-                            return { error: 'NO_AT: mở flow.google.com. nzResp=' + nzResp.substring(0, 80) };
-                        }
-                    }
-
-                    // reCAPTCHA
-                    const rcToken = await new Promise((resolve, reject) => {
-                        if (!window.grecaptcha?.enterprise) { reject(new Error('no_grecaptcha')); return; }
-                        window.grecaptcha.enterprise.execute(SITEKEY, { action: 'VIDEO_GENERATION' })
-                            .then(resolve).catch(reject);
-                    });
-
-                    const uuid1 = crypto.randomUUID().toUpperCase();
-                    const uuid2 = crypto.randomUUID().toUpperCase();
-                    const uuid3 = crypto.randomUUID().toUpperCase();
-                    const aspectRow = [null, 22, null, null, null, projectId, null, null, null, null, [rcToken, 1]];
-
-                    // as29s (session init)
-                    const as29sFreq = JSON.stringify([[['as29s', JSON.stringify([uuid3]), null, 'generic']]]);
-                    await fetch(`${BASE}?${mkParams('as29s')}`, {
-                        method: 'POST', credentials: 'include', headers: mkHeaders(),
-                        body: `f.req=${encodeURIComponent(as29sFreq)}&at=${encodeURIComponent(at)}`
-                    }).catch(() => {});
-
-                    // maseQ — upload ingredient images → get server UUIDs (max 7 confirmed from F12)
-                    const parseMaseUUID = (respText) => {
-                        const stripped2 = respText.replace(/^\)\]}'[\n\r]+/, '');
-                        let mPos = 0;
-                        while (mPos < stripped2.length) {
-                            const nl = stripped2.indexOf('\n', mPos);
-                            if (nl < 0) break;
-                            const lenStr = stripped2.substring(mPos, nl).trim();
-                            const len = parseInt(lenStr, 10);
-                            if (isNaN(len) || len <= 0) { mPos = nl + 1; continue; }
-                            const chunk = stripped2.substring(nl + 1, nl + 1 + len);
-                            try {
-                                const mParsed = JSON.parse(chunk);
-                                for (const item of (mParsed || [])) {
-                                    if (Array.isArray(item) && item[0] === 'wrb.fr' && item[1] === 'maseQ' && item[2]) {
-                                        const uuidMatch = item[2].match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-                                        if (uuidMatch) return uuidMatch[0];
-                                    }
-                                }
-                            } catch (_) {
-                                const cm = chunk.match(/"wrb\.fr","maseQ","((?:[^"\\]|\\.)*)"/);
-                                if (cm) {
-                                    try {
-                                        const s = JSON.parse('"' + cm[1] + '"');
-                                        const uuidMatch = s.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-                                        if (uuidMatch) return uuidMatch[0];
-                                    } catch(__) {}
-                                }
-                            }
-                            mPos = nl + 1 + len;
-                        }
-                        const mFallback = respText.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-                        return mFallback ? mFallback[0] : null;
-                    };
-
-                    const imagesData = p.ingredientImagesData || [];
-                    const imageUUIDs = [];
-                    for (let iIdx = 0; iIdx < imagesData.length; iIdx++) {
-                        const { base64: imgBase64, filename: imgFilename } = imagesData[iIdx];
-                        const mUUID1 = crypto.randomUUID().toUpperCase();
-                        const mUUID2 = crypto.randomUUID().toUpperCase();
-                        const refExt = imgFilename.split('.').pop().toLowerCase();
-                        const refMime = refExt === 'png' ? 'image/png' : refExt === 'webp' ? 'image/webp' : 'image/jpeg';
-                        const maseInner = [aspectRow, imgBase64, refMime, 1,
-                            null, null, null, null, imgFilename, null, mUUID1, mUUID2];
-                        const maseFreq = JSON.stringify([[['maseQ', JSON.stringify(maseInner), null, 'generic']]]);
-                        const maseRespText = await fetch(`${BASE}?${mkParams('maseQ')}`, {
-                            method: 'POST', credentials: 'include', headers: mkHeaders(),
-                            body: `f.req=${encodeURIComponent(maseFreq)}&at=${encodeURIComponent(at)}`
-                        }).then(r => r.text()).catch(e => { console.error('[maseQ r2v] error', e); return ''; });
-                        const uuid = parseMaseUUID(maseRespText);
-                        if (!uuid) return { error: `maseQ r2v: ảnh ${iIdx + 1} không lấy được UUID. resp=${maseRespText.substring(0, 150)}` };
-                        console.log(`[maseQ r2v] ảnh ${iIdx + 1}/${imagesData.length} UUID:`, uuid);
-                        imageUUIDs.push(uuid);
-                    }
-                    if (imageUUIDs.length === 0) return { error: 'maseQ r2v: không có UUID nào' };
-
-                    // MZZa6b — Ingredients r2v (confirmed from F12):
-                    // task[1] = [[null, uuid1], [null, uuid2], ...] — all ingredient images
-                    // task[2] = modelCode, task[3] = aspectCode, task[7] = [[voiceId]] when voice set
-                    // voiceId must be lowercase (confirmed from F12: "achernar" not "Achernar")
-                    const task = [
-                        [null, null, [[[p.prompt]]]],
-                        imageUUIDs.map(u => [null, u]),
-                        p.modelCode,
-                        p.aspectCode,
-                        null,
-                        [null, null, null, null, uuid1, uuid2],
-                        null,
-                        p.voiceId ? [[p.voiceId.toLowerCase()]] : null
-                    ];
-                    const inner = [[task], aspectRow, [uuid3, 2]];
-                    const mzzFreq = JSON.stringify([[['MZZa6b', JSON.stringify(inner), null, 'generic']]]);
-                    const mzzRes = await fetch(`${BASE}?${mkParams('MZZa6b')}`, {
-                        method: 'POST', credentials: 'include', headers: mkHeaders(),
-                        body: `f.req=${encodeURIComponent(mzzFreq)}&at=${encodeURIComponent(at)}`
-                    });
-                    const mzzBody = await mzzRes.text();
-                    if (!mzzRes.ok) return { error: `MZZa6b HTTP ${mzzRes.status}: ${mzzBody.substring(0, 300)}` };
-
-                    const mzzData = parseBatch(mzzBody, 'MZZa6b');
-                    if (!mzzData) return { error: `MZZa6b no data. body=${mzzBody.substring(0, 300)}` };
-
-                    let operationId = null;
-                    let workflowId = null;
-                    let _allUuids = [];
-                    try {
-                        const parsed = typeof mzzData === 'string' ? JSON.parse(mzzData) : mzzData;
-                        const str = JSON.stringify(parsed);
-                        // Lấy TẤT CẢ UUID từ response để tìm workflowId
-                        const allUuids = [...str.matchAll(/"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/gi)].map(m => m[1]);
-                        _allUuids = allUuids.map(u => u.substring(0, 8));
-                        operationId = allUuids[0] || null;
-                        // workflowId = UUID đầu tiên không phải operationId và không phải projectId
-                        workflowId = allUuids.find(u => u !== operationId && u !== p.projectId) || null;
-                        if (!operationId) {
-                            const longM = str.match(/"([A-Za-z0-9_\-]{20,})"/);
-                            if (longM) operationId = longM[1];
-                        }
-                        if (!operationId && Array.isArray(parsed) && typeof parsed[0] === 'string' && parsed[0].length > 8) {
-                            operationId = parsed[0];
-                        }
-                    } catch(e) {}
-                    if (!operationId) return { error: `MZZa6b: không tìm thấy operationId. data=${JSON.stringify(mzzData).substring(0, 200)}` };
-
-                    return { operationId, workflowId, at, _allUuids };
-                } catch (e) { return { error: e.message }; }
-            },
-            args: [genParams]
-        });
-
-        const res = result?.[0]?.result;
-        if (res?.error) {
-            console.log('❌ Flow R2V gen lỗi:', res.error);
-            await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: res.error }) });
-        } else if (res?.operationId) {
-            const _opId = res.operationId;
-            console.log(`✅ MZZa6b OK, opId:${_opId.substring(0,8)}, wid:${res.workflowId?.substring(0,8)||'null'}, allUuids:[${res._allUuids?.join(',')||''}]`);
-            await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operationId: _opId, at: res.at }) });
-            // Clear stale R2V ops trước khi thêm mới (tránh op cũ cướp URL mới)
-            for (const [staleId, staleP] of _pendingR2V) {
-                if (staleP.isR2V) { console.log(`[R2V] Clear stale R2V op ${staleId.substring(0,8)}`); _pendingR2V.delete(staleId); }
-            }
-            // Thêm vào shared poller (không tạo IIFE riêng nữa)
-            _pendingR2V.set(_opId, {
-                pid: genParams.projectId,
-                bl: genParams.bl || '',
-                fsid: genParams.fsid || '',
-                at: res.at,
-                wid: res.workflowId || null,
-                isR2V: true,
-                genStartTs: Date.now(),
-                tabId: tab.id,
-                startTime: Date.now()
-            });
-            ensureR2VPoller();
-            // Inject fetch interceptor — bắt URL từ page's batchexecute response (giống T2V)
-            injectFetchInterceptor(tab.id, _opId).catch(() => {});
-        } else {
-            await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'NO_RESULT' }) });
-        }
-    } catch (e) {
-        console.log('Lỗi executeFlowR2VGen:', e.message);
-        await fetch(SAVE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: e.message }) }).catch(() => {});
-    } finally {
-        isGeneratingFlowR2V = false;
-    }
-}
-
 // TẢI URL QUA CHROME MAIN WORLD (để bypass hạn chế network của Electron)
 let isFetchingUrl = false;
 async function fetchUrlViaChrome(url) {
@@ -2093,392 +620,6 @@ async function uploadImageViaPage() {
     }
 }
 
-// THỰC THI VIDEO GEN QUA MAIN WORLD
-let isGeneratingVideo = false;
-async function executeVideoGen() {
-    if (isGeneratingVideo) return;
-    isGeneratingVideo = true;
-    try {
-        let tab = await findActiveTab();
-        if (!tab) {
-            console.log('❌ Không tìm thấy tab labs.google để gọi video gen');
-            await fetch('http://127.0.0.1:3000/api/save-video-gen-result', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'NO_TAB' }) }).catch(() => {});
-            return;
-        }
-
-        const dataRes = await fetch('http://127.0.0.1:3000/api/get-pending-video-gen');
-        if (!dataRes.ok) { console.log('❌ Không lấy được video gen data'); return; }
-        const { url, payload, bearerToken } = await dataRes.json();
-        if (!url || !payload) { console.log('❌ Thiếu url hoặc payload'); return; }
-
-        console.log(`🎬 Gọi video gen qua MAIN world: ${url.substring(url.lastIndexOf('/') + 1)}...`);
-
-        const result = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            world: 'MAIN',
-            func: async (apiUrl, apiPayload, bearer) => {
-                try {
-                    const headers = { 'Content-Type': 'application/json' };
-                    if (bearer) headers['Authorization'] = `Bearer ${bearer}`;
-                    const res = await fetch(apiUrl, {
-                        method: 'POST',
-                        credentials: 'include',
-                        headers: headers,
-                        body: JSON.stringify(apiPayload)
-                    });
-                    const text = await res.text();
-                    if (!res.ok) return { error: `HTTP ${res.status}: ${text.substring(0, 300)}` };
-                    try { return { data: JSON.parse(text) }; } catch(e) { return { error: 'JSON parse fail: ' + text.substring(0, 200) }; }
-                } catch (e) { return { error: e.message }; }
-            },
-            args: [url, payload, bearerToken || null]
-        });
-
-        const resultData = result?.[0]?.result;
-        if (resultData?.error) {
-            console.log('❌ Video gen MAIN world lỗi:', resultData.error);
-            await fetch('http://127.0.0.1:3000/api/save-video-gen-result', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: resultData.error }) });
-        } else if (resultData?.data) {
-            console.log('✅ Video gen MAIN world OK');
-            await fetch('http://127.0.0.1:3000/api/save-video-gen-result', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data: resultData.data }) });
-        } else {
-            await fetch('http://127.0.0.1:3000/api/save-video-gen-result', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'NO_RESULT' }) });
-        }
-    } catch (e) {
-        console.log('Lỗi executeVideoGen:', e.message);
-        await fetch('http://127.0.0.1:3000/api/save-video-gen-result', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: e.message }) }).catch(() => {});
-    } finally {
-        isGeneratingVideo = false;
-    }
-}
-
-// TẢI VIDEO T2V/R2V flow-content.google
-// Primary: chrome.downloads (browser-level — không CORS, không CSP, dùng cookie đúng)
-// Secondary: MAIN world fetch (page context — có thể bị CSP block connect-src)
-// Log mỗi bước về Electron /api/capture-rpc-body để debug trong cmd.exe
-const _dlLog = (msg, opId) => {
-    console.log(msg);
-    fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rpc: 'FlowDL', freq: msg, ts: Date.now(), opId: (opId||'').substring(0,8) })
-    }).catch(() => {});
-};
-
-async function downloadFlowContentVideo(videoUrl, operationId, saveVideoUrl, tabId = null, opStartTime = 0) {
-    _dlLog(`[FlowDL] START opId=${operationId.substring(0,8)} url=${videoUrl.substring(0,80)}`, operationId);
-
-    // === Pre-check: unsigned ?alt=media → wait for Angular to load googlevideo signed URL ===
-    // Khi URL là flow-content.google?alt=media (không có Expires/Signature), thử dùng
-    // googlevideo.com URL mà Angular đã load khi render video card — URL đó self-signed, không cần cookies.
-    // QUAN TRỌNG: chỉ claim URL có ts >= opStartTime để tránh nhầm video cũ trong thư viện.
-    const _isUnsignedAltMedia = videoUrl.includes('flow-content.google') &&
-        videoUrl.includes('?alt=media') && !videoUrl.includes('Expires=') && !videoUrl.includes('X-Goog-Signature=');
-    if (_isUnsignedAltMedia) {
-        const _gvTotal = () => _capturedR2VUrls.filter(c => c.url.includes('googlevideo')).length;
-        const _gvNew = () => _capturedR2VUrls.filter(c => c.url.includes('googlevideo') && c.ts >= opStartTime).length;
-        _dlLog(`[FlowDL] Unsigned alt=media — polling up to 30s for fresh googlevideo (opStartTime=${opStartTime}). gv total=${_gvTotal()} fresh=${_gvNew()}`, operationId);
-        for (let _gi = 0; _gi < 30; _gi++) {
-            // Chỉ claim googlevideo URL được capture SAU KHI op bắt đầu → loại bỏ video cũ trong thư viện
-            const _gvCap = _capturedR2VUrls.find(c =>
-                c.url.includes('googlevideo.com/videoplayback') &&
-                c.url.includes('source=contrib_service_ai_sandbox') &&
-                !c.claimedBy &&
-                c.ts >= opStartTime
-            );
-            if (_gvCap) {
-                _gvCap.claimedBy = operationId;
-                _dlLog(`[FlowDL] ✅ Fresh googlevideo URL found (waited ${_gi}s, ts=${_gvCap.ts}): ${_gvCap.url.substring(0, 100)}`, operationId);
-                videoUrl = _gvCap.url;
-                break;
-            }
-            if (_gi % 5 === 4) {
-                _dlLog(`[FlowDL] Poll ${_gi+1}/30 — waiting fresh googlevideo. gv total=${_gvTotal()} fresh=${_gvNew()}`, operationId);
-            }
-            await new Promise(r => setTimeout(r, 1000));
-        }
-        if (videoUrl.includes('flow-content.google')) {
-            _dlLog(`[FlowDL] No fresh googlevideo after 30s — aborting, không dùng alt=media (sẽ trả về XML)`, operationId);
-            return { success: false, error: 'alt_media_no_googlevideo' };
-        }
-    }
-
-    // === Primary: chrome.downloads + Referer injection ===
-    // Log cookies for diagnosis (flow-content.google vs flow.google.com)
-    try {
-        const _fcCk = await new Promise(r => chrome.cookies.getAll({ url: 'https://flow-content.google/' }, r));
-        const _flCk = await new Promise(r => chrome.cookies.getAll({ url: 'https://flow.google.com/' }, r));
-        _dlLog(`[FlowDL] cookies: flow-content.google=${(_fcCk||[]).length}[${(_fcCk||[]).map(c=>c.name).join(',')||'none'}] flow.google.com=${(_flCk||[]).length}`, operationId);
-    } catch(_) {}
-    const _DL_RULE_ID = 99901;
-    let _dlRuleAdded = false;
-    try {
-        await chrome.declarativeNetRequest.updateDynamicRules({
-            removeRuleIds: [_DL_RULE_ID],
-            addRules: [{
-                id: _DL_RULE_ID, priority: 1,
-                action: { type: 'modifyHeaders', requestHeaders: [
-                    { header: 'Referer', operation: 'set', value: 'https://flow.google.com/' },
-                    { header: 'Range', operation: 'set', value: 'bytes=0-' }
-                ]},
-                condition: { urlFilter: 'flow-content.google/', resourceTypes: ['main_frame', 'sub_frame', 'media', 'other', 'xmlhttprequest'] }
-            }]
-        });
-        _dlRuleAdded = true;
-        _dlLog('[FlowDL] Referer injected via declarativeNetRequest', operationId);
-    } catch(ruleErr) { _dlLog(`[FlowDL] Referer inject err: ${ruleErr.message}`, operationId); }
-
-    try {
-        const filename = `fluxy_dl_${operationId.substring(0,8)}_${Date.now()}.mp4`;
-        // declarativeNetRequest handles Referer. Chrome sends .google TLD cookies automatically.
-        // Do NOT pass headers[] — Chrome rejects Referer/Cookie as "Unsafe request header name".
-        _dlLog(`[FlowDL] chrome.downloads start (Referer via DNR, cookies via browser jar)`, operationId);
-        const downloadId = await new Promise((resolve, reject) => {
-            chrome.downloads.download({ url: videoUrl, filename, saveAs: false, conflictAction: 'uniquify' }, (id) => {
-                if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-                else resolve(id);
-            });
-        });
-        _dlLog(`[FlowDL] chrome.downloads started ID=${downloadId}`, operationId);
-        await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                chrome.downloads.onChanged.removeListener(listener);
-                reject(new Error('chrome.downloads timeout 300s'));
-            }, 300000);
-            function listener(delta) {
-                if (delta.id !== downloadId) return;
-                if (delta.state?.current === 'complete') {
-                    clearTimeout(timer); chrome.downloads.onChanged.removeListener(listener); resolve();
-                } else if (delta.state?.current === 'interrupted') {
-                    clearTimeout(timer); chrome.downloads.onChanged.removeListener(listener);
-                    reject(new Error(`interrupted: ${delta.error?.current || '?'}`));
-                }
-            }
-            chrome.downloads.onChanged.addListener(listener);
-        });
-        const items = await new Promise(resolve => chrome.downloads.search({ id: downloadId }, resolve));
-        const _dlItem = items?.[0];
-        const filePath = _dlItem?.filename;
-        const mimeType = _dlItem?.mime;
-        if (!filePath) throw new Error('no filePath from chrome.downloads.search');
-        // Detect wrong content: server returned XML/HTML error page instead of video
-        if (filePath.endsWith('.xml') || filePath.endsWith('.html') || filePath.endsWith('.htm')
-            || (mimeType && !mimeType.startsWith('video/'))) {
-            _dlLog(`⚠️ [FlowDL] WRONG CONTENT: mime=${mimeType} file=${filePath.split(/[/\\]/).pop()} path=${filePath} — KEEP FILE FOR INSPECTION`, operationId);
-            // Giữ file lại để đọc nội dung XML (không xóa) — sau khi diagnose xong mới xóa
-            throw new Error(`wrong_content mime=${mimeType} — bare URL not authorized`);
-        }
-        _dlLog(`✅ [FlowDL] chrome.downloads OK: ${filePath} mime=${mimeType}`, operationId);
-        await fetch(saveVideoUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ operationId, videoUrl: 'file://' + filePath.replace(/\\/g, '/') }) });
-        return;
-    } catch (dlErr) {
-        _dlLog(`⚠️ [FlowDL] chrome.downloads FAIL: ${dlErr.message} → MAIN world fetch`, operationId);
-    } finally {
-        if (_dlRuleAdded) {
-            try { await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [_DL_RULE_ID] }); } catch(_) {}
-        }
-    }
-
-    // === Secondary: MAIN world fetch (page context — bypass CDN CORS nếu CDN allow flow.google.com) ===
-    const activeTabId = tabId || (await findActiveTab().catch(() => null))?.id || null;
-    if (activeTabId) {
-        try {
-            _dlLog(`[FlowDL] MAIN world fetch start tab=${activeTabId}`, operationId);
-            const mwResult = await chrome.scripting.executeScript({
-                target: { tabId: activeTabId },
-                world: 'MAIN',
-                func: async (url) => {
-                    try {
-                        const resp = await fetch(url, { credentials: 'include' });
-                        if (!resp.ok) return { error: `HTTP ${resp.status}` };
-                        const buf = await resp.arrayBuffer();
-                        const bytes = new Uint8Array(buf);
-                        const CHUNK = 8192;
-                        const parts = [];
-                        for (let i = 0; i < bytes.length; i += CHUNK) {
-                            parts.push(String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CHUNK, bytes.length))));
-                        }
-                        return { b64: btoa(parts.join('')), size: buf.byteLength };
-                    } catch (e) { return { error: e.message }; }
-                },
-                args: [videoUrl]
-            });
-            const mwData = mwResult?.[0]?.result;
-            if (mwData?.b64 && !mwData.error) {
-                const sizeMB = (mwData.size / 1024 / 1024).toFixed(1);
-                _dlLog(`[FlowDL] MAIN world OK ${sizeMB}MB → sending to Electron...`, operationId);
-                const binaryStr = atob(mwData.b64);
-                const outBytes = new Uint8Array(binaryStr.length);
-                for (let i = 0; i < binaryStr.length; i++) outBytes[i] = binaryStr.charCodeAt(i);
-                const saveResp = await fetch('http://127.0.0.1:3000/api/save-r2v-video-bytes', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/octet-stream', 'x-operation-id': operationId },
-                    body: outBytes.buffer
-                });
-                if (!saveResp.ok) throw new Error(`save-r2v-video-bytes HTTP ${saveResp.status}`);
-                _dlLog(`✅ [FlowDL] MAIN world fetch done ${sizeMB}MB`, operationId);
-                return;
-            }
-            _dlLog(`⚠️ [FlowDL] MAIN world fail: ${mwData?.error || 'no result'}`, operationId);
-        } catch (mwErr) {
-            _dlLog(`⚠️ [FlowDL] MAIN world err: ${mwErr.message}`, operationId);
-        }
-    }
-
-    // === Tertiary: BSW fetch với credentials:include (Cookie header bị strip bởi Chrome — dùng browser jar) ===
-    try {
-        _dlLog(`[FlowDL] BSW creds:include fetch`, operationId);
-        const _bswR = await fetch(videoUrl, {
-            credentials: 'include',
-            headers: { 'Referer': 'https://flow.google.com/', 'Range': 'bytes=0-', 'Accept': 'video/mp4,video/*,*/*' }
-        });
-        const _bswCt = _bswR.headers.get('content-type') || '?';
-        _dlLog(`[FlowDL] BSW status=${_bswR.status} type=${_bswCt}`, operationId);
-        if (_bswR.status === 403 || _bswR.status === 401) {
-            try { const _b = await _bswR.text(); _dlLog(`[FlowDL] BSW ${_bswR.status} body: ${_b.substring(0,300)}`, operationId); } catch(_) {}
-        } else if (_bswR.status === 200 || _bswR.status === 206) {
-            if (!_bswCt.includes('xml') && !_bswCt.includes('html')) {
-                const _bswBuf = await _bswR.arrayBuffer();
-                _dlLog(`[FlowDL] BSW OK ${(_bswBuf.byteLength/1024/1024).toFixed(1)}MB → Electron`, operationId);
-                const _bswSr = await fetch('http://127.0.0.1:3000/api/save-r2v-video-bytes', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/octet-stream', 'x-operation-id': operationId },
-                    body: _bswBuf
-                });
-                if (_bswSr.ok) { _dlLog(`✅ [FlowDL] BSW save OK`, operationId); return; }
-                _dlLog(`⚠️ [FlowDL] BSW save fail: HTTP ${_bswSr.status}`, operationId);
-            }
-        }
-    } catch(_bswE) {
-        _dlLog(`⚠️ [FlowDL] BSW error: ${_bswE.message}`, operationId);
-    }
-
-    // === All methods failed → gửi HTTPS URL + cookies về Electron ===
-    _dlLog(`❌ [FlowDL] ALL methods failed, sending HTTPS URL + cookies back`, operationId);
-    let fcCookieStr = '';
-    try {
-        // Lấy flow.google.com cookies (có .google TLD auth cookies như SAPISID, SID)
-        // flow-content.google cùng TLD .google nên cùng cookies
-        const flowCookies = await new Promise(resolve => chrome.cookies.getAll({ url: 'https://flow.google.com/' }, resolve));
-        const flowCookieStr = (flowCookies || []).map(c => `${c.name}=${c.value}`).join('; ');
-        // Cũng lấy flow-content.google riêng (cookies set trực tiếp cho domain này)
-        const fcCookies = await new Promise(resolve => chrome.cookies.getAll({ url: 'https://flow-content.google/' }, resolve));
-        const fcOnlyStr = (fcCookies || []).map(c => `${c.name}=${c.value}`).join('; ');
-        // Combine: ưu tiên flow-content.google, fallback flow.google.com
-        fcCookieStr = [fcOnlyStr, flowCookieStr].filter(Boolean).join('; ');
-        _dlLog(`[FlowDL] fallback cookies: flow-content.google=${(fcCookies||[]).length} flow.google.com=${(flowCookies||[]).length} total=${fcCookieStr.length}chars`, operationId);
-    } catch(_) {}
-    fetch(saveVideoUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ operationId, videoUrl, flowContentCookie: fcCookieStr || undefined }) }).catch(() => {});
-}
-
-// TẢI VIDEO 1080P QUA CHROME.DOWNLOADS (Chrome native — xử lý flow-content.google đúng cách)
-// Electron net.fetch không decode được binary protocol 2PINHOLE của flow-content.google CDN.
-// chrome.downloads.download() dùng Chrome download stack đầy đủ → tải video thành công.
-let isDownloadingVideo = false;
-async function downloadVideoViaChrome(mediaName) {
-    if (isDownloadingVideo) return;
-    isDownloadingVideo = true;
-    console.log(`📥 Bắt đầu tải video 1080p qua chrome.downloads: ${mediaName}`);
-    try {
-        // Dùng URL tRPC trực tiếp — chrome.downloads sẽ follow 307 redirect và xử lý flow-content.google
-        const tRPCUrl = `https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=${mediaName}`;
-        const filename = `veo_1080p_${Date.now()}.mp4`;
-
-        const downloadId = await new Promise((resolve, reject) => {
-            chrome.downloads.download({
-                url: tRPCUrl,
-                filename: filename,
-                saveAs: false,
-                conflictAction: 'uniquify'
-            }, (id) => {
-                if (chrome.runtime.lastError) {
-                    reject(new Error(chrome.runtime.lastError.message));
-                } else {
-                    resolve(id);
-                }
-            });
-        });
-
-        console.log(`⬇️ Download ID: ${downloadId}, chờ hoàn thành...`);
-
-        // Chờ download hoàn thành (tối đa 5 phút)
-        await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                chrome.downloads.onChanged.removeListener(listener);
-                reject(new Error('chrome.downloads timeout sau 300s'));
-            }, 300000);
-
-            function listener(delta) {
-                if (delta.id !== downloadId) return;
-                if (delta.state?.current === 'complete') {
-                    clearTimeout(timer);
-                    chrome.downloads.onChanged.removeListener(listener);
-                    resolve();
-                } else if (delta.state?.current === 'interrupted') {
-                    clearTimeout(timer);
-                    chrome.downloads.onChanged.removeListener(listener);
-                    const errReason = delta.error?.current || 'INTERRUPTED';
-                    reject(new Error(`Download bị gián đoạn: ${errReason}`));
-                }
-            }
-            chrome.downloads.onChanged.addListener(listener);
-        });
-
-        // Lấy đường dẫn file đã tải
-        const items = await new Promise(resolve => chrome.downloads.search({ id: downloadId }, resolve));
-        const filePath = items?.[0]?.filename;
-
-        if (!filePath) {
-            throw new Error('Không lấy được đường dẫn file sau khi tải');
-        }
-
-        console.log(`✅ chrome.downloads hoàn thành: ${filePath}`);
-        await fetch('http://127.0.0.1:3000/api/save-video-download', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: filePath })
-        }).catch(() => {});
-
-    } catch (e) {
-        console.log('❌ Lỗi downloadVideoViaChrome:', e.message);
-        await fetch('http://127.0.0.1:3000/api/video-download-error', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ error: e.message })
-        }).catch(() => {});
-    } finally {
-        isDownloadingVideo = false;
-    }
-}
-
-// RESOLVE VIDEO URL: Extension service worker có <all_urls> permission → bypass CORS → follow redirect tự do
-// Service worker gọi với credentials:include để gửi cookie labs.google → nhận 307 → lấy signed URL
-let isResolvingMedia = false;
-async function resolveMediaUrl(mediaName) {
-    if (isResolvingMedia) return;
-    isResolvingMedia = true;
-    try {
-        const targetUrl = `https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=${mediaName}`;
-        const res = await fetch(targetUrl, { redirect: 'follow', credentials: 'include' });
-        const finalUrl = res.url;
-        if (finalUrl && finalUrl !== targetUrl) {
-            await fetch('http://127.0.0.1:3000/api/save-media-url', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: finalUrl })
-            });
-            console.log('✅ Resolve video URL OK:', finalUrl.substring(0, 100));
-        } else {
-            console.log('❌ Không redirect — status:', res.status, '| url:', finalUrl?.substring(0, 80));
-        }
-    } catch (e) {
-        console.log('Lỗi resolve media URL:', e.message);
-    } finally {
-        isResolvingMedia = false;
-    }
-}
-
 // SNIFFER: Bắt f.req + at= từ batchexecute — capture AT hợp lệ mà Angular đang dùng
 chrome.webRequest.onBeforeRequest.addListener(
     (details) => {
@@ -2498,14 +639,14 @@ chrome.webRequest.onBeforeRequest.addListener(
                 for (const r of details.requestBody.raw) {
                     fullBody += new TextDecoder().decode(new Uint8Array(r.bytes));
                 }
-                const mAt = fullBody.match(/(?:^|&)at=([^&]{20,60})/);
-                if (mAt) atFromBody = decodeURIComponent(mAt[1]);
+                const mAt = fullBody.match(/(?:^|&)at=([^&]+)/);
+                if (mAt && mAt[1].length >= 20) atFromBody = decodeURIComponent(mAt[1]);
                 const m = fullBody.match(/f\.req=([^&]{0,3000})/);
                 if (m) freqStr = decodeURIComponent(m[1]);
             }
 
             // Lưu AT hợp lệ — CHỈ từ Angular's native calls, không từ RPCs của mình
-            const ourOwnRpcs = ['as29s', 'ogiZ0b', 'nzlxg', 'YhhmEf', 'jwpduf', 'SPrCad'];
+            const ourOwnRpcs = ['as29s', 'ogiZ0b', 'WuwhI', 'nzlxg', 'SPrCad'];
             const isOurRpc = ourOwnRpcs.some(r => rpcFromUrl.includes(r));
             if (!isOurRpc && atFromBody && atFromBody.startsWith('AIQ-') && atFromBody.length >= 30) {
                 chrome.storage.local.get('lastGoodAt', (data) => {
@@ -2517,8 +658,8 @@ chrome.webRequest.onBeforeRequest.addListener(
             }
 
             if (!freqStr) return;
-            if (freqStr.includes('ogiZ0b') || freqStr.includes('YhhmEf') || freqStr.includes('jwpduf') || freqStr.includes('SPrCad')) {
-                const rpc = freqStr.includes('ogiZ0b') ? 'ogiZ0b' : freqStr.includes('YhhmEf') ? 'YhhmEf' : freqStr.includes('SPrCad') ? 'SPrCad' : 'jwpduf';
+            if (freqStr.includes('WuwhI') || freqStr.includes('ogiZ0b') || freqStr.includes('SPrCad')) {
+                const rpc = freqStr.includes('WuwhI') ? 'WuwhI' : freqStr.includes('ogiZ0b') ? 'ogiZ0b' : 'SPrCad';
                 const snippet = freqStr.substring(0, 5000);
                 chrome.storage.local.set({ ['capturedFreq_' + rpc]: snippet, capturedFreqTs: Date.now() });
                 fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
@@ -2619,12 +760,6 @@ setInterval(async () => {
 
 // QUÉT PROJECT ID + COOKIE (mỗi 2s — gửi cả cookie để xác nhận kết nối)
 setInterval(async () => {
-    // Auto-reload check: fire khi timer đến hạn
-    if (_flowTabReloadAt && Date.now() >= _flowTabReloadAt) {
-        _flowTabReloadAt = 0;
-        _fireFlowTabReload('timer_fired').catch(_=>{});
-    }
-
     let tab = await findActiveTab();
     if (!tab) return;
     chrome.scripting.executeScript({
@@ -2684,6 +819,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // AT + BL token từ MAIN world (flow.google.com — cookie-based auth)
     if (message.type === "FLOW_AUTH_FOUND" && message.data?.at) {
         const { at, bl, fsid } = message.data;
+        // Lưu vào storage để SW có thể đọc khi tạo ảnh
+        chrome.storage.local.set({ flowAuth: { at, bl: bl || '', fsid: fsid || '', ts: Date.now() } });
+        // Nếu AT này tốt hơn lastGoodAt hiện tại, cập nhật luôn
+        chrome.storage.local.get('lastGoodAt', d => {
+            if (!d.lastGoodAt || !d.lastGoodAt.startsWith('AIQ-')) {
+                chrome.storage.local.set({ lastGoodAt: at, lastGoodAtTs: Date.now(), lastGoodAtRpc: 'FLOW_AUTH_FOUND' });
+            }
+        });
         chrome.cookies.getAll({ url: 'https://flow.google.com' }, (cookies) => {
             const cookieStr = (cookies || []).map(c => `${c.name}=${c.value}`).join('; ');
             const sapisid = cookies?.find(c => c.name === 'SAPISID')?.value || '';
@@ -2698,11 +841,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ rpc: 'JWPDUF_COMPLETE_RAW', raw: message.data.raw.substring(0, 3000), ts: Date.now() })
         }).catch(_=>{});
-        // Backup reload: nếu page chưa có signed URL (không có _capturedR2VUrls match)
-        // Debounce 10s — 8 video complete gần nhau chỉ reload 1 lần
-        if (Date.now() - _lastFlowTabReload > 10000) {
-            _scheduleFlowTabReload(500, 'jwpduf_complete');
-        }
     }
 
     // Video blob created in page (Angular dùng MSE/blob URL)
@@ -2729,17 +867,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }).catch(_=>{});
     }
 
-    // googlevideo.com URL captured from page (ASB manifest / response body / currentSrc)
-    if (message.type === "GV_URL_CAPTURED" && message.data?.url) {
-        const gvUrl = message.data.url;
-        if (gvUrl.includes('googlevideo.com/videoplayback') && !_capturedR2VUrls.some(c => c.url === gvUrl)) {
-            const ts = message.data.ts || Date.now();
-            _capturedR2VUrls.push({ url: gvUrl, ts, mid: null });
-            fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ rpc: 'GV_FROM_PAGE', url: gvUrl.substring(0, 250), ts, source: message.data.source || 'page', capturedAt: new Date().toISOString() })
-            }).catch(_=>{});
-        }
+    // v5.59: grecaptcha action capture — POST to Electron so it appears in Veo Log
+    if (message.type === "RC_EXEC_CAPTURED") {
+        const action = message.data?.action || '?';
+        const sk = (message.data?.sitekey || '').substring(0, 10);
+        fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rpc: 'RC_EXEC', action, sitekey_pfx: sk, ts: Date.now() })
+        }).catch(_=>{});
+    }
+
+    // v5.55: Angular batchexecute RPC log
+    if (message.type === "RPC_RESP_DEBUG") {
+        const rpc = message.data?.rpc || '?';
+        const len = message.data?.len || 0;
+        fetch('http://127.0.0.1:3000/api/capture-rpc-body', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rpc: 'ANGULAR_BATCH_RPC', rpcid: rpc, len, snip: message.data?.snip?.substring(0, 500), ts: Date.now() })
+        }).catch(_=>{});
     }
 });
 
@@ -2823,22 +968,12 @@ registerSelf();
 // ── KEEPALIVE: MV3 service worker bị Chrome tắt sau 30s idle ─────────────────
 // chrome.alarms đảm bảo service worker được đánh thức lại mỗi 25s, duy trì setInterval
 // Re-inject fetch interceptor khi tab reload (tránh mất capture sau khi user reload trang flow)
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (changeInfo.status !== 'complete') return;
-    // Kiểm tra xem tab này có pending T2V/R2V op không
-    let hasOp = false;
-    for (const [, p] of _pendingR2V) { if (p.tabId === tabId) { hasOp = true; break; } }
-    if (!hasOp) return;
-    // Re-inject sau khi page load xong (delay nhỏ để Angular khởi động)
-    setTimeout(() => {
-        for (const [opId, p] of _pendingR2V) {
-            if (p.tabId === tabId) {
-                console.log(`[Poller] Tab ${tabId} reloaded — re-inject interceptor for opId=${opId.substring(0,8)}`);
-                injectFetchInterceptor(tabId, opId).catch(() => {});
-                break; // chỉ inject 1 lần (interceptor nghe tất cả ops trên tab)
-            }
-        }
-    }, 2000);
+    // Export cookies khi bất kỳ tab flow.google.com nào load xong
+    if (tab?.url?.includes('flow.google.com') || tab?.url?.includes('labs.google')) {
+        exportGoogleCookiesToServer().catch(() => {});
+    }
 });
 
 chrome.alarms.create('fluxy-keepalive', { periodInMinutes: 0.5 });  // 30 giây (minimum Chrome cho phép)
@@ -3409,277 +1544,18 @@ async function grokTextToImage(tab, job) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// [MODULE 2,3,4] VIDEO: TEXT_TO_VIDEO | IMAGE_TO_VIDEO | REF_TO_VIDEO
-// ════════════════════════════════════════════════════════════════════════════
-async function grokVideoJob(tab, job) {
-    const { jobId, prompt, aspectRatio, duration, quality, mode, imageBase64, imagesBase64 } = job;
-    const sleep = ms => new Promise(r => setTimeout(r, ms));
-    const modeUp = (mode || "TEXT_TO_VIDEO").toUpperCase().replace(/\s+/g, "_");
-    const isI2V  = modeUp === "IMAGE_TO_VIDEO";
-    const isR2V  = modeUp === "REF_TO_VIDEO";
-    console.log("[Grok VID] " + modeUp + " | ratio=" + aspectRatio + " dur=" + duration + "s quality=" + quality);
-
-    // 1. Click tab Video
-    await chrome.scripting.executeScript({
-        target: { tabId: tab.id }, world: "MAIN",
-        func: async () => {
-            const btns = Array.from(document.querySelectorAll("button,[role=button]"));
-            const vt = btns.find(b => (b.innerText||"").trim().toLowerCase() === "video");
-            if (vt) { vt.click(); await new Promise(r=>setTimeout(r,2000)); }
-        }
-    }).catch(()=>{});
-    await sleep(2000);
-
-    // 2. Settings (TRICK 16:9 trước để unlock 10s, giống Playwright cũ)
-    const setR = await chrome.scripting.executeScript({
-        target: { tabId: tab.id }, world: "MAIN",
-        func: async (ar, dur, qual) => {
-            const sleep = ms => new Promise(r => setTimeout(r, ms));
-            const allBtns = () => Array.from(document.querySelectorAll("button,[role=button]"));
-            // pickRatio — copy logic Playwright: danh sách cố định + loại trừ menu + chỉ click nếu cần + .last()
-            const RATIOS = ["1:1","2:3","3:2","9:16","16:9"];
-            const isVis = el => el.checkVisibility ? el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) : (el.offsetParent !== null && (() => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; })());
-            const pickRatio = async (target) => {
-                const toggle = Array.from(document.querySelectorAll("button, div[role='button'], [role='button']"))
-                    .find(b => RATIOS.some(r => (b.innerText||"").trim().startsWith(r))
-                               && !b.closest("[role='menu']") && !b.closest(".menu") && isVis(b));
-                if (!toggle) return "toggle-not-found";
-                const cur = (toggle.innerText||"").trim();
-                if (cur.startsWith(target)) return "already-" + cur;
-                // Visibility diff: ghi nhận element ĐANG HIỆN TRƯỚC khi mở dropdown
-                const beforeVisible = new Set(
-                    Array.from(document.querySelectorAll("*")).filter(el => {
-                        const t = (el.innerText||"").trim();
-                        return t.startsWith(target) && t.length < 25 && isVis(el);
-                    })
-                );
-                toggle.click();
-                await sleep(900);
-                // Ưu tiên 1: container dropdown (không dùng role=dialog tránh nhầm cookie popup)
-                const menuContainers = Array.from(document.querySelectorAll(
-                    "[role='menu'], [role='listbox'], [data-radix-popper-content-wrapper], [data-floating-ui-portal], [data-headlessui-state], [data-state='open']"
-                ));
-                let found = null;
-                for (const scope of menuContainers) {
-                    const items = Array.from(scope.querySelectorAll("*")).filter(el => {
-                        const t = (el.innerText||"").trim();
-                        return t.startsWith(target) && t.length < 25 && isVis(el);
-                    });
-                    if (items.length > 0) { found = items[0]; break; }
-                }
-                // Ưu tiên 2: Visibility diff — element MỚI HIỆN sau khi dropdown mở
-                if (!found) {
-                    const newlyVisible = Array.from(document.querySelectorAll("*")).filter(el => {
-                        const t = (el.innerText||"").trim();
-                        return t.startsWith(target) && t.length < 25
-                            && !beforeVisible.has(el) && isVis(el);
-                    });
-                    if (newlyVisible.length > 0) found = newlyVisible[0];
-                }
-                // Ưu tiên 3: bất kỳ element VISIBLE khớp text (loại toggle và ProseMirror)
-                if (!found) {
-                    const anyVisible = Array.from(document.querySelectorAll("*")).filter(el => {
-                        const t = (el.innerText||"").trim();
-                        return t.startsWith(target) && t.length < 25
-                            && el !== toggle && !el.closest(".ProseMirror") && !el.closest("[contenteditable]")
-                            && isVis(el);
-                    });
-                    if (anyVisible.length > 0) found = anyVisible[0];
-                }
-                if (found) { found.click(); await sleep(500); return "OK → " + target; }
-                document.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}));
-                return "option-not-found";
-            };
-            // TRICK: ép 16:9 để unlock nút 10s (giống Playwright cũ)
-            await pickRatio("16:9"); await sleep(500);
-            // Duration
-            if (dur) { const d=allBtns().find(b=>(b.innerText||"").trim()===dur+"s"); if(d){d.click();await sleep(500);} }
-            // Quality
-            if (qual) { const q=allBtns().find(b=>(b.innerText||"").trim().toLowerCase()===qual.toLowerCase()); if(q){q.click();await sleep(500);} }
-            // Đặt tỉ lệ thực (nếu khác 16:9)
-            let rd = "kept-16:9";
-            if (ar && ar !== "16:9") rd = await pickRatio(ar);
-            return rd;
-        },
-        args: [aspectRatio || "16:9", parseInt(duration) || 5, quality || ""]
-    }).catch(()=>[{result:"error"}]);
-    console.log("[Grok VID] Settings:", setR[0]?.result);
-    await sleep(500);
-
-    // 3. Upload ảnh (IMAGE_TO_VIDEO / REF_TO_VIDEO)
-    if ((isI2V || isR2V)) {
-        const filesToUpload = isR2V ? (imagesBase64 || []) : (imageBase64 ? [imageBase64] : []);
-        if (filesToUpload.length > 0) {
-            const upR = await chrome.scripting.executeScript({
-                target: { tabId: tab.id }, world: "MAIN",
-                func: async (b64List) => {
-                    const sleep = ms => new Promise(r => setTimeout(r, ms));
-                    const files = b64List.map((b64, i) => {
-                        const pts = b64.split(","); const mime = pts[0].match(/:(.*?);/)?.[1]||"image/jpeg";
-                        const ext = mime.split("/")[1]||"jpg";
-                        const bytes = Uint8Array.from(atob(pts[1]), c => c.charCodeAt(0));
-                        return new File([bytes], "img_"+(i+1)+"."+ext, { type: mime });
-                    });
-                    // Tìm input[type=file] — grok có thể ẩn sau button upload
-                    let inp = document.querySelector("input[type=file]");
-                    if (!inp) {
-                        // Thử click nút upload để lộ input
-                        const upBtn = Array.from(document.querySelectorAll("button,[role=button],[data-testid]"))
-                            .find(b => {
-                                const t = (b.innerText||b.getAttribute("aria-label")||"").toLowerCase();
-                                return t.includes("upload")||t.includes("image")||t.includes("ảnh")||t.includes("photo");
-                            });
-                        if (upBtn) { upBtn.click(); await sleep(1000); }
-                        inp = document.querySelector("input[type=file]");
-                    }
-                    if (!inp) return { ok: false, reason: "No file input found" };
-                    const dt = new DataTransfer(); files.forEach(f => dt.items.add(f));
-                    try { Object.defineProperty(inp, "files", { value: dt.files, configurable: true }); } catch(_) {}
-                    inp.dispatchEvent(new Event("change",{bubbles:true}));
-                    inp.dispatchEvent(new Event("input",{bubbles:true}));
-                    await sleep(5000 + files.length * 2000);
-                    return { ok: true, count: files.length };
-                },
-                args: [filesToUpload]
-            }).catch(e=>[{result:{ok:false,reason:e.message}}]);
-            const up = upR[0]?.result || {};
-            console.log("[Grok VID] Upload: ok=" + up.ok + " count=" + up.count + " " + (up.reason||""));
-            if (!up.ok) throw new Error("Lỗi upload ảnh: " + (up.reason || "unknown"));
-            await sleep(3000);
-        }
-    }
-
-    // 4. Gõ prompt + submit
-    const pR = await chrome.scripting.executeScript({
-        target: { tabId: tab.id }, world: "MAIN",
-        func: async (promptText, numRefImgs) => {
-            const sleep = ms => new Promise(r => setTimeout(r, ms));
-            const editor = document.querySelector(".ProseMirror,[contenteditable=true]");
-            if (!editor) return { ok: false };
-            editor.focus(); await sleep(300);
-
-            // Gõ từng ký tự để kích hoạt autocomplete của ProseMirror / React
-            const typeChars = async (text, charDelay = 40) => {
-                for (const ch of text) {
-                    editor.dispatchEvent(new KeyboardEvent("keydown",{key:ch,bubbles:true,cancelable:true}));
-                    document.execCommand("insertText", false, ch);
-                    editor.dispatchEvent(new KeyboardEvent("keyup",{key:ch,bubbles:true}));
-                    await sleep(charDelay);
-                }
-            };
-
-            // REF tag — gõ @Image i từng ký tự → autocomplete mở → Enter chọn → Space xác nhận
-            for (let i = 1; i <= numRefImgs; i++) {
-                await typeChars("@Image " + i, 50);
-                await sleep(800); // chờ dropdown autocomplete hiện
-                editor.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",keyCode:13,code:"Enter",bubbles:true,cancelable:true}));
-                await sleep(400);
-                document.execCommand("insertText", false, " ");
-                await sleep(300);
-            }
-
-            // Paste toàn bộ prompt 1 lần
-            document.execCommand("insertText", false, promptText);
-            await sleep(300);
-            let typed = editor.innerText?.trim() || "";
-
-            // Submit — click nút "Gửi" (aria-label="Gửi" hoặc "Send"), fallback Ctrl+Enter
-            await sleep(300);
-            const sendBtn = Array.from(document.querySelectorAll('button,[role=button]'))
-                .find(b => {
-                    const aria = (b.getAttribute('aria-label')||'').toLowerCase();
-                    return (aria === 'gửi' || aria === 'send') && !b.disabled;
-                });
-            if (sendBtn) {
-                sendBtn.click();
-            } else {
-                // fallback: Ctrl+Enter
-                editor.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",keyCode:13,code:"Enter",ctrlKey:true,bubbles:true,cancelable:true}));
-                await sleep(80);
-                editor.dispatchEvent(new KeyboardEvent("keyup",{key:"Enter",keyCode:13,code:"Enter",ctrlKey:true,bubbles:true}));
-            }
-            await sleep(1000);
-            return { ok: typed.length >= 1, typed: typed.substring(0,80) };
-        },
-        args: [prompt || "", isR2V ? (imagesBase64||[]).length : 0]
-    }).catch(e=>[{result:{ok:false}}]);
-    const pr = pR[0]?.result || {};
-    console.log("[Grok VID] Prompt: ok=" + pr.ok + " typed=\"" + pr.typed + "\"");
-    if (!pr.ok) throw new Error("Không gõ được prompt vào editor (video).");
-
-    // 5. Poll chờ video xuất hiện (tối đa 35 phút)
-    const deadline = Date.now() + 2100000;
-    let attempt = 0;
-    while (Date.now() < deadline) {
-        await sleep(15000); attempt++;
-        const pollR = await chrome.scripting.executeScript({
-            target: { tabId: tab.id }, world: "MAIN",
-            func: () => {
-                const txt = (document.body.innerText||"").replace(/\s+/g," ");
-                let pct = 10;
-                const m = txt.match(/(?:Đang tạo|Generating)[^\d]*(\d{1,3})\s*%/i)||txt.match(/(\d{1,3})\s*%/g);
-                if (m) pct = Array.isArray(m) ? parseInt(m[m.length-1]) : parseInt(m[1]);
-                const isGen = txt.includes("Đang tạo")||txt.toLowerCase().includes("generating")||txt.includes("Hủy");
-                const hasAB = txt.includes("Bạn thích")||txt.includes("Bỏ qua");
-                const isMod = txt.toLowerCase().includes("content moderated")||txt.toLowerCase().includes("try a different idea");
-                const vids = document.querySelectorAll("video");
-                let hasVid = false; for(const v of vids){if(v.src||v.currentSrc||v.querySelector("source")?.src){hasVid=true;break;}}
-                return { pct, isGenerating:isGen, isFinished:hasAB||(hasVid&&(!isGen||pct===100)), isModerated:isMod };
-            }
-        }).catch(()=>[{result:{pct:10,isGenerating:false,isFinished:false,isModerated:false}}]);
-        const poll = pollR[0]?.result || {};
-        if (attempt % 3 === 0) console.log("[Grok VID] Poll #" + attempt + ": pct=" + poll.pct + "% gen=" + poll.isGenerating + " done=" + poll.isFinished);
-        if (poll.isModerated) throw new Error("Bị chặn: Vi phạm chính sách nội dung Grok.");
-        if (poll.isFinished) { console.log("[Grok VID] Video xong!"); break; }
-    }
-
-    // 6. Click Bỏ qua (A/B test)
-    await chrome.scripting.executeScript({
-        target: { tabId: tab.id }, world: "MAIN",
-        func: async () => {
-            await new Promise(r=>setTimeout(r,2000));
-            const skip = Array.from(document.querySelectorAll("button")).find(b=>(b.innerText||"").toLowerCase().includes("bỏ qua"));
-            if (skip) { skip.click(); await new Promise(r=>setTimeout(r,2000)); }
-        }
-    }).catch(()=>{});
-    await new Promise(r=>setTimeout(r,2000));
-
-    // 7. Fetch video blob → base64 trong page context
-    const vidR = await chrome.scripting.executeScript({
-        target: { tabId: tab.id }, world: "MAIN",
-        func: async () => {
-            const vids = Array.from(document.querySelectorAll("video"));
-            if (vids.length === 0) return null;
-            const vid = vids[vids.length - 1];
-            const url = vid.src || vid.currentSrc || vid.querySelector("source")?.src;
-            if (!url || (!url.startsWith("blob:") && !url.startsWith("http"))) return null;
-            const res = await fetch(url);
-            const blob = await res.blob();
-            return await new Promise(r => { const rd=new FileReader(); rd.onloadend=()=>r(rd.result); rd.readAsDataURL(blob); });
-        }
-    }).catch(()=>[{result:null}]);
-
-    const videoB64 = vidR[0]?.result;
-    if (!videoB64) throw new Error("Không lấy được video từ trang.");
-    console.log("[Grok VID] Video size: " + Math.round(videoB64.length/1024) + "KB");
-    return { success: true, video: videoB64, jobId, mediaType: "VIDEO" };
-}
-
-// ════════════════════════════════════════════════════════════════════════════
 // JOB EXECUTOR CHÍNH — hỗ trợ N worker song song
 // ════════════════════════════════════════════════════════════════════════════
 const workerSlots   = new Set();   // các slot đang chạy
 let   workerMaxCount = 5;          // mặc định 5 tab song song (server có thể giảm theo queue size)
 
 async function executeGrokJob(job, slotIdx) {
-    const mode = (job.mode || "TEXT_TO_IMAGE").toUpperCase().replace(/\s+/g, "_");
-    console.log("[Grok Slot " + slotIdx + "] Job #" + job.jobId + " | mode=" + mode + " | ratio=" + job.aspectRatio + " | \"" + (job.prompt||"").substring(0,40) + "\"");
+    console.log("[Grok Slot " + slotIdx + "] Job #" + job.jobId + " | ratio=" + job.aspectRatio + " | \"" + (job.prompt||"").substring(0,40) + "\"");
     fetch("http://127.0.0.1:3000/grok/api/sw-ping", {
         method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ step: "EXECUTE_JOB slot=" + slotIdx + " mode=" + mode, jobId: job.jobId })
+        body: JSON.stringify({ step: "EXECUTE_JOB slot=" + slotIdx, jobId: job.jobId })
     }).catch(()=>{});
     const tab = await ensureWorkerTab(slotIdx);
-    if (mode.includes("VIDEO")) return await grokVideoJob(tab, job);
     return await grokTextToImage(tab, job);
 }
 
@@ -3792,42 +1668,11 @@ setInterval(() => {
     runPoller();
 }, 2500);  // Fast polling khi SW đang sống (alarm giữ SW alive)
 
-// Capture YhhmEf (video gen) and jwpduf (video poll) POST bodies for analysis
+// Capture WuwhI POST body (previously ogiZ0b) for debugging
 chrome.webRequest.onBeforeRequest.addListener(
     (details) => {
         if (details.method !== 'POST') return;
-        const isVideoGen = details.url.includes('YhhmEf');
-        const isVideoPoll = details.url.includes('jwpduf');
-        if (!isVideoGen && !isVideoPoll) return;
-        const raw = details.requestBody && details.requestBody.raw;
-        if (!raw || !raw.length) return;
-        try {
-            const bodyBytes = raw.map(r => new Uint8Array(r.bytes));
-            let fullBody = '';
-            bodyBytes.forEach(b => { fullBody += new TextDecoder().decode(b); });
-            const freqMatch = fullBody.match(/f\.req=([^&]{0,5000})/);
-            if (!freqMatch) return;
-            const decoded = decodeURIComponent(freqMatch[1]);
-            if (isVideoGen) {
-                chrome.storage.local.set({ capturedVideoGenBody: decoded.substring(0, 3000) });
-                console.log('[FLUXY] Captured YhhmEf (video gen) body:', decoded.substring(0, 200));
-                fetch('http://127.0.0.1:3000/api/debug-log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tag: 'YhhmEf', body: decoded.substring(0, 3000) }) }).catch(() => {});
-            } else {
-                chrome.storage.local.set({ capturedVideoPollBody: decoded.substring(0, 3000) });
-                console.log('[FLUXY] Captured jwpduf (video poll) body:', decoded.substring(0, 200));
-                fetch('http://127.0.0.1:3000/api/debug-log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tag: 'jwpduf', body: decoded.substring(0, 3000) }) }).catch(() => {});
-            }
-        } catch(e) { console.error('[FLUXY] video webRequest capture error:', e); }
-    },
-    { urls: ['https://flow.google.com/*'] },
-    ['requestBody']
-);
-
-// TEMP: Capture ogiZ0b POST body to find Nano Banana 2 Lite model code
-chrome.webRequest.onBeforeRequest.addListener(
-    (details) => {
-        if (details.method !== 'POST') return;
-        if (!details.url.includes('ogiZ0b')) return;
+        if (!details.url.includes('WuwhI') && !details.url.includes('ogiZ0b')) return;
         const raw = details.requestBody && details.requestBody.raw;
         if (!raw || !raw.length) return;
         try {
@@ -3848,3 +1693,371 @@ chrome.webRequest.onBeforeRequest.addListener(
     { urls: ['https://flow.google.com/*'] },
     ['requestBody']
 );
+
+// ══════════════════════════════════════════════════════════════
+// FLUXY AGENT BRIDGE — WebSocket kết nối Python agent port 9222
+// Handles: batch_rpc (batchexecute proxy), solve_captcha, api_request, trpc_request
+// ══════════════════════════════════════════════════════════════
+
+const FLUXY_AGENT_WS_URL = 'ws://127.0.0.1:9222';
+const FK_FLOW_URLS = ['https://flow.google.com/*', 'https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'];
+const FK_FLOW_TAB_URL = 'https://flow.google.com/';
+const FK_CAPTCHA_SLOT = '__CAPTCHA__';
+const FK_MAX_RPC_TEXT = 32000000;
+
+let fkWs = null;
+let fkFlowKey = null;
+let fkState = 'off';
+let fkManualDisconnect = false;
+let fkCallbackSecret = null;
+let fkMetrics = { requestCount: 0, successCount: 0, failedCount: 0, lastError: null, tokenCapturedAt: null };
+let fkRequestLog = [];
+
+chrome.storage.local.get(['fkFlowKey', 'fkMetrics'], (d) => {
+  if (d.fkFlowKey) fkFlowKey = d.fkFlowKey;
+  if (d.fkMetrics) Object.assign(fkMetrics, d.fkMetrics);
+  fkConnect();
+});
+
+function fkConnect() {
+  if (fkManualDisconnect) return;
+  if (fkWs?.readyState === WebSocket.CONNECTING || fkWs?.readyState === WebSocket.OPEN) return;
+  try {
+    fkWs = new WebSocket(FLUXY_AGENT_WS_URL);
+  } catch(e) { fkScheduleReconnect(); return; }
+  fkWs.onopen = () => {
+    console.log('[FluxyAgent] Connected to Python agent');
+    chrome.alarms.clear('fk-reconnect');
+    fkSetState('idle');
+    fkWs.send(JSON.stringify({
+      type: 'extension_ready', flowKeyPresent: !!fkFlowKey,
+      extensionVersion: chrome.runtime.getManifest().version, flowUrlSupported: true,
+      tokenAge: fkFlowKey && fkMetrics.tokenCapturedAt ? Date.now() - fkMetrics.tokenCapturedAt : null,
+    }));
+    if (fkFlowKey) fkWs.send(JSON.stringify({ type: 'token_captured', flowKey: fkFlowKey }));
+  };
+  fkWs.onmessage = async ({ data }) => {
+    try {
+      const msg = JSON.parse(data);
+      if      (msg.method === 'batch_rpc')     await fkHandleBatchRpc(msg);
+      else if (msg.method === 'api_request')   await fkHandleApiRequest(msg);
+      else if (msg.method === 'trpc_request')  await fkHandleTrpcRequest(msg);
+      else if (msg.method === 'solve_captcha') await fkHandleSolveCaptcha(msg);
+      else if (msg.method === 'get_status') {
+        fkSendToAgent({ id: msg.id, result: { state: fkState, flowKeyPresent: !!fkFlowKey, metrics: fkMetrics } });
+      } else if (msg.type === 'callback_secret') {
+        fkCallbackSecret = msg.secret;
+        chrome.storage.local.set({ fkCallbackSecret: msg.secret });
+      }
+    } catch(e) { console.error('[FluxyAgent] message error:', e); }
+  };
+  fkWs.onclose = () => { fkSetState('off'); if (!fkManualDisconnect) fkScheduleReconnect(); };
+  fkWs.onerror = () => { fkMetrics.lastError = 'WS_ERROR'; };
+}
+
+function fkScheduleReconnect() { chrome.alarms.create('fk-reconnect', { delayInMinutes: 0.083 }); }
+function fkSetState(s) { fkState = s; chrome.runtime.sendMessage({ type: 'FK_STATUS_PUSH' }).catch(() => {}); }
+
+function fkSendToAgent(msg) {
+  if (msg.id) {
+    fetch('http://127.0.0.1:8100/api/ext/callback', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(msg),
+    }).catch(() => { if (fkWs?.readyState === WebSocket.OPEN) fkWs.send(JSON.stringify(msg)); });
+    return;
+  }
+  if (fkWs?.readyState === WebSocket.OPEN) fkWs.send(JSON.stringify(msg));
+}
+
+function fkAddRequestLog(entry) {
+  fkRequestLog.unshift(entry);
+  if (fkRequestLog.length > 100) fkRequestLog.pop();
+  chrome.runtime.sendMessage({ type: 'REQUEST_LOG_UPDATE', log: fkRequestLog }).catch(() => {});
+}
+function fkUpdateRequestLog(id, updates) {
+  const entry = fkRequestLog.find(e => e.id === id);
+  if (entry) Object.assign(entry, updates);
+  chrome.runtime.sendMessage({ type: 'REQUEST_LOG_UPDATE', log: fkRequestLog }).catch(() => {});
+}
+
+// ─── reCAPTCHA ─────────────────────────────────────────────
+
+async function fkRequestCaptchaFromTab(tabId, requestId, pageAction) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, { type: 'GET_CAPTCHA', requestId, pageAction });
+  } catch(e) {
+    const msg = e?.message || '';
+    if (msg.includes('Receiving end does not exist') || msg.includes('Could not establish connection')) {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['fk_content.js'] });
+      await new Promise(r => setTimeout(r, 200));
+      return await chrome.tabs.sendMessage(tabId, { type: 'GET_CAPTCHA', requestId, pageAction });
+    }
+    throw e;
+  }
+}
+
+async function fkReviveTabIfNeeded(tab) {
+  if (!tab?.discarded) return tab;
+  try { await chrome.tabs.reload(tab.id); await new Promise(r => setTimeout(r, 2500)); return await chrome.tabs.get(tab.id); } catch { return null; }
+}
+
+async function fkSolveCaptcha(requestId, captchaAction) {
+  let tabs = await chrome.tabs.query({ url: FK_FLOW_URLS });
+  if (!tabs.length) {
+    try {
+      const opened = await chrome.tabs.create({ url: FK_FLOW_TAB_URL, active: false });
+      await new Promise(r => setTimeout(r, 3000));
+      tabs = [opened?.id ? await chrome.tabs.get(opened.id).catch(() => null) : null].filter(Boolean);
+    } catch(e) { return { error: e.message || 'NO_FLOW_TAB' }; }
+  }
+  const errors = [];
+  for (const candidate of tabs) {
+    const tab = await fkReviveTabIfNeeded(candidate);
+    if (!tab) continue;
+    try {
+      const resp = await Promise.race([
+        fkRequestCaptchaFromTab(tab.id, requestId, captchaAction),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
+      ]);
+      if (!resp?.token) { errors.push(resp?.error || 'NO_TOKEN'); continue; }
+      return resp;
+    } catch(e) {
+      errors.push(e?.message || '');
+    }
+  }
+  try {
+    const rt = await chrome.tabs.create({ url: FK_FLOW_TAB_URL, active: false });
+    await new Promise(r => setTimeout(r, 3000));
+    const target = await chrome.tabs.get(rt.id);
+    const result = await Promise.race([
+      fkRequestCaptchaFromTab(target.id, requestId, captchaAction),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
+    ]);
+    try { await chrome.tabs.remove(rt.id); } catch {}
+    return result;
+  } catch(e) { return { error: e?.message || errors[0] || 'NO_FLOW_TAB' }; }
+}
+
+async function fkHandleSolveCaptcha(msg) {
+  const { id, params } = msg;
+  const result = await fkSolveCaptcha(id, params?.captchaAction || 'VIDEO_GENERATION');
+  fkMetrics.requestCount++;
+  if (result?.token) fkMetrics.successCount++;
+  else { fkMetrics.failedCount++; fkMetrics.lastError = result?.error || 'NO_TOKEN'; }
+  chrome.storage.local.set({ fkMetrics });
+  fkSendToAgent({ id, result });
+}
+
+// ─── Batch RPC runner ──────────────────────────────────────
+
+async function fkRunBatchRpc(cmd) {
+  const tabs = await chrome.tabs.query({ url: FK_FLOW_URLS });
+  let candidate = tabs.find(t => !t.discarded) || tabs[0];
+  if (!candidate) {
+    try {
+      const opened = await chrome.tabs.create({ url: FK_FLOW_TAB_URL, active: false });
+      await new Promise(r => setTimeout(r, 5000));
+      candidate = opened?.id ? await chrome.tabs.get(opened.id).catch(() => null) : null;
+    } catch(e) { return { error: e?.message || 'NO_FLOW_TAB' }; }
+    if (!candidate) return { error: 'NO_FLOW_TAB' };
+  }
+  const tab = await fkReviveTabIfNeeded(candidate);
+  if (!tab) return { error: 'FLOW_TAB_DISCARDED' };
+
+  let freq = cmd.freq;
+  if (cmd.captchaAction) {
+    const solved = await fkSolveCaptcha(cmd.id, cmd.captchaAction);
+    if (!solved?.token) return { error: `CAPTCHA_FAILED: ${solved?.error || 'no token'}` };
+    freq = freq.split(FK_CAPTCHA_SLOT).join(solved.token);
+  }
+
+  const [injected] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id }, world: 'MAIN',
+    args: [cmd.rpcid, freq, FK_MAX_RPC_TEXT, cmd.match || null],
+    func: async (rpcid, freqStr, maxText, match) => {
+      const wiz = globalThis.WIZ_global_data || {};
+      const at = wiz.SNlM0e;
+      const sid = wiz.FdrFJe;
+      const bl = wiz.cfb2h;
+      if (!at) return { error: 'NO_AT_TOKEN' };
+      const reqid = Math.floor(Math.random() * 900000) + 100000;
+      const sourcePath = location.pathname || '/';
+      const hl = (document.documentElement.lang || navigator.language || 'en').split('-')[0];
+      const url = `/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=${encodeURIComponent(rpcid)}` +
+        `&source-path=${encodeURIComponent(sourcePath)}&bl=${encodeURIComponent(bl || '')}` +
+        `&f.sid=${encodeURIComponent(sid || '')}&hl=${encodeURIComponent(hl)}&_reqid=${reqid}&rt=c`;
+      const resp = await fetch(url, {
+        method: 'POST', credentials: 'include',
+        headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8', 'x-same-domain': '1' },
+        body: new URLSearchParams({ 'f.req': freqStr, at }),
+      });
+      const text = await resp.text();
+      if (match) {
+        const found = text.indexOf(match);
+        return { status: resp.status, matched: found !== -1, text: found === -1 ? '' : text.slice(found, found + 800) };
+      }
+      return { status: resp.status, text: text.slice(0, maxText) };
+    },
+  });
+
+  return injected?.result || { error: 'NO_INJECTION_RESULT' };
+}
+
+const FK_RPC_LABELS = { ogiZ0b:'Gen Image', eb1hJf:'Gen Video', YhhmEf:'Gen Video (text)', nprQif:'Gen Video (chain)', MZZa6b:'Gen Video (refs)', maseQ:'Upload Image', SPrCad:'Upscale Image', jHPbke:'Create Project', jwpduf:'Poll Operation', Zzl0ze:'Project Media', as29s:'Get Media' };
+
+async function fkHandleBatchRpc(msg) {
+  const { id, params } = msg;
+  const { rpcid, freq, captchaAction, match } = params || {};
+  if (!rpcid || !freq) { fkSendToAgent({ id, status: 400, error: 'INVALID_BATCH_RPC' }); return; }
+  fkSetState('running');
+  const hasCaptcha = !!captchaAction;
+  if (hasCaptcha) {
+    fkMetrics.requestCount++;
+    fkAddRequestLog({ id, type: FK_RPC_LABELS[rpcid] || `RPC:${rpcid}`, time: new Date().toISOString(), status: 'processing', error: null, url: rpcid, payloadSummary: freq.slice(0, 200) });
+  }
+  try {
+    const out = await fkRunBatchRpc({ id, rpcid, freq, captchaAction, match });
+    if (out.error) {
+      if (hasCaptcha) { fkMetrics.failedCount++; fkMetrics.lastError = out.error; fkUpdateRequestLog(id, { status: 'failed', error: out.error }); }
+      fkSendToAgent({ id, status: 502, error: out.error });
+    } else {
+      if (hasCaptcha) { fkMetrics.successCount++; fkMetrics.lastError = null; fkUpdateRequestLog(id, { status: 'success', httpStatus: out.status, responseSummary: (out.text || '').slice(0, 300) }); }
+      fkSendToAgent({ id, status: out.status, data: out.text });
+    }
+  } catch(e) {
+    const err = e?.message || 'BATCH_RPC_FAILED';
+    if (hasCaptcha) { fkMetrics.failedCount++; fkMetrics.lastError = err; fkUpdateRequestLog(id, { status: 'failed', error: err }); }
+    fkSendToAgent({ id, status: 500, error: err });
+  }
+  chrome.storage.local.set({ fkMetrics });
+  fkSetState('idle');
+}
+
+async function fkHandleTrpcRequest(msg) {
+  const { id, params } = msg;
+  const { url, method = 'POST', headers = {}, body, responseMode = 'json' } = params;
+  if (!url || !url.startsWith('https://labs.google/')) { fkSendToAgent({ id, error: 'INVALID_TRPC_URL' }); return; }
+  fkSetState('running');
+  const fetchHeaders = { 'Content-Type': 'application/json', ...headers };
+  if (fkFlowKey) fetchHeaders['authorization'] = `Bearer ${fkFlowKey}`;
+  try {
+    const resp = await fetch(url, { method, headers: fetchHeaders, body: body ? JSON.stringify(body) : undefined, credentials: 'include' });
+    let data;
+    if (responseMode === 'url') { data = { url: resp.url, contentType: resp.headers.get('content-type') }; await resp.body?.cancel(); }
+    else { data = await resp.json(); }
+    fkSendToAgent({ id, status: resp.status, data });
+  } catch(e) { fkSendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' }); }
+  fkSetState('idle');
+}
+
+async function fkHandleApiRequest(msg) {
+  const { id, params } = msg;
+  const { url, method, headers, body, captchaAction } = params;
+  if (!url || !url.startsWith('https://aisandbox-pa.googleapis.com/')) { fkSendToAgent({ id, error: 'INVALID_URL' }); return; }
+  fkSetState('running');
+  const hasCaptcha = !!captchaAction;
+  if (hasCaptcha) fkMetrics.requestCount++;
+  try {
+    let captchaToken = null;
+    if (captchaAction) {
+      const cr = await fkSolveCaptcha(id, captchaAction);
+      captchaToken = cr?.token || null;
+      if (!captchaToken) {
+        const err = cr?.error || 'CAPTCHA_FAILED';
+        if (hasCaptcha) { fkMetrics.failedCount++; fkMetrics.lastError = `CAPTCHA_FAILED: ${err}`; }
+        chrome.storage.local.set({ fkMetrics });
+        fkSendToAgent({ id, status: 403, error: `CAPTCHA_FAILED: ${err}` });
+        fkSetState('idle'); return;
+      }
+    }
+    let finalBody = body;
+    if (captchaToken && finalBody) {
+      finalBody = JSON.parse(JSON.stringify(finalBody));
+      if (finalBody.clientContext?.recaptchaContext) finalBody.clientContext.recaptchaContext.token = captchaToken;
+      if (finalBody.requests) for (const req of finalBody.requests) { if (req.clientContext?.recaptchaContext) req.clientContext.recaptchaContext.token = captchaToken; }
+    }
+    const fetchHeaders = { ...(headers || {}) };
+    if (fkFlowKey) fetchHeaders['authorization'] = `Bearer ${fkFlowKey}`;
+    const response = await fetch(url, { method: method || 'POST', headers: fetchHeaders, credentials: 'include', body: method === 'GET' ? undefined : JSON.stringify(finalBody) });
+    const responseText = await response.text();
+    let responseData;
+    try { responseData = JSON.parse(responseText); } catch { responseData = responseText; }
+    fkSendToAgent({ id, status: response.status, data: responseData });
+    if (hasCaptcha) { if (response.ok) fkMetrics.successCount++; else { fkMetrics.failedCount++; fkMetrics.lastError = `API_${response.status}`; } }
+  } catch(e) {
+    fkSendToAgent({ id, status: 500, error: e.message || 'API_REQUEST_FAILED' });
+    if (hasCaptcha) { fkMetrics.failedCount++; fkMetrics.lastError = e.message; }
+  }
+  chrome.storage.local.set({ fkMetrics });
+  fkSetState('idle');
+}
+
+// ─── Message handlers for FlowKit bridge ───────────────────
+
+chrome.runtime.onMessage.addListener((msg, _, reply) => {
+  if (msg.type === 'FK_STATUS') {
+    reply({ connected: fkWs?.readyState === WebSocket.OPEN, flowKeyPresent: !!fkFlowKey, state: fkState, metrics: fkMetrics });
+    return true;
+  }
+  if (msg.type === 'REQUEST_LOG') {
+    reply({ log: fkRequestLog });
+    return true;
+  }
+  if (msg.type === 'OPEN_FLOW_TAB') {
+    chrome.tabs.query({ url: FK_FLOW_URLS }).then(tabs => {
+      if (tabs.length) { chrome.tabs.update(tabs[0].id, { active: true }); reply({ ok: true, tabId: tabs[0].id }); }
+      else chrome.tabs.create({ url: FK_FLOW_TAB_URL }).then(tab => reply({ ok: true, tabId: tab.id })).catch(e => reply({ error: e.message }));
+    }).catch(e => reply({ error: e.message }));
+    return true;
+  }
+  if (msg.type === 'TRPC_MEDIA_URLS') {
+    if (fkWs?.readyState === WebSocket.OPEN) {
+      try {
+        const urlRegex = /https:\/\/storage\.googleapis\.com\/ai-sandbox-videofx\/(?:image|video)\/[0-9a-f-]{36}\?[^"'\s]+/g;
+        const matches = (msg.body || '').match(urlRegex) || [];
+        const urlMap = {};
+        for (const rawUrl of matches) {
+          const url = rawUrl.replace(/\\u0026/g, '&').replace(/\\/g, '');
+          const m = url.match(/\/(image|video)\/([0-9a-f-]{36})\?/);
+          if (m) urlMap[m[2]] = { mediaType: m[1], url, mediaId: m[2] };
+        }
+        const entries = Object.values(urlMap);
+        if (entries.length) fkWs.send(JSON.stringify({ type: 'media_urls_refresh', urls: entries }));
+      } catch {}
+    }
+    reply({ ok: true });
+    return true;
+  }
+});
+
+// ─── Bearer token capture (flow.google.com) ────────────────
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    if (!details?.requestHeaders?.length) return;
+    const authHeader = details.requestHeaders.find(h => h.name?.toLowerCase() === 'authorization');
+    const value = authHeader?.value || '';
+    if (!value.startsWith('Bearer ya29.')) return;
+    const token = value.replace(/^Bearer\s+/i, '').trim();
+    if (!token) return;
+    fkFlowKey = token;
+    fkMetrics.tokenCapturedAt = Date.now();
+    chrome.storage.local.set({ fkFlowKey, fkMetrics });
+    if (fkWs?.readyState === WebSocket.OPEN) fkWs.send(JSON.stringify({ type: 'token_captured', flowKey: fkFlowKey }));
+  },
+  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*'] },
+  ['requestHeaders', 'extraHeaders']
+);
+
+// ─── Alarm handlers for FlowKit bridge ────────────────────
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'fk-reconnect') fkConnect();
+  if (alarm.name === 'fk-keepAlive') {
+    if (fkWs?.readyState === WebSocket.OPEN) fkWs.send(JSON.stringify({ type: 'ping' }));
+    else fkConnect();
+  }
+});
+
+chrome.alarms.create('fk-keepAlive', { periodInMinutes: 0.4 });
+
+console.log('[FluxyAgent] FlowKit bridge loaded v5.71');

@@ -17,7 +17,6 @@ async function geminiGenerate(apiKeys, systemInstruction, contentParts, maxToken
         config: {
           systemInstruction: systemInstruction || undefined,
           maxOutputTokens: maxTokens,
-          ...(useModel === 'gemini-2.5-flash' ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
         }
       });
     } catch (err) {

@@ -76,7 +76,7 @@ const SUBTITLE_LANGUAGES = [
   { code: 'et', name: 'Eesti (Tiếng Estonia)' },
 ];
 
-async function smartTranslateSRT(srtContent, tLang, apiKeys, logFn, model = 'gemini-2.5-flash', mode = 'normal') {
+async function smartTranslateSRT(srtContent, tLang, apiKeys, logFn, model = 'gemini-3.5-flash', mode = 'normal') {
   const langObj = SUBTITLE_LANGUAGES.find(l => l.code === tLang);
   const langName = langObj?.name || tLang;
   const countryMap = { vi:'Việt Nam', en:'Anh/Mỹ', zh:'Trung Quốc', ja:'Nhật Bản', ko:'Hàn Quốc', th:'Thái Lan', id:'Indonesia', ms:'Malaysia', fr:'Pháp', de:'Đức', es:'Tây Ban Nha', pt:'Bồ Đào Nha', it:'Ý', ru:'Nga', ar:'Ả Rập', hi:'Ấn Độ' };
@@ -2427,39 +2427,52 @@ function VideoCleanerPanel({ initialTab } = {}) {
       };
 
       try {
-        const totalOutputs = mode === 'multi' ? Math.max(1, multiCount) : 1;
-        let cachedLogoRegions = null, cachedImgW = null, cachedImgH = null;
-
-        for (let vi = 0; vi < totalOutputs; vi++) {
-          if (biliBatchStopRef.current) break;
-          const profile = totalOutputs > 1 ? MULTI_PROFILES[vi % MULTI_PROFILES.length] : {};
-          const varFolder = totalOutputs > 1 ? `${subFolder}\\Ban_${String(vi+1).padStart(2,'0')}` : subFolder;
-          if (totalOutputs > 1) await window.electronAPI?.createFolder?.(varFolder);
-          const outputFileName = `${nameNoExt.slice(0, 50)}_reup.mp4`;
-          if (totalOutputs > 1) addBiliLog(`  🎬 Bản ${vi+1}/${totalOutputs}...`, 'info');
-
-          const params = {
-            ...buildRecreateParams(videoPath, varFolder),
-            ...profile,
-            outputFileName,
-            ...(cachedLogoRegions !== null && {
-              preDetectedLogoRegions: cachedLogoRegions,
-              preDetectedImgW: cachedImgW,
-              preDetectedImgH: cachedImgH,
-            }),
-          };
-          const res = await window.electronAPI.videoRecreate(params);
-          if (vi === 0 && res?.logoRegions !== undefined) {
-            cachedLogoRegions = res.logoRegions;
-            cachedImgW = res.detectedImgW ?? null;
-            cachedImgH = res.detectedImgH ?? null;
+        if (mode === 'review') {
+          // Review Phim: transcribe → dịch → TTS → recreate → mix audio (dùng cài đặt Review Phim)
+          setBiliBatchProgress(p => ({ ...p, step: 'review' }));
+          addBiliLog(`🎬 [Review Phim] Bắt đầu pipeline...`, 'info');
+          const rfPaths = await runReviewFilm(videoPath, subFolder);
+          if (Array.isArray(rfPaths)) {
+            rfPaths.forEach((p, ri) => { if (p) donePaths.push(p); });
+            for (let ri = 0; ri < rfPaths.length; ri++) {
+              if (rfPaths[ri]) await processVariantSeoThumb(rfPaths[ri], ri, rfPaths.length, subFolder);
+            }
           }
-          if (res?.ok) {
-            addBiliLog(`✅ Bản ${vi+1}: ${res.path?.split(/[/\\]/).pop()}`, 'success');
-            donePaths.push(res.path);
-            await processVariantSeoThumb(res.path, vi, totalOutputs, varFolder);
-          } else {
-            addBiliLog(`❌ Bản ${vi+1} lỗi: ${res?.error || ''}`, 'error');
+        } else {
+          const totalOutputs = mode === 'multi' ? Math.max(1, multiCount) : 1;
+          let cachedLogoRegions = null, cachedImgW = null, cachedImgH = null;
+
+          for (let vi = 0; vi < totalOutputs; vi++) {
+            if (biliBatchStopRef.current) break;
+            const profile = totalOutputs > 1 ? MULTI_PROFILES[vi % MULTI_PROFILES.length] : {};
+            const varFolder = totalOutputs > 1 ? `${subFolder}\\Ban_${String(vi+1).padStart(2,'0')}` : subFolder;
+            if (totalOutputs > 1) await window.electronAPI?.createFolder?.(varFolder);
+            const outputFileName = `${nameNoExt.slice(0, 50)}_reup.mp4`;
+            if (totalOutputs > 1) addBiliLog(`  🎬 Bản ${vi+1}/${totalOutputs}...`, 'info');
+
+            const params = {
+              ...buildRecreateParams(videoPath, varFolder),
+              ...profile,
+              outputFileName,
+              ...(cachedLogoRegions !== null && {
+                preDetectedLogoRegions: cachedLogoRegions,
+                preDetectedImgW: cachedImgW,
+                preDetectedImgH: cachedImgH,
+              }),
+            };
+            const res = await window.electronAPI.videoRecreate(params);
+            if (vi === 0 && res?.logoRegions !== undefined) {
+              cachedLogoRegions = res.logoRegions;
+              cachedImgW = res.detectedImgW ?? null;
+              cachedImgH = res.detectedImgH ?? null;
+            }
+            if (res?.ok) {
+              addBiliLog(`✅ Bản ${vi+1}: ${res.path?.split(/[/\\]/).pop()}`, 'success');
+              donePaths.push(res.path);
+              await processVariantSeoThumb(res.path, vi, totalOutputs, varFolder);
+            } else {
+              addBiliLog(`❌ Bản ${vi+1} lỗi: ${res?.error || ''}`, 'error');
+            }
           }
         }
       } catch (e) { addBiliLog(`❌ Pipeline lỗi: ${e.message}`, 'error'); }
@@ -2921,6 +2934,13 @@ function VideoCleanerPanel({ initialTab } = {}) {
             randomFps={randomFps} setRandomFps={setRandomFps}
             randomPosCrop={randomPosCrop} setRandomPosCrop={setRandomPosCrop}
             audioEQ={audioEQ} setAudioEQ={setAudioEQ}
+            rfTtsEngine={rfTtsEngine} setRfTtsEngine={setRfTtsEngine}
+            rfEdgeVoice={rfEdgeVoice} setRfEdgeVoice={setRfEdgeVoice} rfEdgeVoices={rfEdgeVoices}
+            rfVieNeuVoice={rfVieNeuVoice} setRfVieNeuVoice={setRfVieNeuVoice} rfVieNeuVoices={rfVieNeuVoices}
+            rfGeminiVoice={rfGeminiVoice} setRfGeminiVoice={setRfGeminiVoice}
+            rfVoiceVol={rfVoiceVol} setRfVoiceVol={setRfVoiceVol}
+            rfTargetCode={rfTargetCode} setRfTargetCode={setRfTargetCode}
+            rfTargetLang={rfTargetLang} setRfTargetLang={setRfTargetLang}
           />
         </div>
       )}
@@ -4282,6 +4302,14 @@ function BilibiliReupPanel({ onStartBatch, onStopBatch, pausedQueue, onClearPaus
   randomFps, setRandomFps,
   randomPosCrop, setRandomPosCrop,
   audioEQ, setAudioEQ,
+  // Review Phim TTS props
+  rfTtsEngine, setRfTtsEngine,
+  rfEdgeVoice, setRfEdgeVoice, rfEdgeVoices,
+  rfVieNeuVoice, setRfVieNeuVoice, rfVieNeuVoices,
+  rfGeminiVoice, setRfGeminiVoice,
+  rfVoiceVol, setRfVoiceVol,
+  rfTargetCode, setRfTargetCode,
+  rfTargetLang, setRfTargetLang,
 }) {
 
   // Search state
@@ -4496,7 +4524,7 @@ function BilibiliReupPanel({ onStartBatch, onStopBatch, pausedQueue, onClearPaus
             {/* Quick info */}
             <div className="border-t border-slate-700/50 px-3 py-2 shrink-0 flex items-center justify-between">
               <span className="text-[10px] text-slate-500">
-                Chế độ: <span className="text-pink-400 font-bold">{mode === 'single' ? '🔄 Single' : '📦 Multi bản'}</span>
+                Chế độ: <span className="text-pink-400 font-bold">{mode === 'single' ? '🔄 Single' : mode === 'review' ? '🎬 Review Phim' : '📦 Multi bản'}</span>
               </span>
               <button onClick={() => setView('settings')} className="text-[10px] text-slate-400 hover:text-white underline">Cài đặt ›</button>
             </div>
@@ -4512,7 +4540,7 @@ function BilibiliReupPanel({ onStartBatch, onStopBatch, pausedQueue, onClearPaus
               <div>
                 <div className="text-[10px] text-slate-500 mb-1 uppercase tracking-wide">Chế độ reup</div>
                 <div className="flex gap-1.5">
-                  {[['single','🔄 Single','Tái tạo 1 bản duy nhất'],['multi','📦 Multi bản','Xuất nhiều bản biến thể']].map(([id,label,desc]) => (
+                  {[['single','🔄 Single','Tái tạo 1 bản duy nhất'],['multi','📦 Multi bản','Xuất nhiều bản biến thể'],['review','🎬 Review Phim','Lồng tiếng TTS thay audio gốc']].map(([id,label,desc]) => (
                     <button key={id} onClick={() => setMode(id)} title={desc}
                       className={`flex-1 py-1.5 rounded text-[10px] font-black transition-all ${mode === id ? 'bg-pink-600 text-white shadow-md' : 'bg-slate-800 text-slate-400 hover:text-white border border-slate-700/40'}`}>
                       {label}
@@ -4522,6 +4550,7 @@ function BilibiliReupPanel({ onStartBatch, onStopBatch, pausedQueue, onClearPaus
                 <div className="text-[10px] text-slate-500 mt-1 italic">
                   {mode === 'single' && '↳ Tái tạo 1 bản duy nhất — né ContentID, SEO tự động'}
                   {mode === 'multi'  && '↳ Tạo nhiều bản biến thể khác nhau từ 1 video gốc'}
+                  {mode === 'review' && '↳ Transcribe → Dịch → TTS → Recreate → Mix audio (Review Phim)'}
                 </div>
               </div>
               {mode === 'multi' && (
@@ -4531,6 +4560,66 @@ function BilibiliReupPanel({ onStartBatch, onStopBatch, pausedQueue, onClearPaus
                   <span className="text-[11px] text-orange-400 font-black w-5 text-center">{multiCount}</span>
                 </div>
               )}
+
+              {/* Review Phim TTS Settings */}
+              {mode === 'review' && (
+                <div className="flex flex-col gap-2 bg-purple-950/30 border border-purple-700/30 rounded-lg px-2 py-2">
+                  <div className="text-[10px] font-black text-purple-300 uppercase tracking-wide">🎬 Cài đặt Review Phim (TTS)</div>
+                  {/* Target Lang */}
+                  <div>
+                    <div className="text-[10px] text-slate-400 mb-1">Ngôn ngữ lồng tiếng:</div>
+                    <div className="flex gap-1 flex-wrap">
+                      {[['vi','🇻🇳 Việt'],['en','🇺🇸 Anh'],['zh','🇨🇳 Trung'],['ja','🇯🇵 Nhật'],['ko','🇰🇷 Hàn']].map(([code,label]) => (
+                        <button key={code} onClick={() => { setRfTargetCode?.(code); setRfTargetLang?.(code); }}
+                          className={`px-2 py-0.5 rounded text-[10px] font-semibold transition-all ${rfTargetCode === code ? 'bg-purple-600 text-white' : 'bg-slate-700/60 text-slate-400 hover:bg-slate-600'}`}>
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  {/* TTS Engine */}
+                  <div>
+                    <div className="text-[10px] text-slate-400 mb-1">Engine TTS:</div>
+                    <div className="flex gap-1">
+                      {['auto','vieneu','edge','gemini'].map(v => (
+                        <button key={v} onClick={() => setRfTtsEngine?.(v)}
+                          className={`flex-1 py-0.5 rounded text-[9px] font-bold transition-all ${rfTtsEngine === v ? 'bg-purple-600 text-white' : 'bg-slate-700/60 text-slate-400 hover:bg-slate-600'}`}>
+                          {v === 'auto' ? '🤖 Auto' : v === 'vieneu' ? '🇻🇳 VieNeu' : v === 'gemini' ? '✨ Gemini' : '⚡ Edge'}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  {/* Voice picker */}
+                  {(rfTtsEngine === 'auto' ? (rfTargetCode === 'vi' ? 'vieneu' : 'edge') : rfTtsEngine) === 'vieneu' && rfVieNeuVoices?.length > 0 && (
+                    <select value={rfVieNeuVoice} onChange={e => setRfVieNeuVoice?.(e.target.value)}
+                      className="w-full bg-[#131929] border border-slate-600/50 rounded px-2 py-1 text-[10px] text-white focus:outline-none focus:border-purple-500">
+                      {rfVieNeuVoices.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                    </select>
+                  )}
+                  {(rfTtsEngine === 'auto' ? (rfTargetCode === 'vi' ? 'vieneu' : 'edge') : rfTtsEngine) === 'edge' && rfEdgeVoices?.length > 0 && (
+                    <select value={rfEdgeVoice} onChange={e => setRfEdgeVoice?.(e.target.value)}
+                      className="w-full bg-[#131929] border border-slate-600/50 rounded px-2 py-1 text-[10px] text-white focus:outline-none focus:border-purple-500">
+                      {rfEdgeVoices.filter(v => (v.Locale||v.ShortName||'').toLowerCase().startsWith(rfTargetCode+'-')).map(v => (
+                        <option key={v.ShortName} value={v.ShortName}>{v.FriendlyName || v.ShortName}</option>
+                      ))}
+                    </select>
+                  )}
+                  {rfTtsEngine === 'gemini' && (
+                    <select value={rfGeminiVoice} onChange={e => setRfGeminiVoice?.(e.target.value)}
+                      className="w-full bg-[#131929] border border-slate-600/50 rounded px-2 py-1 text-[10px] text-white focus:outline-none focus:border-purple-500">
+                      {['Aoede','Charon','Fenrir','Kore','Puck','Schedar','Orus','Leda'].map(v => <option key={v}>{v}</option>)}
+                    </select>
+                  )}
+                  {/* Voice Volume */}
+                  <div>
+                    <div className="text-[10px] text-slate-400 mb-1">🎙 Âm lượng TTS: <span className="text-purple-400 font-bold">{rfVoiceVol ?? 120}%</span></div>
+                    <input type="range" min={80} max={150} step={5} value={rfVoiceVol ?? 120}
+                      onChange={e => setRfVoiceVol?.(+e.target.value)} className="w-full accent-purple-500" />
+                  </div>
+                  <div className="text-[9px] text-slate-500 italic">↳ Dùng chung cài đặt Review Phim ở tab YouTube Reup</div>
+                </div>
+              )}
+
               {/* Trim */}
               <div className="grid grid-cols-2 gap-2">
                 <div>
@@ -4808,7 +4897,7 @@ function BilibiliReupPanel({ onStartBatch, onStopBatch, pausedQueue, onClearPaus
                 <div className="text-[10px] text-slate-500 uppercase tracking-widest mb-2 font-bold">⚙️ Cấu hình Pipeline</div>
                 <div className="bg-[#0d1221] border border-slate-700/40 rounded-xl p-3 space-y-1.5">
                   {[
-                    ['Chế độ', mode === 'single' ? '🔄 Single' : `📦 Multi (${multiCount} bản)`],
+                    ['Chế độ', mode === 'single' ? '🔄 Single' : mode === 'review' ? '🎬 Review Phim' : `📦 Multi (${multiCount} bản)`],
                     ['Độ phân giải', outputResolution === 'source' ? 'Gốc' : outputResolution || 'Gốc'],
                     ['Ngôn ngữ SEO', {'vi':'🇻🇳 Tiếng Việt','en':'🇺🇸 Tiếng Anh','zh':'🇨🇳 Tiếng Trung','ja':'🇯🇵 Tiếng Nhật','ko':'🇰🇷 Tiếng Hàn','th':'🇹🇭 Tiếng Thái','id':'🇮🇩 Tiếng Indo'}[seoLang] || seoLang],
                     (trimStart > 0 || trimEnd > 0) && ['Cắt video', `✂ đầu ${trimStart}s · cuối ${trimEnd}s`],

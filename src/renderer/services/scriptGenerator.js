@@ -24,7 +24,7 @@ async function geminiChatRotating(apiKeys, prompt, maxTokens, onSwitch) {
     const response = await ai.models.generateContent({
       model: GEMINI_MODEL,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } },
+      config: { maxOutputTokens: maxTokens },
     });
     const candidate = response?.candidates?.[0];
     if (candidate?.finishReason === 'SAFETY') throw new Error('Nội dung bị chặn do chính sách an toàn.');

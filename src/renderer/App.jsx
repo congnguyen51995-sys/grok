@@ -5,8 +5,13 @@ class ErrorBoundary extends Component {
   static getDerivedStateFromError(e) { return { error: e }; }
   render() {
     if (this.state.error) return (
-      <div style={{padding:32,color:'#f87171',fontFamily:'monospace',whiteSpace:'pre-wrap'}}>
-        <b>⚠️ Lỗi render:</b>{'\n'}{this.state.error.message}{'\n\n'}{this.state.error.stack}
+      <div style={{padding:32,color:'#f87171',fontFamily:'monospace',whiteSpace:'pre-wrap',background:'#0f1117',minHeight:'200px',borderRadius:'8px',margin:'8px',border:'1px solid #f8717144'}}>
+        <b style={{fontSize:'16px'}}>⚠️ Lỗi render component</b>{'\n\n'}
+        <span style={{color:'#fbbf24'}}>{this.state.error.message}</span>{'\n\n'}
+        <span style={{fontSize:'11px',color:'#94a3b8'}}>{this.state.error.stack}</span>
+        <div style={{marginTop:16}}>
+          <button onClick={()=>this.setState({error:null})} style={{background:'#3b82f6',color:'white',border:'none',padding:'6px 14px',borderRadius:'6px',cursor:'pointer',fontFamily:'sans-serif'}}>Thử lại</button>
+        </div>
       </div>
     );
     return this.props.children;
@@ -24,21 +29,22 @@ import VoiceStudio from './components/VoiceStudio'
 import VideoStudio from './components/VideoStudio'
 import CapCutEditor from './components/CapCutEditor'
 import VeoStudio from './components/VeoStudio'
+import FlowKitPanel from './components/FlowKitPanel'
 import CreatorStudio from './components/CreatorStudio'
-import AutoAnimation from './components/AutoAnimation'
-import DramaStudio from './components/DramaStudio'
+
 import ReupVideo from './components/ReupVideo'
 import AudioStoryPanel from './components/AudioStoryPanel'
+import HorrorStoryPanel from './components/HorrorStoryPanel'
+import HongguoPanel from './components/HongguoPanel'
 import RemotionStudio from './components/RemotionStudio'
 import AIVideoRemixer from './components/AIVideoRemixer'
+import EyesChallengePanel from './components/EyesChallengePanel'
+import FacebookAutoPost from './components/FacebookAutoPost'
+import TikTokAutoPost from './components/TikTokAutoPost'
 import Settings from './components/Settings'
 
 const MODES = [
   { value: 'TEXT_TO_IMAGE',  label: 'Text to Image',      short: 'T2I' },
-  { value: 'TEXT_TO_VIDEO',  label: 'Text to Video',      short: 'T2V' },
-  { value: 'IMAGE_TO_VIDEO', label: 'Image to Video',     short: 'I2V' },
-  { value: 'REF_TO_VIDEO',   label: 'Reference to Video', short: 'R2V' },
-  { value: 'VIDEO_EXTEND',   label: 'Video Extend',       short: 'VE'  },
 ]
 
 const MODE_FILE_TYPE = {
@@ -51,7 +57,7 @@ const ASPECT_RATIOS = ['1:1', '2:3', '3:2', '9:16', '16:9']
 const QUALITY_OPTIONS = ['480p', '720p']
 
 const DEFAULT_PROFILES = [
-  { id: 1, name: 'Profile 1', mode: 'TEXT_TO_VIDEO', aspectRatio: '9:16', quality: '720p', duration: 6, concurrency: 5 },
+  { id: 1, name: 'Profile 1', mode: 'TEXT_TO_IMAGE', aspectRatio: '9:16', quality: '720p', duration: 6, concurrency: 5 },
   { id: 2, name: 'Profile 2', mode: 'TEXT_TO_IMAGE', aspectRatio: '1:1',  quality: '720p', duration: 6, concurrency: 5  },
 ]
 
@@ -156,14 +162,12 @@ const NAV_GROUPS = [
     ],
   },
   {
-    id: 'video-ai', label: '🎬 Tạo Video AI',
+    id: 'video-ai', label: '🎬 Tạo ảnh AI',
     activeCls: 'bg-orange-600 text-white shadow-lg shadow-orange-900/40',
     inactiveCls: 'bg-orange-900/30 text-orange-300 hover:bg-orange-700 hover:text-white border border-orange-700/40',
     tabs: [
-      { id: 'veo',     label: 'Veo Studio',     emoji: '🎬', activeCls: 'bg-orange-600 text-white', inactiveCls: 'bg-orange-900/40 text-orange-300 hover:bg-orange-600/70 hover:text-white border border-orange-700/40' },
-      { id: 'auto',    label: 'Auto Animation', emoji: '⚡', activeCls: 'bg-purple-600 text-white', inactiveCls: 'bg-purple-900/40 text-purple-300 hover:bg-purple-600/70 hover:text-white border border-purple-700/40' },
-      { id: 'grok',    label: 'Grok Queue',     emoji: '🚀', activeCls: 'bg-sky-600 text-white',      inactiveCls: 'bg-sky-900/40 text-sky-300 hover:bg-sky-600/70 hover:text-white border border-sky-700/40' },
-      { id: 'drama',   label: 'Drama AI',       emoji: '🎭', activeCls: 'bg-emerald-600 text-white',  inactiveCls: 'bg-emerald-900/40 text-emerald-300 hover:bg-emerald-600/70 hover:text-white border border-emerald-700/40' },
+      { id: 'veo',     label: 'Veo Studio',  emoji: '🎬', activeCls: 'bg-orange-600 text-white', inactiveCls: 'bg-orange-900/40 text-orange-300 hover:bg-orange-600/70 hover:text-white border border-orange-700/40' },
+      { id: 'flowkit', label: 'Flow Kit',    emoji: '🤖', activeCls: 'bg-orange-600 text-white', inactiveCls: 'bg-orange-900/40 text-orange-300 hover:bg-orange-600/70 hover:text-white border border-orange-700/40' },
     ],
   },
   {
@@ -174,6 +178,8 @@ const NAV_GROUPS = [
       { id: 'reup',         label: 'Reup Video',  emoji: '🎥', activeCls: 'bg-rose-600 text-white',   inactiveCls: 'bg-rose-900/40 text-rose-300 hover:bg-rose-600/70 hover:text-white border border-rose-700/40' },
       { id: 'reup-taitao',  label: 'Tái Tạo',    emoji: '🎬', activeCls: 'bg-orange-600 text-white', inactiveCls: 'bg-orange-900/40 text-orange-300 hover:bg-orange-600/70 hover:text-white border border-orange-700/40' },
       { id: 'mc-studio',    label: 'Truyện Audio', emoji: '🎙️', activeCls: 'bg-pink-600 text-white',   inactiveCls: 'bg-pink-900/40 text-pink-300 hover:bg-pink-600/70 hover:text-white border border-pink-700/40' },
+      { id: 'horror-story', label: 'Truyện Ma',  emoji: '👻', activeCls: 'bg-violet-700 text-white',  inactiveCls: 'bg-violet-900/40 text-violet-300 hover:bg-violet-700/70 hover:text-white border border-violet-700/40' },
+      { id: 'hongguo',      label: 'Hongguo',     emoji: '🍎', activeCls: 'bg-red-700 text-white',     inactiveCls: 'bg-red-900/40 text-red-300 hover:bg-red-700/70 hover:text-white border border-red-700/40' },
     ],
   },
   {
@@ -183,6 +189,23 @@ const NAV_GROUPS = [
     tabs: [
       { id: 'video',    label: 'Video Editor',    emoji: '🎞️', activeCls: 'bg-teal-600 text-white',   inactiveCls: 'bg-teal-900/40 text-teal-300 hover:bg-teal-600/70 hover:text-white border border-teal-700/40' },
       { id: 'remotion', label: 'Remotion Studio', emoji: '🎬', activeCls: 'bg-violet-600 text-white', inactiveCls: 'bg-violet-900/40 text-violet-300 hover:bg-violet-600/70 hover:text-white border border-violet-700/40' },
+    ],
+  },
+  {
+    id: 'viral-game', label: '🎮 Viral Game',
+    activeCls: 'bg-fuchsia-600 text-white shadow-lg shadow-fuchsia-900/40',
+    inactiveCls: 'bg-fuchsia-900/30 text-fuchsia-300 hover:bg-fuchsia-700 hover:text-white border border-fuchsia-700/40',
+    tabs: [
+      { id: 'eyes-challenge', label: 'Eyes Challenge', emoji: '👁️', activeCls: 'bg-fuchsia-600 text-white', inactiveCls: 'bg-fuchsia-900/40 text-fuchsia-300 hover:bg-fuchsia-600/70 hover:text-white border border-fuchsia-700/40' },
+    ],
+  },
+  {
+    id: 'social-post', label: '📱 Đăng Bài',
+    activeCls: 'bg-blue-600 text-white shadow-lg shadow-blue-900/40',
+    inactiveCls: 'bg-blue-900/30 text-blue-300 hover:bg-blue-700 hover:text-white border border-blue-700/40',
+    tabs: [
+      { id: 'fb-auto-post',      label: 'Facebook',  emoji: '📘', activeCls: 'bg-blue-600 text-white',  inactiveCls: 'bg-blue-900/40 text-blue-300 hover:bg-blue-600/70 hover:text-white border border-blue-700/40' },
+      { id: 'tiktok-auto-post',  label: 'TikTok',    emoji: '🎵', activeCls: 'bg-pink-600 text-white',  inactiveCls: 'bg-pink-900/40 text-pink-300 hover:bg-pink-600/70 hover:text-white border border-pink-700/40' },
     ],
   },
   {
@@ -203,8 +226,17 @@ function getGroupByTab(tabId) {
 }
 
 export default function App({ onLicenseExpired }) {
-  const [currentTab, setCurrentTab] = useState(() => localStorage.getItem('fluxy_last_tab') || 'ai-remixer')
-  const [mainGroup,  setMainGroup]  = useState(() => getGroupByTab(localStorage.getItem('fluxy_last_tab') || 'ai-remixer').id)
+  const [currentTab, setCurrentTab] = useState(() => {
+    const saved = localStorage.getItem('fluxy_last_tab') || 'ai-remixer';
+    const allTabs = NAV_GROUPS.flatMap(g => g.tabs.map(t => t.id));
+    return allTabs.includes(saved) ? saved : 'ai-remixer';
+  })
+  const [mainGroup,  setMainGroup]  = useState(() => {
+    const saved = localStorage.getItem('fluxy_last_tab') || 'ai-remixer';
+    const allTabs = NAV_GROUPS.flatMap(g => g.tabs.map(t => t.id));
+    const tab = allTabs.includes(saved) ? saved : 'ai-remixer';
+    return getGroupByTab(tab).id;
+  })
 
   const switchTab = (tab) => {
     setCurrentTab(tab);
@@ -284,7 +316,8 @@ export default function App({ onLicenseExpired }) {
   }, []);
 
   // --- STATE BẢN QUYỀN GLOBAL ---
-  const [licenseData, setLicenseData] = useState({ daysLeft: 0, isActive: false });
+  const isDev = import.meta.env.DEV === true;
+  const [licenseData, setLicenseData] = useState(isDev ? { daysLeft: 9999, isActive: true } : { daysLeft: 0, isActive: false });
 
   // --- AUTO UPDATE ---
   const [updateInfo,     setUpdateInfo]     = useState(null);   // { newVersion, releaseNotes, downloadUrl }
@@ -311,6 +344,7 @@ export default function App({ onLicenseExpired }) {
 
   // --- CHECK BẢN QUYỀN MỖI 1 PHÚT (hiển thị số ngày + đá ra nếu hết hạn) ---
   useEffect(() => {
+    if (isDev) return; // dev mode: bỏ qua check bản quyền
     const checkGlobalLicense = async () => {
         try {
             const res = await fetch('http://localhost:3000/api/system-status');
@@ -903,52 +937,74 @@ export default function App({ onLicenseExpired }) {
 
         {/* ── VEO STUDIO (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'veo' ? 'flex' : 'none' }}>
-          <VeoStudio dark={dark} />
+          <ErrorBoundary><VeoStudio dark={dark} /></ErrorBoundary>
         </div>
 
+        {/* ── FLOW KIT ── */}
+        {currentTab === 'flowkit' && (
+          <div className="absolute inset-0 w-full h-full flex">
+            <ErrorBoundary><FlowKitPanel /></ErrorBoundary>
+          </div>
+        )}
 
         {/* ── VOICE STUDIO (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'voice' ? 'flex' : 'none' }}>
-          <VoiceStudio dark={dark} />
+          <ErrorBoundary><VoiceStudio dark={dark} /></ErrorBoundary>
         </div>
 
         {/* ── VIDEO EDITOR (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'video' ? 'flex' : 'none' }}>
-          <VideoStudio dark={dark} />
+          <ErrorBoundary><VideoStudio dark={dark} /></ErrorBoundary>
         </div>
 
         {/* ── CAPCUT EDITOR (mount on first visit) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'capcut' ? 'flex' : 'none' }}>
-          <ErrorBoundary>
-            <CapCutEditor />
-          </ErrorBoundary>
+          <ErrorBoundary><CapCutEditor /></ErrorBoundary>
+        </div>
+
+        {/* ── EYES CHALLENGE ── */}
+        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'eyes-challenge' ? 'flex' : 'none' }}>
+          <ErrorBoundary><EyesChallengePanel /></ErrorBoundary>
+        </div>
+
+        {/* ── FACEBOOK AUTO POST ── */}
+        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'fb-auto-post' ? 'flex' : 'none' }}>
+          <ErrorBoundary><FacebookAutoPost /></ErrorBoundary>
+        </div>
+
+        {/* ── TIKTOK AUTO POST ── */}
+        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'tiktok-auto-post' ? 'flex' : 'none' }}>
+          <ErrorBoundary><TikTokAutoPost /></ErrorBoundary>
         </div>
 
         {/* ── CREATOR STUDIO (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'creator' ? 'flex' : 'none' }}>
-          <CreatorStudio />
-        </div>
-
-        {/* ── AUTO ANIMATION (always mounted) ── */}
-        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'auto' ? 'flex' : 'none' }}>
-          <AutoAnimation />
+          <ErrorBoundary><CreatorStudio /></ErrorBoundary>
         </div>
 
         {/* ── REUP VIDEO: YouTube + Bilibili (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'reup' ? 'flex' : 'none' }}>
-          <ReupVideo initialTab="ytchannel" />
+          <ErrorBoundary><ReupVideo initialTab="ytchannel" /></ErrorBoundary>
         </div>
 
         {/* ── TÁI TẠO VIDEO (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'reup-taitao' ? 'flex' : 'none' }}>
-          <ReupVideo initialTab="recreate" />
+          <ErrorBoundary><ReupVideo initialTab="recreate" /></ErrorBoundary>
         </div>
-
-
 
         {/* ── MC STUDIO (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'mc-studio' ? 'flex' : 'none' }}>
           <ErrorBoundary><AudioStoryPanel /></ErrorBoundary>
+        </div>
+
+        {/* ── HORROR STORY (always mounted) ── */}
+        <div className="absolute inset-0 w-full h-full overflow-y-auto" style={{ display: currentTab === 'horror-story' ? 'block' : 'none' }}>
+          <ErrorBoundary><HorrorStoryPanel /></ErrorBoundary>
+        </div>
+
+        {/* ── HONGGUO (always mounted) ── */}
+        <div className="absolute inset-0 w-full h-full overflow-hidden" style={{ display: currentTab === 'hongguo' ? 'flex' : 'none' }}>
+          <ErrorBoundary><HongguoPanel /></ErrorBoundary>
         </div>
 
         {/* ── REMOTION STUDIO (always mounted) ── */}
@@ -961,18 +1017,13 @@ export default function App({ onLicenseExpired }) {
           <ErrorBoundary><AIVideoRemixer /></ErrorBoundary>
         </div>
 
-        {/* ── DRAMA AI STUDIO (always mounted) ── */}
-        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'drama' ? 'flex' : 'none' }}>
-          <ErrorBoundary><DramaStudio /></ErrorBoundary>
-        </div>
-
         {/* ── SETTINGS (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'settings' ? 'flex' : 'none' }}>
-          <Settings dark={dark} />
+          <ErrorBoundary><Settings dark={dark} /></ErrorBoundary>
         </div>
 
-        {/* ── GROK STUDIO (always mounted) ── */}
-        <div className="absolute inset-0 w-full h-full" style={{ display: currentTab === 'grok' ? 'flex' : 'none' }}>
+        {/* GROK STUDIO REMOVED */}
+        {false && <div className="absolute inset-0 w-full h-full">
         <div className="flex w-full h-full bg-[#0a0f18] text-slate-300 font-sans relative">
 
             {/* ── NÚT TOGGLE SIDEBAR ── */}
@@ -1363,7 +1414,7 @@ export default function App({ onLicenseExpired }) {
             </div>
 
           </div>{/* end flex w-full h-full grok outer */}
-        </div>{/* end absolute inset-0 grok wrapper */}
+        </div>}{/* end grok (removed) */}
 
       </div>{/* end flex-1 overflow-hidden relative tab container */}
 

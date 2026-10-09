@@ -35,7 +35,6 @@ async function optimizePromptWithGemini(originalPrompt) {
         systemInstruction: OPTIMIZE_SYSTEM,
         maxOutputTokens: 500,
         temperature: 0.7,
-        thinkingConfig: { thinkingBudget: 0 },
       },
     });
     const text = response?.text?.trim() || response?.candidates?.[0]?.content?.parts?.find(p => p.text)?.text?.trim();

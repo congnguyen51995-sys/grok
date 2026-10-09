@@ -27,7 +27,7 @@ class PlaywrightEngine {
     this.profileJobCount = new Map(); 
     this.initPromises    = new Map(); 
 
-    if (!fs.existsSync(this.downloadsDir)) fs.mkdirSync(this.downloadsDir, { recursive: true });
+    try { fs.mkdirSync(this.downloadsDir, { recursive: true }); } catch {}
   }
 
   _buildFileName(job, type, ext) {

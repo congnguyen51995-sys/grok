@@ -37,7 +37,7 @@ async function transcribeAudioWithGemini(filePath) {
                 { text: 'Chép lại toàn bộ lời nói trong audio này. Chỉ trả về transcript tiếng Việt.' }
             ]
         }],
-        generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 512 } }
+        generationConfig: { temperature: 0 }
     });
 
     let lastErr;
@@ -3235,7 +3235,7 @@ export default function VoiceStudio({ dark = true }) {
                               { inlineData: { data: b64, mimeType: 'audio/wav' } },
                               { text: 'Transcribe ONLY what is spoken in this audio clip. Return ONLY the spoken text, no translation, no explanation.' }
                             ]}],
-                            config: { maxOutputTokens: 1024, ...(/gemini-2\.5/.test(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}) }
+                            config: { maxOutputTokens: 1024 }
                           });
                           refText = (resp?.text || '').trim();
                           // Auto-detect ngôn ngữ từ transcript

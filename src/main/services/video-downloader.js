@@ -111,35 +111,38 @@ function getVideoInfo(url) {
   }));
 }
 
-function buildArgs(url, outputTemplate, quality, format, useCookies = false) {
+const _getNodePath = () => { try { return require('child_process').execSync('where node', { encoding: 'utf8' }).trim().split('\n')[0].trim(); } catch { return 'node'; } };
+
+function buildArgs(url, outputTemplate, quality, format, useCookies = false, noExtractorArgs = false) {
   const args = [
     '--no-playlist', '--newline', '--no-warnings',
     '-o', outputTemplate,
+    '--js-runtimes', `node:${_getNodePath()}`,  // cần để yt-dlp thấy đủ format 1080p
     // Chống throttle / ngắt kết nối giữa chừng
     '--retries', '15',
     '--fragment-retries', '15',
-    '--retry-sleep', 'linear=1::3',   // tăng dần 1s → 3s giữa retries
+    '--retry-sleep', 'linear=1::3',
     '--socket-timeout', '30',
     '--concurrent-fragments', '4',
     '--extractor-retries', '5',
-    // Giả browser để tránh 403 — YouTube kiểm tra User-Agent
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    // player_client web_creator ít bị chặn hơn android/ios trên server mới của YT
-    '--extractor-args', 'youtube:player_client=web,default',
   ];
-  // Khi bị 403: thử dùng cookie từ browser để xác thực
-  // Firefox trước vì Chrome v127+ dùng DPAPI encryption mới mà yt-dlp chưa hỗ trợ
-  if (useCookies) {
+  if (!noExtractorArgs) {
+    args.push('--extractor-args', 'youtube:player_client=web,tv_embedded,ios,android');
+  }
+  // useCookies: 'chrome' | 'firefox' | false
+  if (useCookies === 'chrome') {
+    args.push('--cookies-from-browser', 'chrome');
+  } else if (useCookies === 'firefox') {
     args.push('--cookies-from-browser', 'firefox');
   }
   if (format === 'mp3') {
     args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
   } else {
     if (quality === 'best') {
-      args.push('-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best', '--merge-output-format', 'mp4');
+      args.push('-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4');
     } else {
       const h = parseInt(quality);
-      args.push('-f', `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`, '--merge-output-format', 'mp4');
+      args.push('-f', `bestvideo[height<=${h}]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/bestvideo+bestaudio/best`, '--format-sort', `res:${h},ext:mp4:m4a`, '--merge-output-format', 'mp4');
     }
   }
   args.push(url);
@@ -197,24 +200,52 @@ function runYtDlp(ytdlp, args, mainWindow, progressChannel = 'downloader:progres
   });
 }
 
+const _is403 = (err) => err.errOut && (
+  err.errOut.includes('403') || err.errOut.includes('Forbidden') ||
+  err.errOut.includes('Sign in') || err.errOut.includes('sign in') ||
+  err.errOut.includes('authentication') || err.errOut.includes('cookies') ||
+  err.errOut.includes('HTTP Error 401') || err.errOut.includes('login') ||
+  err.errOut.includes('age') || err.errOut.includes('Premium') ||
+  err.errOut.includes('DPAPI') || err.errOut.includes('decrypt')
+);
+
+const _isFormatErr = (err) => err.errOut && (
+  err.errOut.includes('Requested format is not available') ||
+  err.errOut.includes('No video formats found') ||
+  err.errOut.includes('Unable to extract')
+);
+
 async function startDownload({ url, outputFolder, quality, format }, mainWindow) {
   const ytdlp = await ensureYtDlp();
   const outputTemplate = path.join(outputFolder, '%(title)s.%(ext)s');
+  const send = (msg) => mainWindow?.webContents?.send('downloader:progress', { status: msg });
+
+  // Lần 1: tv_embedded,ios,web
   try {
     return await runYtDlp(ytdlp, buildArgs(url, outputTemplate, quality, format, false), mainWindow);
   } catch (err) {
-    const needsAuth = err.errOut && (
-      err.errOut.includes('403') || err.errOut.includes('Forbidden') ||
-      err.errOut.includes('Sign in') || err.errOut.includes('sign in') ||
-      err.errOut.includes('authentication') || err.errOut.includes('cookies') ||
-      err.errOut.includes('HTTP Error 401') || err.errOut.includes('login') ||
-      err.errOut.includes('age') || err.errOut.includes('Premium') ||
-      err.errOut.includes('DPAPI') || err.errOut.includes('decrypt')
-    );
-    if (!needsAuth) throw err;
-    mainWindow?.webContents?.send('downloader:progress', { status: '🍪 Cần xác thực — thử lại với cookie trình duyệt...' });
-    return await runYtDlp(ytdlp, buildArgs(url, outputTemplate, quality, format, true), mainWindow);
+    if (!_isFormatErr(err) && !_is403(err)) throw err;
+    if (_isFormatErr(err)) {
+      // Lần 2: không dùng extractor-args, nếu vẫn lỗi tiếp tục xuống cookie
+      send('🔄 Thử lại không dùng tv_embedded client...');
+      try {
+        return await runYtDlp(ytdlp, buildArgs(url, outputTemplate, quality, format, false, true), mainWindow);
+      } catch (err2) {
+        if (!_is403(err2)) throw err2;
+        // 403 → fall through to cookie retry
+      }
+    }
   }
+
+  // Cookie retry (sau 403 hoặc sau format retry vẫn 403)
+  send('🍪 403 → thử cookie Chrome...');
+  try {
+    return await runYtDlp(ytdlp, buildArgs(url, outputTemplate, quality, format, 'chrome'), mainWindow);
+  } catch (err3) {
+    if (!_is403(err3)) throw err3;
+  }
+  send('🦊 Thử cookie Firefox...');
+  return await runYtDlp(ytdlp, buildArgs(url, outputTemplate, quality, format, 'firefox'), mainWindow);
 }
 
 async function startBatchDownload(items, mainWindow) {
@@ -228,22 +259,22 @@ async function startBatchDownload(items, mainWindow) {
         mainWindow, 'downloader:batch-progress', item.id);
       return { id: item.id, success: true };
     } catch (err) {
-      const is403 = err.errOut && (
-        err.errOut.includes('403') || err.errOut.includes('Forbidden') ||
-        err.errOut.includes('Sign in') || err.errOut.includes('sign in') ||
-        err.errOut.includes('authentication') || err.errOut.includes('cookies') ||
-        err.errOut.includes('HTTP Error 401') || err.errOut.includes('login') ||
-        err.errOut.includes('age') || err.errOut.includes('Premium') ||
-        err.errOut.includes('DPAPI') || err.errOut.includes('decrypt')
-      );
-      if (!is403) return { id: item.id, success: false, error: err.message };
-      send({ status: '🍪 403 → thử cookie...' });
+      if (!_is403(err)) return { id: item.id, success: false, error: err.message };
+      send({ status: '🍪 403 → thử cookie Chrome...' });
       try {
-        await runYtDlp(ytdlp, buildArgs(item.url, outputTemplate, item.quality, item.format, true),
+        await runYtDlp(ytdlp, buildArgs(item.url, outputTemplate, item.quality, item.format, 'chrome'),
           mainWindow, 'downloader:batch-progress', item.id);
         return { id: item.id, success: true };
       } catch (e2) {
-        return { id: item.id, success: false, error: e2.message };
+        if (!_is403(e2)) return { id: item.id, success: false, error: e2.message };
+      }
+      send({ status: '🦊 Thử cookie Firefox...' });
+      try {
+        await runYtDlp(ytdlp, buildArgs(item.url, outputTemplate, item.quality, item.format, 'firefox'),
+          mainWindow, 'downloader:batch-progress', item.id);
+        return { id: item.id, success: true };
+      } catch (e3) {
+        return { id: item.id, success: false, error: e3.message };
       }
     }
   }));
@@ -303,22 +334,22 @@ function registerDownloaderHandlers(mainWindow) {
         mainWindow, 'downloader:batch-progress', item.id);
       return { id: item.id, success: true };
     } catch (err) {
-      const is403 = err.errOut && (
-        err.errOut.includes('403') || err.errOut.includes('Forbidden') ||
-        err.errOut.includes('Sign in') || err.errOut.includes('sign in') ||
-        err.errOut.includes('authentication') || err.errOut.includes('cookies') ||
-        err.errOut.includes('HTTP Error 401') || err.errOut.includes('login') ||
-        err.errOut.includes('age') || err.errOut.includes('Premium') ||
-        err.errOut.includes('DPAPI') || err.errOut.includes('decrypt')
-      );
-      if (!is403) return { id: item.id, success: false, error: err.message };
-      mainWindow?.webContents?.send('downloader:batch-progress', { id: item.id, status: '🍪 403 → thử cookie...' });
+      if (!_is403(err)) return { id: item.id, success: false, error: err.message };
+      mainWindow?.webContents?.send('downloader:batch-progress', { id: item.id, status: '🍪 403 → thử cookie Chrome...' });
       try {
-        await runYtDlp(ytdlp, buildArgs(item.url, outputTemplate, item.quality, item.format, true),
+        await runYtDlp(ytdlp, buildArgs(item.url, outputTemplate, item.quality, item.format, 'chrome'),
           mainWindow, 'downloader:batch-progress', item.id);
         return { id: item.id, success: true };
       } catch (e2) {
-        return { id: item.id, success: false, error: e2.message };
+        if (!_is403(e2)) return { id: item.id, success: false, error: e2.message };
+      }
+      mainWindow?.webContents?.send('downloader:batch-progress', { id: item.id, status: '🦊 Thử cookie Firefox...' });
+      try {
+        await runYtDlp(ytdlp, buildArgs(item.url, outputTemplate, item.quality, item.format, 'firefox'),
+          mainWindow, 'downloader:batch-progress', item.id);
+        return { id: item.id, success: true };
+      } catch (e3) {
+        return { id: item.id, success: false, error: e3.message };
       }
     }
   });

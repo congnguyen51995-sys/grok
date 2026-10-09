@@ -18,9 +18,9 @@ async function callGemini(apiKeys, prompt, maxTokens = 4096) {
   return retryWithKeyRotation(async (key) => {
     const ai = new GoogleGenAI({ apiKey: key });
     const res = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.5-flash',
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: { maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } },
+      config: { maxOutputTokens: maxTokens },
     });
     return res?.text || res?.candidates?.[0]?.content?.parts?.[0]?.text || '';
   }, apiKeys, { maxCycles: 2 });

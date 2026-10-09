@@ -55,7 +55,7 @@ export default function VeoStudio({ dark = true }) {
 
     // Extend Chain state
     const [extendPrompts, setExtendPrompts]     = useState('');  // mỗi dòng 1 prompt
-    const [extendModel,   setExtendModel]       = useState('Veo 3.1 - Lite [Lower Priority]');
+    const [extendModel,   setExtendModel]       = useState('Veo 3.1 - Lite');
     const [extendChainRunning, setExtChainRun]  = useState(false);
     const [extendResults, setExtendResults]     = useState([]);
     const [extendProgress, setExtendProgress]   = useState({ current: 0, total: 0, stepPct: 0, phase: '', latestFile: null });
@@ -96,8 +96,8 @@ export default function VeoStudio({ dark = true }) {
 
     useEffect(() => {
         if (inputMode === 'Image') setModel('Nano Banana Pro');
-        else if (inputMode === 'Extend') setModel('Veo 3.1 - Lite [Lower Priority]'); // T2V model for first step
-        else setModel('Veo 3.1 - Lite [Lower Priority]');
+        else if (inputMode === 'Extend') setModel('Veo 3.1 - Lite');
+        else setModel('Veo 3.1 - Lite');
     }, [inputMode]);
 
     const handleAddIngredientImages = (e) => {
@@ -718,10 +718,6 @@ export default function VeoStudio({ dark = true }) {
 
                     <div className="flex gap-1 bg-[#0f1524] p-1.5 rounded-lg border border-slate-800 flex-wrap">
                         <button onClick={() => setInputMode('Image')} className={`flex-1 py-1.5 rounded-md text-[10px] font-bold transition-all ${inputMode === 'Image' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-300'}`}>Tạo Ảnh</button>
-                        <button onClick={() => setInputMode('TextToVideo')} className={`flex-1 py-1.5 rounded-md text-[10px] font-bold transition-all ${inputMode === 'TextToVideo' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-300'}`}>T2V</button>
-                        <button onClick={() => setInputMode('ImageToVideo')} className={`flex-1 py-1.5 rounded-md text-[10px] font-bold transition-all ${inputMode === 'ImageToVideo' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-300'}`}>I2V</button>
-                        <button onClick={() => setInputMode('Ingredients')} className={`flex-1 py-1.5 rounded-md text-[10px] font-bold transition-all ${inputMode === 'Ingredients' ? 'bg-violet-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-300'}`}>Ingredients</button>
-                        <button onClick={() => setInputMode('Extend')} className={`flex-1 py-1.5 rounded-md text-[10px] font-bold transition-all ${inputMode === 'Extend' ? 'bg-cyan-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-300'}`}>🔁 Extend</button>
                     </div>
 
                     <div>
@@ -735,16 +731,22 @@ export default function VeoStudio({ dark = true }) {
                                 </optgroup>
                             ) : inputMode === 'Ingredients' ? (
                                 <>
-                                    <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 - Lite [Lower Priority]</option>
+                                    <option value="Veo 3.1 - Lite">Veo 3.1 - Lite</option>
+                                    <option value="Veo 3.1 - Fast">Veo 3.1 - Fast</option>
+                                    <option value="Veo 3.1 - Quality">Veo 3.1 - Quality</option>
                                     <option value="Omni 1.1 Flash">Omni 1.1 Flash r2v (4s/6s/8s/10s)</option>
                                 </>
                             ) : inputMode === 'Extend' ? (
                                 <optgroup label="🎬 T2V (video đầu tiên)">
-                                    <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 - Lite [Lower Priority]</option>
+                                    <option value="Veo 3.1 - Lite">Veo 3.1 - Lite</option>
+                                    <option value="Veo 3.1 - Fast">Veo 3.1 - Fast</option>
+                                    <option value="Veo 3.1 - Quality">Veo 3.1 - Quality</option>
                                 </optgroup>
                             ) : (
                                 <>
-                                    <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 - Lite [Lower Priority]</option>
+                                    <option value="Veo 3.1 - Lite">Veo 3.1 - Lite</option>
+                                    <option value="Veo 3.1 - Fast">Veo 3.1 - Fast</option>
+                                    <option value="Veo 3.1 - Quality">Veo 3.1 - Quality</option>
                                     <option value="Omni 1.1 Flash">Omni 1.1 Flash (4s/6s/8s/10s)</option>
                                 </>
                             )}
@@ -1066,7 +1068,9 @@ export default function VeoStudio({ dark = true }) {
                                 <label className="text-[9px] font-bold text-cyan-400 mb-1 block uppercase tracking-wider">Model Extend (dòng 2+)</label>
                                 <select value={extendModel} onChange={e => setExtendModel(e.target.value)} disabled={extendChainRunning}
                                     className="w-full bg-[#1e293b] border border-cyan-500/40 text-cyan-300 text-xs font-semibold rounded-lg px-3 py-2 focus:outline-none cursor-pointer">
-                                    <option value="Veo 3.1 - Lite [Lower Priority]">Veo 3.1 - Lite [Lower Priority]</option>
+                                    <option value="Veo 3.1 - Lite">Veo 3.1 - Lite</option>
+                                    <option value="Veo 3.1 - Fast">Veo 3.1 - Fast</option>
+                                    <option value="Veo 3.1 - Quality">Veo 3.1 - Quality</option>
                                 </select>
                             </div>
 

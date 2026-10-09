@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Fluxy Extension - Thành Công Media",
-  "version": "5.27",
-  "description": "Kết nối Veo Studio với Fluxy Tool",
+  "version": "5.71",
+  "description": "Kết nối Veo Studio + Flow với Fluxy Tool",
   "permissions": [
     "scripting",
     "activeTab",
@@ -13,7 +13,8 @@
     "alarms",
     "storage",
     "declarativeNetRequest",
-    "declarativeNetRequestWithHostAccess"
+    "declarativeNetRequestWithHostAccess",
+    "sidePanel"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -33,9 +34,35 @@
       "js": ["content_iso.js"],
       "run_at": "document_start",
       "world": "ISOLATED"
+    },
+    {
+      "matches": ["https://flow.google.com/*", "https://labs.google/fx/tools/flow*", "https://labs.google/fx/*/tools/flow*"],
+      "js": ["fk_hijack_bypass.js", "fk_recaptcha_enterprise.js", "fk_recaptcha__en.js", "fk_injected.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://flow.google.com/*", "https://labs.google/fx/tools/flow*", "https://labs.google/fx/*/tools/flow*"],
+      "js": ["fk_content.js"],
+      "run_at": "document_start"
     }
   ],
+  "web_accessible_resources": [
+    {
+      "resources": ["fk_injected.js", "fk_recaptcha_enterprise.js", "fk_recaptcha__en.js"],
+      "matches": ["https://flow.google.com/*", "https://labs.google/*"]
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {"id": "fluxy_referer_rules", "enabled": true, "path": "fk_rules.json"}
+    ]
+  },
+  "side_panel": {
+    "default_path": "side_panel.html"
+  },
   "action": {
-    "default_title": "Fluxy Extension Status"
+    "default_title": "Fluxy Extension Status",
+    "default_popup": "popup.html"
   }
 }

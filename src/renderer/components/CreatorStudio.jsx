@@ -1886,7 +1886,8 @@ export async function generateSeoMetadata(apiKeys, content, language, channelNam
   return retryWithKeyRotation(async (key) => {
     const ai = new GoogleGenAI({ apiKey: key });
     const langLabel = { vi: 'Tiếng Việt', en: 'English', ja: 'Japanese (日本語)', ko: 'Korean (한국어)' }[language] || 'Tiếng Việt';
-    const disclaimer = language === 'vi' ? DISCLAIMER_VI : DISCLAIMER_EN;
+    // options.disclaimer / options.extraRules: AI Agent (video tài liệu) dùng chung hàm này nhưng cần câu miễn trừ khác
+    const disclaimer = options.disclaimer || (language === 'vi' ? DISCLAIMER_VI : DISCLAIMER_EN);
     const hasRefImages = referenceImages?.length > 0;
 
     const langEnforcement = language !== 'vi'
@@ -1977,7 +1978,7 @@ ${options.contentType === 'story' ? `  ⚡ CHẾ ĐỘ TRUYỆN AUDIO — NGUYÊ
   - Ngôn ngữ: ${langLabel.toUpperCase()}.
   - Kênh: ${channelName || 'Của tôi'}.
   - Viết cho CON NGƯỜI click nhưng cấu trúc cho MÁY xếp hạng.
-  - TRUNG THÀNH NỘI DUNG GỐC (BẮT BUỘC): Nếu đầu vào là tiêu đề video / URL / mô tả ngắn (KHÔNG phải kịch bản/truyện đầy đủ), tiêu đề, mô tả và thumbnail PHẢI BÁM SÁT đúng chủ đề và nội dung thực tế của video đó. TUYỆT ĐỐI KHÔNG bịa đặt hoặc sáng tác nội dung drama/câu chuyện/ngôn tình không có trong video. Ví dụ: video timelapse nông trại → tiêu đề phải về nông trại/timelapse; video parkour → tiêu đề phải về parkour. Sai chủ đề = thất bại hoàn toàn.`;
+  - TRUNG THÀNH NỘI DUNG GỐC (BẮT BUỘC): Nếu đầu vào là tiêu đề video / URL / mô tả ngắn (KHÔNG phải kịch bản/truyện đầy đủ), tiêu đề, mô tả và thumbnail PHẢI BÁM SÁT đúng chủ đề và nội dung thực tế của video đó. TUYỆT ĐỐI KHÔNG bịa đặt hoặc sáng tác nội dung drama/câu chuyện/ngôn tình không có trong video. Ví dụ: video timelapse nông trại → tiêu đề phải về nông trại/timelapse; video parkour → tiêu đề phải về parkour. Sai chủ đề = thất bại hoàn toàn.${options.extraRules ? `\n\n  ### QUY TẮC BỔ SUNG (ƯU TIÊN CAO NHẤT)\n${options.extraRules}` : ''}`;
 
     const parts = [];
     if (hasRefImages) {
@@ -2083,7 +2084,6 @@ CHÍNH SÁCH: Không CSAM, deepfake, bạo lực máu me. Kênh = ${channelName 
       model: GEMINI_MODEL,
       contents: [{ parts: [{ text: `Tạo 3 ý tưởng thumbnail cho nội dung sau (Kênh: ${channelName || 'Của tôi'}):\n\n${content}` }] }],
       config: {
-        thinkingConfig: { thinkingBudget: 0 },
         maxOutputTokens: 2048,
         responseMimeType: 'application/json',
         responseSchema: {
@@ -2125,7 +2125,7 @@ export async function analyzeThumbImageToPrompt(apiKeys, imageBase64, mimeType, 
     const res = await ai.models.generateContent({
       model: useModel,
       contents: [{ parts: [{ inlineData: { data: cleanData, mimeType: mimeType || 'image/jpeg' } }, { text: txt }] }],
-      config: { ...(useModel === 'gemini-2.5-flash' ? { thinkingConfig: { thinkingBudget: 0 } } : {}) },
+      config: {},
     });
     return res.text?.trim() || '';
   }, apiKeys, { onSwitch });
@@ -3846,7 +3846,7 @@ function ThumbnailStudioPanel({ apiKeys, onKeySwitch, geminiModel }) {
         const res = await ai.models.generateContent({
           model: useModel,
           contents: [{ parts: [{ inlineData: { data: cleanData, mimeType } }, { text: txt }] }],
-          config: { ...(useModel === 'gemini-2.5-flash' ? { thinkingConfig: { thinkingBudget: 0 } } : {}) },
+          config: {},
         });
         return res.text?.trim() || '';
       }, apiKeys, { onSwitch: onKeySwitch });
@@ -3867,7 +3867,7 @@ function ThumbnailStudioPanel({ apiKeys, onKeySwitch, geminiModel }) {
         const res = await ai.models.generateContent({
           model: useModel,
           contents: `Original prompt: ${prompt}\nUser instruction (Vietnamese/English): ${refineInstr}\n\nOutput ONLY the refined prompt in English, optimized for 16:9 thumbnail. No explanation.`,
-          config: { ...(useModel === 'gemini-2.5-flash' ? { thinkingConfig: { thinkingBudget: 0 } } : {}) },
+          config: {},
         });
         return res.text?.trim() || '';
       }, apiKeys, { onSwitch: onKeySwitch });
@@ -4211,7 +4211,7 @@ function AudioStoryPanel({ apiKeys, onKeySwitch, geminiModel }) {
   const [gsvSpeed,        setGsvSpeed]        = useState(1.0);
   const stopRef = useRef(false);
   const textareaRef = useRef(null);
-  const model = geminiModel || 'gemini-2.5-flash';
+  const model = geminiModel || 'gemini-3.5-flash';
 
   // Load VieNeu built-in voices khi chọn VieNeu
   useEffect(() => {

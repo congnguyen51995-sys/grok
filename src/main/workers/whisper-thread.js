@@ -240,7 +240,7 @@ parentPort.on('message', async (msg) => {
       const result = await tr(
         float32,              // Float32Array — whisper-tiny mặc định 16kHz
         {
-          language:          null,   // auto-detect
+          language:          'vi',   // force tiếng Việt — auto-detect thường sai với nhạc nền
           task:              'transcribe',
           return_timestamps: true,
           chunk_length_s:    30,

@@ -95,6 +95,18 @@ export async function transcribeLocalChunked(
       if (!res.success) throw new Error(res.error || 'Whisper trả về lỗi không xác định');
 
       // Parse segments, offset về thời gian tuyệt đối
+      // Lọc noise tokens và hallucination lặp từ của Whisper
+      const NOISE_TAG = /^\[.{1,30}\]$|^\(.{1,30}\)$/;
+
+      // Phát hiện Whisper hallucination: lặp từ/cụm từ liên tục
+      // Ví dụ: "nói, nói, nói, nói..." hoặc "bây giờ, bây giờ, bây giờ..."
+      function isHallucinated(text) {
+        const words = text.split(/[\s,，、.。!！?？\-–]+/).filter(w => w.length > 0);
+        if (words.length < 5) return false;
+        const unique = new Set(words.map(w => w.toLowerCase()));
+        return (unique.size / words.length) < 0.35; // < 35% unique = lặp vô hạn
+      }
+
       const chunks   = res.result?.chunks || [];
       const segments = chunks
         .map(c => ({
@@ -102,7 +114,7 @@ export async function transcribeLocalChunked(
           end:   startSec + (c.timestamp?.[1] ?? (c.timestamp?.[0] ?? 0) + 2),
           text:  (c.text || '').trim(),
         }))
-        .filter(s => s.text.length > 1);
+        .filter(s => s.text.length > 1 && !NOISE_TAG.test(s.text) && !isHallucinated(s.text));
 
       allSegments.push(...segments);
       fullText += (res.result?.text || '').trim() + ' ';

@@ -1,5 +1,5 @@
 ﻿const electron = require('electron');
-const { app, BrowserWindow, ipcMain, dialog, shell } = electron;
+const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage } = electron;
 const protocol = electron.protocol;
 const session = electron.session;
 const path = require('path');
@@ -39,6 +39,7 @@ function detectGPU() {
 detectGPU();
 const { checkForUpdates, registerUpdaterHandlers } = require('./updater');
 const { registerDownloaderHandlers }               = require('./services/video-downloader');
+const { registerGroqWhisperHandlers }              = require('./services/groq-whisper');
 
 app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 app.commandLine.appendSwitch('disable-infobars');
@@ -82,26 +83,15 @@ global.googleLabsAuth = {
     pendingImageUpload: null,       // đường dẫn ảnh chờ Extension upload
     imageUploadTriggered: false,    // guard: Extension chỉ nhận lệnh upload 1 lần
     uploadedMediaId: null,          // UUID trả về từ Extension sau khi upload
-    pendingVideoGen: null,          // {url, payload} chờ Extension thực thi
-    videoGenTriggered: false,       // guard: Extension chỉ nhận lệnh gen 1 lần — tránh gọi API 2 lần
-    videoGenResult: null,           // kết quả từ Extension sau khi gọi video gen API
     pendingFlowImageGen: null,      // params chờ Extension tạo ảnh qua flow.google.com batchexecute
     flowImageGenTriggered: false,   // guard: chỉ nhận lệnh 1 lần
     flowImageGenResult: null,       // kết quả download URL từ Extension
-    pendingFlowVideoGen: null,      // params chờ Extension trigger YhhmEf video gen
-    flowVideoGenTriggered: false,
-    flowVideoGenResult: null,
-    pendingFlowR2VGen: null,        // params chờ Extension trigger MZZa6b r2v gen
-    flowR2VGenTriggered: false,
-    flowR2VGenResult: null,
     // ── DOWNLOAD VIDEO QUA EXTENSION (Chrome full-session) ─────────────────────
     pendingVideoDownload: null,     // mediaName cần tải — Extension phát hiện và tải về
     videoDownloadTriggered: false,  // guard: Extension chỉ tải 1 lần — tránh download 2 lần
     videoDownloadDone: false,       // Extension set true khi xong
     videoDownloadError: null,       // Extension set error string nếu lỗi
     videoDownloadPath: null,        // đường dẫn file tạm Extension đã lưu (nếu có)
-    // ── DIRECT API (không cần Extension) ─────────────────────────────────────
-    flowCookies: null,              // Array cookie JSON export từ CocCoc → flow-direct-api dùng
 };
 
 // 1. Hứng Token, Cookie & VÂN TAY từ Extension
@@ -144,28 +134,15 @@ expressApp.get('/api/check-request', (req, res) => {
         needImageUpload: (global.googleLabsAuth.pendingImageUpload && !global.googleLabsAuth.imageUploadTriggered)
             ? (global.googleLabsAuth.imageUploadTriggered = true, true)
             : false,
-        // Chỉ gửi lệnh needVideoGen 1 lần — KHÔNG để Extension gọi Veo API 2 lần cho cùng 1 prompt
-        // Đây là nguyên nhân "1 prompt tạo ra 2 video": Extension poll nhanh thấy needVideoGen=true 2 lần
-        needVideoGen: (global.googleLabsAuth.pendingVideoGen && !global.googleLabsAuth.videoGenTriggered)
-            ? (global.googleLabsAuth.videoGenTriggered = true, true)
-            : false,
-        needFlowImageGen: (global.googleLabsAuth.pendingFlowImageGen && !global.googleLabsAuth.flowImageGenTriggered)
-            ? (global.googleLabsAuth.flowImageGenTriggered = true, true)
-            : false,
-        needFlowVideoGen: (global.googleLabsAuth.pendingFlowVideoGen && !global.googleLabsAuth.flowVideoGenTriggered)
-            ? (global.googleLabsAuth.flowVideoGenTriggered = true, true)
-            : false,
-        needFlowR2VGen: (global.googleLabsAuth.pendingFlowR2VGen && !global.googleLabsAuth.flowR2VGenTriggered)
-            ? (global.googleLabsAuth.flowR2VGenTriggered = true, true)
-            : false,
+        // Không dùng flowImageGenTriggered guard — gây race condition khi batch:
+        // Extension poll thấy triggered=true sau khi trả early (isGeneratingFlowImage=true),
+        // triggered bị kẹt true → Extension không bao giờ trigger task tiếp theo → timeout.
+        // Extension tự có isGeneratingFlowImage guard để tránh concurrent gen.
+        needFlowImageGen: !!global.googleLabsAuth.pendingFlowImageGen,
         // Chỉ gửi lệnh downloadVideo 1 lần — sau khi Extension nhận, đặt cờ triggered
         // để các poll tiếp theo không kích hoạt chrome.downloads lần 2 (tránh file trùng)
         downloadVideo: (global.googleLabsAuth.pendingVideoDownload && !global.googleLabsAuth.videoDownloadTriggered)
             ? (global.googleLabsAuth.videoDownloadTriggered = true, global.googleLabsAuth.pendingVideoDownload)
-            : null,
-        // Lệnh download flow-content.google video qua chrome.downloads (Electron không có cookie .google)
-        downloadFlowVideo: (global.googleLabsAuth.pendingFlowVideoDownload && !global.googleLabsAuth.flowVideoDownloadTriggered)
-            ? (global.googleLabsAuth.flowVideoDownloadTriggered = true, global.googleLabsAuth.pendingFlowVideoDownload)
             : null
     });
 });
@@ -185,26 +162,6 @@ expressApp.get('/api/get-upload-image-data', (req, res) => {
         projectId: global.googleLabsAuth.projectId,
         bearerToken: global.googleLabsAuth.bearerToken
     });
-});
-
-// Cấp payload video gen cho Extension thực thi qua MAIN world
-expressApp.get('/api/get-pending-video-gen', (req, res) => {
-    if (!global.googleLabsAuth.pendingVideoGen) {
-        return res.status(404).json({ error: 'No pending video gen' });
-    }
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.json(global.googleLabsAuth.pendingVideoGen);
-});
-
-// Nhận kết quả video gen từ Extension
-expressApp.post('/api/save-video-gen-result', (req, res) => {
-    if (req.body) {
-        global.googleLabsAuth.videoGenResult = req.body;
-        global.googleLabsAuth.pendingVideoGen = null;
-        global.googleLabsAuth.videoGenTriggered = false; // reset để lần gọi tiếp theo hoạt động bình thường
-    }
-    res.json({ ok: true });
 });
 
 // Flow recaptcha request (từ veo-engine, extension fetch token và trả về)
@@ -231,73 +188,18 @@ expressApp.post('/api/save-flow-image-result', (req, res) => {
     res.json({ ok: true });
 });
 
-// Flow.google.com video gen qua Extension (YhhmEf từ browser MAIN world)
-expressApp.get('/api/get-pending-flow-video', (req, res) => {
-    const p = global.googleLabsAuth.pendingFlowVideoGen;
-    if (!p) return res.status(404).json({ error: 'No pending flow video gen' });
-    res.json(p);
+// Extension tự động export Google cookies → Playwright dùng để login flow.google.com
+expressApp.post('/api/save-flow-cookies', (req, res) => {
+    const { cookies } = req.body || {};
+    if (!Array.isArray(cookies) || cookies.length === 0) return res.json({ ok: false, reason: 'no cookies' });
+    global.googleLabsAuth.flowCookies = cookies;
+    try {
+        const cookieFile = require('path').join(require('electron').app.getPath('userData'), 'flow-cookies.json');
+        require('fs').writeFileSync(cookieFile, JSON.stringify(cookies, null, 2));
+    } catch (_) {}
+    console.log(`[FlowCookies] Extension exported ${cookies.length} cookies`);
+    res.json({ ok: true, count: cookies.length });
 });
-expressApp.post('/api/save-flow-video-result', (req, res) => {
-    if (req.body) {
-        global.googleLabsAuth.flowVideoGenResult = req.body;
-    }
-    res.json({ ok: true });
-});
-
-// Flow.google.com r2v (Ingredients) gen qua Extension (MZZa6b từ browser MAIN world)
-expressApp.get('/api/get-pending-flow-r2v', (req, res) => {
-    const p = global.googleLabsAuth.pendingFlowR2VGen;
-    if (!p) return res.status(404).json({ error: 'No pending flow r2v gen' });
-    res.json(p);
-});
-expressApp.post('/api/save-flow-r2v-result', (req, res) => {
-    if (req.body) {
-        global.googleLabsAuth.flowR2VGenResult = req.body;
-    }
-    res.json({ ok: true });
-});
-// Extension poll jwpduf thành công → lưu videoUrl để veo-engine lấy
-expressApp.post('/api/save-flow-r2v-video', (req, res) => {
-    const { operationId, videoUrl, flowContentCookie } = req.body || {};
-    if (operationId && videoUrl) {
-        if (!global.googleLabsAuth.pendingR2VVideoUrls) global.googleLabsAuth.pendingR2VVideoUrls = {};
-        global.googleLabsAuth.pendingR2VVideoUrls[operationId] = videoUrl;
-        if (flowContentCookie) {
-            global.googleLabsAuth.flowContentCookie = flowContentCookie;
-            console.log(`[R2V] flow-content.google cookie captured (${flowContentCookie.length} chars)`);
-        }
-        console.log(`[R2V] Extension poll → videoUrl saved for opId ${operationId.substring(0, 16)}...`);
-    }
-    res.json({ ok: true });
-});
-
-// Extension SW fetch bytes video → lưu thẳng vào temp → veo-engine copy sang outputFolder
-// Tránh Chrome Downloads: SW fetch dùng credentials:include → có cookie flow-content.google
-expressApp.post('/api/save-r2v-video-bytes',
-    (req, res, next) => {
-        let chunks = [];
-        req.on('data', c => chunks.push(c));
-        req.on('end', () => { req.rawBody = Buffer.concat(chunks); next(); });
-    },
-    (req, res) => {
-        const operationId = req.headers['x-operation-id'];
-        const buf = req.rawBody;
-        if (!buf || buf.length === 0) return res.status(400).json({ error: 'empty body' });
-        const os = require('os');
-        const tempPath = path.join(os.tmpdir(), `veo_r2v_${Date.now()}.mp4`);
-        try {
-            fs.writeFileSync(tempPath, buf);
-            if (!global.googleLabsAuth.pendingR2VVideoUrls) global.googleLabsAuth.pendingR2VVideoUrls = {};
-            if (operationId) {
-                global.googleLabsAuth.pendingR2VVideoUrls[operationId] = 'file://' + tempPath.replace(/\\/g, '/');
-                console.log(`[R2V bytes] ${(buf.length/1024/1024).toFixed(1)}MB → ${tempPath} (opId=${operationId.substring(0,16)})`);
-            }
-            res.json({ ok: true });
-        } catch (e) {
-            res.status(500).json({ error: e.message });
-        }
-    }
-);
 
 // Debug: nhận f.req body từ Extension để phân tích aspect code
 let _capturedRpcBodies = [];
@@ -308,6 +210,14 @@ expressApp.post('/api/capture-rpc-body', (req, res) => {
         if (_capturedRpcBodies.length > 200) _capturedRpcBodies = _capturedRpcBodies.slice(-200);
         console.log(`[RPC CAPTURE] ${entry.rpc} @ ${entry.capturedAt}`);
         console.log(`[RPC CAPTURE] freq preview: ${(entry.freq || '').substring(0, 500)}`);
+        // Forward key debug events to UI status log
+        const rpc = entry.rpc || '';
+        if (rpc === 'FlowDL') {
+            mainWindow?.webContents.send('veo-log', { type: 'info', text: `[EXT] ${entry.freq || ''}` });
+        } else if (rpc === 'RC_EXEC') {
+            // grecaptcha action captured from extension or Angular — forward to Veo Log
+            mainWindow?.webContents.send('veo-log', { type: 'warn', text: `[EXT RC_ACTION] action="${entry.action||'?'}" sitekey_pfx=${entry.sitekey_pfx||'?'}` });
+        }
     }
     res.json({ ok: true });
 });
@@ -315,43 +225,7 @@ expressApp.get('/api/get-captured-rpc', (req, res) => {
     res.json({ bodies: _capturedRpcBodies });
 });
 
-// ── FLOW DIRECT API COOKIES (không cần Extension) ───────────────────────────
-const getFlowCookiesFile = () => {
-    try { return path.join(require('electron').app.getPath('userData'), 'flow-cookies.json'); }
-    catch (_) { return path.join(require('os').homedir(), 'fluxy-flow-cookies.json'); }
-};
 
-expressApp.post('/api/flow-cookies', (req, res) => {
-    const cookies = req.body;
-    if (!Array.isArray(cookies) || cookies.length === 0) return res.status(400).json({ error: 'Cần array cookies' });
-    global.googleLabsAuth.flowCookies = cookies;
-    try { fs.writeFileSync(getFlowCookiesFile(), JSON.stringify(cookies, null, 2), 'utf-8'); } catch (e) { console.error('[FlowDirect] Save cookies fail:', e.message); }
-    console.log(`[FlowDirect] Saved ${cookies.length} cookies`);
-    res.json({ ok: true, count: cookies.length });
-});
-
-expressApp.get('/api/flow-cookies', (req, res) => {
-    const cookies = global.googleLabsAuth.flowCookies;
-    res.json({ count: cookies?.length || 0, hasCookies: !!(cookies?.length) });
-});
-
-expressApp.get('/api/check-flow-cookies', async (req, res) => {
-    const cookies = global.googleLabsAuth.flowCookies;
-    if (!cookies?.length) return res.json({ valid: false, reason: 'Chưa có cookie' });
-    try {
-        const { checkCookiesValid } = require('./services/flow-direct-api');
-        const result = await checkCookiesValid(cookies);
-        res.json(result);
-    } catch (e) {
-        res.json({ valid: false, reason: e.message });
-    }
-});
-
-expressApp.delete('/api/flow-cookies', (req, res) => {
-    global.googleLabsAuth.flowCookies = null;
-    try { const f = getFlowCookiesFile(); if (fs.existsSync(f)) fs.unlinkSync(f); } catch (_) {}
-    res.json({ ok: true });
-});
 
 // Nhận mediaId sau khi Extension upload thành công
 expressApp.post('/api/save-media-id', (req, res) => {
@@ -437,7 +311,7 @@ expressApp.post('/api/save-caus', (req, res) => {
     res.json({ success: true });
 });
 
-// Debug log từ Extension — lưu request body của YhhmEf/jwpduf để phân tích
+// Debug log từ Extension — lưu request body để phân tích
 const _debugLogs = [];
 expressApp.post('/api/debug-log', (req, res) => {
     if (req.body) {
@@ -496,8 +370,12 @@ if (protocol && protocol.registerSchemesAsPrivileged) {
 
 async function initializeServices() {
   try {
-    profilesBaseDir = path.join(app.getPath('userData'), 'chrome-profiles');
-    if (!fs.existsSync(profilesBaseDir)) fs.mkdirSync(profilesBaseDir, { recursive: true });
+    const userDataPath = app.getPath('userData');
+    try { fs.mkdirSync(userDataPath, { recursive: true }); } catch {}
+    profilesBaseDir = path.join(userDataPath, 'chrome-profiles');
+    try { fs.mkdirSync(profilesBaseDir, { recursive: true }); } catch (mkdirErr) {
+      console.warn('[Init] chrome-profiles mkdir failed (non-fatal):', mkdirErr.message);
+    }
 
     db = new DatabaseService(app.getPath('userData'));
     await db.init();
@@ -551,11 +429,160 @@ function createWindow() {
   // Fallback 2: timeout 4s — phòng trường hợp cả 2 event trên đều không fire
   setTimeout(() => { if (mainWindow && !mainWindow.isVisible()) mainWindow.show(); }, 4000);
 
-  mainWindow.on('closed', () => mainWindow = null);
+  // Ấn X → ẩn xuống tray thay vì thoát (để FB auto-post chạy ngầm)
+  mainWindow.on('close', (e) => {
+    if (!app.isQuitting) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
+  mainWindow.on('closed', () => { mainWindow = null; });
+}
+
+let tray = null;
+let _fbScheduleActive = false;
+let _fbScheduleNext   = 0;
+
+// ── FlowKit Python Agent ───────────────────────────────────────────────────
+let _flowkitProc = null;
+let _flowkitLogs = [];
+const MAX_FLOWKIT_LOGS = 300;
+
+function getFlowkitDir() {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'flowkit')
+    : path.join(app.getAppPath(), 'flowkit');
+}
+
+function findPythonCmd() {
+  const { execSync } = require('child_process');
+  const candidates = process.platform === 'win32' ? ['python', 'py', 'python3'] : ['python3', 'python'];
+  for (const cmd of candidates) {
+    try {
+      const out = execSync(`${cmd} --version`, { encoding: 'utf8', timeout: 4000, windowsHide: true });
+      if (/python/i.test(out)) return cmd;
+    } catch {}
+  }
+  return null;
+}
+
+function startFlowkitAgent(win) {
+  if (_flowkitProc && !_flowkitProc.killed) return { ok: false, msg: 'Agent đang chạy' };
+  const flowDir = getFlowkitDir();
+  if (!fs.existsSync(flowDir)) return { ok: false, msg: 'Thư mục flowkit không tồn tại: ' + flowDir };
+
+  const pythonCmd = findPythonCmd();
+  if (!pythonCmd) return { ok: false, msg: 'Không tìm thấy Python. Cài Python 3.10+ từ python.org rồi thử lại.' };
+
+  const { spawn } = require('child_process');
+  _flowkitLogs = [];
+
+  const pushLog = (line) => {
+    _flowkitLogs.push(line);
+    if (_flowkitLogs.length > MAX_FLOWKIT_LOGS) _flowkitLogs.shift();
+    const w = win || BrowserWindow.getAllWindows()[0];
+    w?.webContents?.send('flowkit:log', line);
+  };
+
+  pushLog(`[FlowKit] Dùng: ${pythonCmd} — thư mục: ${flowDir}`);
+
+  _flowkitProc = spawn(pythonCmd, ['-m', 'agent.main'], {
+    cwd: flowDir,
+    windowsHide: true,
+    env: { ...process.env },
+  });
+
+  _flowkitProc.stdout.on('data', d => d.toString().split('\n').filter(Boolean).forEach(pushLog));
+  _flowkitProc.stderr.on('data', d => d.toString().split('\n').filter(Boolean).forEach(pushLog));
+  _flowkitProc.on('exit', (code) => {
+    pushLog(`[FlowKit] Agent dừng (exit ${code})`);
+    _flowkitProc = null;
+    const w = BrowserWindow.getAllWindows()[0];
+    w?.webContents?.send('flowkit:status', 'stopped');
+  });
+  _flowkitProc.on('error', (e) => {
+    pushLog(`[FlowKit] Lỗi spawn: ${e.message}`);
+    _flowkitProc = null;
+    const w = BrowserWindow.getAllWindows()[0];
+    w?.webContents?.send('flowkit:status', 'stopped');
+  });
+
+  const w = win || BrowserWindow.getAllWindows()[0];
+  w?.webContents?.send('flowkit:status', 'started');
+  return { ok: true, msg: `Đã khởi động agent (${pythonCmd})` };
+}
+
+function stopFlowkitAgent() {
+  if (!_flowkitProc || _flowkitProc.killed) return { ok: false, msg: 'Agent chưa chạy' };
+  _flowkitProc.kill('SIGTERM');
+  setTimeout(() => { if (_flowkitProc && !_flowkitProc.killed) _flowkitProc.kill('SIGKILL'); }, 3000);
+  return { ok: true, msg: 'Đang dừng agent...' };
+}
+
+function updateTrayMenu() {
+  if (!tray) return;
+  const schedLabel = _fbScheduleActive
+    ? `⏰ Auto-post đang chạy — lần sau: ${_fbScheduleNext > Date.now() ? Math.ceil((_fbScheduleNext - Date.now()) / 60000) + ' phút' : 'sắp đăng'}`
+    : '● Không có lịch';
+  const menu = Menu.buildFromTemplate([
+    { label: 'Mở Fluxy', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
+    { type: 'separator' },
+    { label: schedLabel, enabled: false },
+    { type: 'separator' },
+    { label: 'Thoát hoàn toàn', click: () => { app.isQuitting = true; app.quit(); } },
+  ]);
+  tray.setContextMenu(menu);
+  tray.setToolTip(_fbScheduleActive ? `Fluxy – Auto-post đang chạy` : 'Fluxy – đang chạy ngầm');
+}
+
+function createTray() {
+  const iconPath = path.join(__dirname, '../../assets/icon.png');
+  const icon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
+  tray = new Tray(icon);
+  updateTrayMenu();
+  tray.on('double-click', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } });
+  // Refresh label mỗi phút (cập nhật thời gian đếm ngược)
+  setInterval(updateTrayMenu, 60000);
 }
 
 function setupIpcHandlers() {
   ipcMain.handle('app:get-version', () => app.getVersion());
+  ipcMain.handle('flowkit:get-extension-path', () => {
+    return app.isPackaged
+      ? path.join(process.resourcesPath, 'FluxyExtension')
+      : path.join(app.getAppPath(), 'FluxyExtension-main');
+  });
+  ipcMain.handle('flowkit:start-agent', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return startFlowkitAgent(win);
+  });
+  ipcMain.handle('flowkit:stop-agent', () => stopFlowkitAgent());
+  ipcMain.handle('flowkit:agent-running', () => !!(_flowkitProc && !_flowkitProc.killed));
+  ipcMain.handle('flowkit:get-logs', () => _flowkitLogs);
+  ipcMain.handle('flowkit:install-deps', async (event) => {
+    return new Promise((resolve) => {
+      const flowDir = getFlowkitDir();
+      if (!fs.existsSync(flowDir)) return resolve({ ok: false, msg: 'Thư mục flowkit không tồn tại' });
+      const { spawn } = require('child_process');
+      const pythonCmd = findPythonCmd();
+      if (!pythonCmd) return resolve({ ok: false, msg: 'Không tìm thấy Python. Cài Python 3.10+ từ python.org.' });
+      const proc = spawn(pythonCmd, ['-m', 'pip', 'install', '-r', 'requirements.txt'], {
+        cwd: flowDir, windowsHide: true,
+      });
+      const win = BrowserWindow.fromWebContents(event.sender);
+      proc.stdout.on('data', d => d.toString().split('\n').filter(Boolean).forEach(l => win?.webContents?.send('flowkit:log', l)));
+      proc.stderr.on('data', d => d.toString().split('\n').filter(Boolean).forEach(l => win?.webContents?.send('flowkit:log', l)));
+      proc.on('exit', code => resolve({ ok: code === 0, msg: code === 0 ? 'Cài thư viện xong!' : `Lỗi pip (exit ${code})` }));
+      proc.on('error', e => resolve({ ok: false, msg: `Không tìm thấy Python: ${e.message}` }));
+    });
+  });
+
+  // FB schedule status → cập nhật tray tooltip
+  ipcMain.on('fb:schedule-status', (_, { active, nextAt }) => {
+    _fbScheduleActive = !!active;
+    _fbScheduleNext   = Number(nextAt) || 0;
+    updateTrayMenu();
+  });
 
   ipcMain.handle('app:get-system-gemini-keys', () => {
     try {
@@ -644,6 +671,7 @@ function setupIpcHandlers() {
   ipcMain.handle('shell:open-folder', async (event, folderPath) => { await shell.openPath(folderPath); return true; });
   ipcMain.handle('shell:open-file', async (event, filePath) => { await shell.openPath(filePath); return true; });
   ipcMain.handle('shell:open-external', async (event, url) => { await shell.openExternal(url); return true; });
+  ipcMain.handle('shell:show-item-in-folder', async (event, filePath) => { shell.showItemInFolder(filePath); return true; });
 
   // Kiểm tra extension đã kết nối Google Labs chưa
   ipcMain.handle('labs:check-auth', () => {
@@ -1747,6 +1775,47 @@ function setupProtocol() {
   });
 }
 
+// ── Facebook OAuth via custom protocol fluxy:// ────────────────────────────
+let _fbOAuthResolve = null;
+
+function handleFbOAuthUrl(rawUrl) {
+  if (!_fbOAuthResolve) return;
+  const resolve = _fbOAuthResolve;
+  _fbOAuthResolve = null;
+  try {
+    const u = new URL(rawUrl);
+    const code  = u.searchParams.get('code');
+    const error = u.searchParams.get('error');
+    if (error || !code) { resolve({ success: false, error: error || 'no_code' }); return; }
+    const { FB_APP_ID: appId, FB_APP_SECRET: appSecret } = require('./fb-config');
+    const redirectUri = 'fluxy://oauth/callback';
+    const { exchangeCode, exchangeToken, getPages } = require('./services/facebook-post');
+    exchangeCode(code, appId, appSecret, redirectUri)
+      .then(short => exchangeToken(short.access_token, appId, appSecret))
+      .then(long  => getPages(long.access_token).then(pages => resolve({ success: true, pages, expiresIn: long.expires_in })))
+      .catch(e => resolve({ success: false, error: e.message }));
+  } catch(e) { resolve({ success: false, error: e.message }); }
+}
+
+app.setAsDefaultProtocolClient('fluxy');
+
+// Windows: second instance nhận URL qua argv
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) { app.quit(); }
+else {
+  app.on('second-instance', (_e, argv) => {
+    const url = argv.find(a => a.startsWith('fluxy://'));
+    if (url) handleFbOAuthUrl(url);
+    if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); }
+  });
+}
+
+// Mac: open-url event
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  if (url.startsWith('fluxy://oauth/')) handleFbOAuthUrl(url);
+});
+
 // Đọc file ảnh local → base64 data URL (dùng cho canvas preview)
 ipcMain.handle('read-image-as-dataurl', (event, filePath) => {
   try {
@@ -1765,16 +1834,25 @@ app.whenReady().then(async () => {
     registerUpdaterHandlers();
     setupProtocol();
     createWindow();
+    createTray();
     const mainWin = BrowserWindow.getAllWindows()[0];
     registerDownloaderHandlers(mainWin);
+    registerGroqWhisperHandlers();
     // Auto-check update sau 5s để app ổn định trước
     setTimeout(() => checkForUpdates(mainWin), 5000);
     // Auto-start tất cả TTS server đã cài sau 4s (để renderer load xong)
-    setTimeout(() => {
+    setTimeout(async () => {
       const win = BrowserWindow.getAllWindows()[0];
       for (const { name, startFn } of _ttsAutoStartRegistry) {
         startFn(win).catch(e => console.log(`[auto-start] ${name} lỗi:`, e.message));
       }
+      // Auto-start FlowKit agent nếu user đã bật
+      try {
+        const autoStart = await db.getSetting('flowkit_autostart', 'false');
+        if (autoStart === 'true') {
+          setTimeout(() => startFlowkitAgent(win), 1000);
+        }
+      } catch(_) {}
     }, 4000);
   } catch (error) { dialog.showErrorBox('Khởi động thất bại', error.message); app.quit(); }
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
@@ -4027,6 +4105,7 @@ ipcMain.handle('chatterbox:synthesize-srt', async (event, { segments, outputPath
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('before-quit', async () => {
+  stopFlowkitAgent();
   if (queueManager) await queueManager.stop();
   if (db) db.close();
 });
@@ -4121,7 +4200,7 @@ ipcMain.handle('gemini:tts', async (event, { text, voiceName, apiKey, apiKeys, o
         const keys   = Array.isArray(apiKeys) && apiKeys.length ? apiKeys : (apiKey ? [apiKey] : []);
         if (!keys.length) return { success: false, error: 'Không có API Key Gemini' };
 
-        const model    = ttsModel || 'gemini-2.5-flash-preview-tts';
+        const model    = ttsModel || 'gemini-3.5-flash-preview-tts';
         const MAX_CHARS = 3000; // 3k chars/chunk — cắt hết câu, an toàn nhất
         const SAMPLE_RATE = 24000, NUM_CH = 1, BPS = 2; // 16-bit PCM mono
 
@@ -4619,7 +4698,7 @@ ipcMain.handle('gemini:translate-srt', async (event, { segments, targetLang, tar
         }), 'utf-8');
         const req = https.request({
             hostname: 'generativelanguage.googleapis.com',
-            path: `/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
+            path: `/v1beta/models/gemini-3.5-flash:generateContent?key=${key}`,
             method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': body.length }
         }, res => {
             let data = '';
@@ -4729,7 +4808,7 @@ ipcMain.handle('gemini:tts-srt', async (event, { segments, voiceName, apiKey, ap
             }), 'utf-8');
             const req = https.request({
                 hostname: 'generativelanguage.googleapis.com',
-                path: `/v1beta/models/${ttsModel || 'gemini-2.5-flash-preview-tts'}:generateContent?key=${key}`,
+                path: `/v1beta/models/${ttsModel || 'gemini-3.5-flash-preview-tts'}:generateContent?key=${key}`,
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Content-Length': bodyBuf.length }
             }, res => {
@@ -6132,7 +6211,9 @@ ipcMain.handle('video:extract-images', async (event, { inputPath, interval, outp
 ipcMain.handle('watermark:auto-remove', async (event, { folder }) => {
     return new Promise((resolve) => {
         const scriptPath = path.join(__dirname, 'watermark_auto.py');
-        const python = spawn('python', [scriptPath, folder]);
+        const pythonCmd = findPython();
+        if (!pythonCmd) return resolve({ success: false, error: 'Không tìm thấy Python. Hãy cài Python 3.8+ từ python.org rồi thử lại.' });
+        const python = spawn(pythonCmd, [scriptPath, folder]);
         let settled = false;
         const done = (val) => { if (!settled) { settled = true; resolve(val); } };
 
@@ -6183,7 +6264,9 @@ ipcMain.handle('watermark:auto-remove', async (event, { folder }) => {
 ipcMain.handle('watermark:auto-crop', async (event, { folder }) => {
     return new Promise((resolve) => {
         const scriptPath = path.join(__dirname, 'watermark_auto.py');
-        const python = spawn('python', [scriptPath, folder, '--crop']);
+        const pythonCmd = findPython();
+        if (!pythonCmd) return resolve({ success: false, error: 'Không tìm thấy Python. Hãy cài Python 3.8+ từ python.org rồi thử lại.' });
+        const python = spawn(pythonCmd, [scriptPath, folder, '--crop']);
         let settled = false;
         const done = (val) => { if (!settled) { settled = true; resolve(val); } };
 
@@ -6231,7 +6314,9 @@ ipcMain.handle('watermark:auto-crop', async (event, { folder }) => {
 ipcMain.handle('watermark:detect-only', async (event, { folder }) => {
     return new Promise((resolve) => {
         const scriptPath = path.join(__dirname, 'watermark_auto.py');
-        const python = spawn('python', [scriptPath, folder, '--detect-only']);
+        const pythonCmd = findPython();
+        if (!pythonCmd) return resolve({ success: false, error: 'Không tìm thấy Python. Hãy cài Python 3.8+ từ python.org rồi thử lại.', regions: [] });
+        const python = spawn(pythonCmd, [scriptPath, folder, '--detect-only']);
         let output = '';
         python.stdout.on('data', (d) => { output += d.toString(); });
         python.on('error', (err) => resolve({ success: false, error: err.message, regions: [] }));
@@ -7343,6 +7428,23 @@ ipcMain.handle('fs:list-files', async (event, folderPath) => {
     } catch (e) { return { success: false, error: e.message, files: [] }; }
 });
 
+ipcMain.handle('fs:list-images-recursive', async (_, folderPath) => {
+  const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp']);
+  const results = [];
+  function scan(dir) {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { scan(full); }
+        else if (IMAGE_EXTS.has(entry.name.split('.').pop()?.toLowerCase())) results.push(full);
+      }
+    } catch (_) {}
+  }
+  scan(folderPath);
+  return { success: true, files: results };
+});
+
 ipcMain.handle('fs:read-text-file', async (_e, filePath) => {
     try {
         const content = fs.readFileSync(filePath, 'utf8');
@@ -7419,30 +7521,38 @@ const _findYtDlpBin = () => {
 const _ytdlpAutoInstalling = { promise: null };
 let _currentYtDlProc = null;
 ipcMain.handle('youtube:abort-download', () => { if (_currentYtDlProc?._abort) _currentYtDlProc._abort(); });
-const _ensureYtDlpBin = () => {
-    const found = _findYtDlpBin();
-    if (found) return Promise.resolve(found);
-    // Tránh download 2 lần song song
-    if (_ytdlpAutoInstalling.promise) return _ytdlpAutoInstalling.promise;
-    const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
+
+const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
+const _downloadYtDlp = () => {
+    const https = require('https'); const http = require('http');
     const dest = path.join(app.getPath('userData'), 'tools', 'yt-dlp.exe');
-    const https = require('https');
-    const http  = require('http');
-    const downloadWithRedirect = (url, toPath, hops = 0) => new Promise((resolve, reject) => {
+    try { require('fs').mkdirSync(path.join(app.getPath('userData'), 'tools'), { recursive: true }); } catch (_) {}
+    const dl = (u, to, hops = 0) => new Promise((resolve, reject) => {
         if (hops > 10) return reject(new Error('Too many redirects'));
-        const mod = url.startsWith('https') ? https : http;
-        mod.get(url, { timeout: 180000 }, (res) => {
+        const mod = u.startsWith('https') ? https : http;
+        mod.get(u, { timeout: 180000 }, (res) => {
             if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
-                return downloadWithRedirect(res.headers.location, toPath, hops + 1).then(resolve).catch(reject);
+                return dl(res.headers.location, to, hops + 1).then(resolve).catch(reject);
             if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
-            const file = require('fs').createWriteStream(toPath);
+            const file = require('fs').createWriteStream(to);
             res.pipe(file);
-            file.on('finish', () => file.close(() => resolve(toPath)));
+            file.on('finish', () => file.close(() => resolve(to)));
             file.on('error', reject);
         }).on('error', reject).on('timeout', function() { this.destroy(); reject(new Error('Timeout')); });
     });
-    try { require('fs').mkdirSync(path.join(app.getPath('userData'), 'tools'), { recursive: true }); } catch (_) {}
-    _ytdlpAutoInstalling.promise = downloadWithRedirect(YTDLP_URL, dest)
+    return dl(YTDLP_URL, dest).then(() => dest);
+};
+// Cập nhật yt-dlp (force re-download)
+ipcMain.handle('youtube:update-ytdlp', async () => {
+    try { const p = await _downloadYtDlp(); return { success: true, path: p }; }
+    catch (e) { return { success: false, error: e.message }; }
+});
+
+const _ensureYtDlpBin = () => {
+    const found = _findYtDlpBin();
+    if (found) return Promise.resolve(found);
+    if (_ytdlpAutoInstalling.promise) return _ytdlpAutoInstalling.promise;
+    _ytdlpAutoInstalling.promise = _downloadYtDlp()
         .then(p => { _ytdlpAutoInstalling.promise = null; return p; })
         .catch(e => { _ytdlpAutoInstalling.promise = null; throw e; });
     return _ytdlpAutoInstalling.promise;
@@ -7758,27 +7868,31 @@ ipcMain.handle('youtube:download-best', async (_e, { url, outputDir, videoId, qu
     let ytdlpPath;
     try { ytdlpPath = await _ensureYtDlpBin(); } catch (e) { return { success: false, error: `Không tải được yt-dlp: ${e.message}` }; }
 
-    const h = (quality && quality !== 'best') ? `[height<=${quality}]` : '';
-    const qualityFormat = [
-        `bestvideo[vcodec^=avc1]${h}+bestaudio/bestvideo[vcodec^=avc]${h}+bestaudio`,
-        `bestvideo[ext=mp4]${h}+bestaudio[ext=m4a]/bestvideo${h}+bestaudio`,
-        `best${h}`,
-    ].join('/');
+    const maxH = (quality && quality !== 'best') ? quality : '1080';
+    // bestvideo không filter codec — lấy VP9/AV1/H264 tuỳ cái nào có 1080p
+    const qualityFormat = `bestvideo[height<=${maxH}]+bestaudio[ext=m4a]/bestvideo[height<=${maxH}]+bestaudio/bestvideo+bestaudio/best`;
     const outputTemplate = path.join(outputDir, '%(title)s.%(ext)s');
 
-    const isBotBlock = (s) => s && (s.includes('Sign in') || s.includes('bot') || s.includes('confirm you') || s.includes('cookies'));
+    const isBotBlock = (s) => s && (
+        s.includes('Sign in') || s.includes('bot') || s.includes('confirm you') ||
+        s.includes('403') || s.includes('Forbidden') || s.includes('HTTP Error 4')
+    );
+    const isCookieErr = (e) => e && (e.includes('cookie') || e.includes('Cookie') || e.includes('Could not copy') || e.includes('decrypt'));
 
-    const buildArgs = (withCookies = false) => {
+    const nodePath = (() => { try { return require('child_process').execSync('where node', { encoding: 'utf8' }).trim().split('\n')[0].trim(); } catch { return 'node'; } })();
+    const buildArgs = (playerClient = 'web,android,ios', withCookies = false, browser = 'chrome') => {
         const a = [
             url, '-f', qualityFormat,
+            '--format-sort', `res:${maxH},ext:mp4:m4a`,
             '-o', outputTemplate,
             '--merge-output-format', 'mp4',
+            '--force-overwrites',
             '--no-playlist', '--newline',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-            '--extractor-args', 'youtube:player_client=web,default',
-            '--retries', '5', '--fragment-retries', '5',
+            '--js-runtimes', `node:${nodePath}`,  // cần để YouTube trả 1080p
+            '--extractor-args', `youtube:player_client=${playerClient}`,
+            '--retries', '3', '--fragment-retries', '3',
         ];
-        if (withCookies) a.push('--cookies-from-browser', 'chrome');
+        if (withCookies) a.push('--cookies-from-browser', browser);
         return a;
     };
 
@@ -7820,18 +7934,24 @@ ipcMain.handle('youtube:download-best', async (_e, { url, outputDir, videoId, qu
         proc._abort = () => { aborted = true; try { proc.kill('SIGTERM'); } catch(_) {} };
     });
 
-    // Lần 1: không cookie
-    let result = await runProc(buildArgs(false));
-    if (!result.success && !result.aborted && result.botBlock) {
-        // Bị bot-check → thử lại với cookie Chrome
-        try { _e.sender.send('youtube:download-progress', { videoId, percent: 0, speed: '', eta: '🍪 Bị bot-check → thử lại với cookie Chrome...' }); } catch(_) {}
-        result = await runProc(buildArgs(true));
-        // Nếu Chrome không có cookie → thử Edge
-        if (!result.success && !result.aborted && result.botBlock) {
-            const edgeArgs = buildArgs(false);
-            edgeArgs.push('--cookies-from-browser', 'edge');
-            result = await runProc(edgeArgs);
-        }
+    const sendEta = (msg) => { try { _e.sender.send('youtube:download-progress', { videoId, percent: 0, speed: '', eta: msg }); } catch(_) {} };
+    const need403Retry = (r) => !r.success && !r.aborted && r.botBlock;
+    const needCookieRetry = (r) => !r.success && !r.aborted && isCookieErr(r.error);
+    // Lần 1: android client — bypass 403 không cần cookie (cần yt-dlp mới)
+    let result = await runProc(buildArgs('android,tv_embedded,ios,web'));
+    // Nếu 403 → thử cookie Edge (ít bị lock nhất trên Windows)
+    if (need403Retry(result)) {
+        sendEta('🌐 403 → thử cookie Edge...');
+        result = await runProc(buildArgs('android,web', true, 'edge'));
+    }
+    // Cookie bị lock (Chrome/Edge đang chạy) → auto-update yt-dlp rồi thử lại không cookie
+    if (needCookieRetry(result) || need403Retry(result)) {
+        sendEta('⬆ Đang cập nhật yt-dlp...');
+        try {
+            ytdlpPath = await _downloadYtDlp();
+            sendEta('🔄 Thử lại với yt-dlp mới...');
+            result = await runProc(buildArgs('android,tv_embedded,ios,web'));
+        } catch (_) {}
     }
     return result;
 });
@@ -8024,9 +8144,158 @@ ipcMain.handle('path:join-downloads', async (event, filename) => {
   return path.join(downloadsDir, filename);
 });
 
+// ── FLOWKIT: save image bytes to disk ────────────────────────────────────────
+ipcMain.handle('fk:save-image-bytes', async (event, filePath, bytes) => {
+  try {
+    const buf = Buffer.from(bytes);
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(filePath, buf);
+    return { ok: true, path: filePath };
+  } catch(e) { return { ok: false, error: e.message }; }
+});
+
+// ── List directory filenames ──────────────────────────────────────────────────
+ipcMain.handle('fs:list-dir', async (event, dirPath) => {
+  try {
+    if (!fs.existsSync(dirPath)) return [];
+    return fs.readdirSync(dirPath).filter(f => !fs.statSync(path.join(dirPath, f)).isDirectory());
+  } catch(e) { return []; }
+});
+
+// ── FLOWKIT: download URL → save to disk (bypasses renderer CORS) ─────────────
+ipcMain.handle('fk:download-url', async (event, url, filePath) => {
+  try {
+    const https = require('https');
+    const http = require('http');
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    await new Promise((resolve, reject) => {
+      const proto = url.startsWith('https') ? https : http;
+      proto.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          proto.get(res.headers.location, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res2) => {
+            const ws = fs.createWriteStream(filePath);
+            res2.pipe(ws);
+            ws.on('finish', resolve);
+            ws.on('error', reject);
+          }).on('error', reject);
+          return;
+        }
+        const ws = fs.createWriteStream(filePath);
+        res.pipe(ws);
+        ws.on('finish', resolve);
+        ws.on('error', reject);
+      }).on('error', reject);
+    });
+    return { ok: true, path: filePath };
+  } catch(e) { return { ok: false, error: e.message }; }
+});
+
 ipcMain.handle('shell:open-path', async (event, filePath) => {
   await shell.openPath(path.dirname(filePath));
   return true;
+});
+
+// ── Read file as base64 (for posting binary files via renderer fetch) ─────────
+ipcMain.handle('fs:read-base64', async (event, filePath) => {
+  try {
+    const buf = fs.readFileSync(filePath);
+    return buf.toString('base64');
+  } catch(e) { return null; }
+});
+
+// ── Viral image gen: chạy Python PIL để tạo ảnh đếm con vật ─────────────────
+ipcMain.handle('viral:gen-image', async (event, { assetsFolder, animalName, bgColor }) => {
+  const { BrowserWindow: HiddenWin } = require('electron');
+  const os = require('os');
+  const base = assetsFolder || 'D:\\EyesAssets';
+  let validAnimals;
+  try {
+    validAnimals = fs.readdirSync(base).filter(d => {
+      try { return fs.statSync(path.join(base, d)).isDirectory(); } catch { return false; }
+    });
+  } catch { validAnimals = []; }
+  if (!validAnimals.length) return { ok: false, error: 'Không tìm thấy thư mục ảnh trong ' + base };
+
+  const chosen = (animalName && validAnimals.includes(animalName))
+    ? animalName
+    : validAnimals[Math.floor(Math.random() * validAnimals.length)];
+  const animalDir = path.join(base, chosen);
+  const outPath = path.join(os.tmpdir(), `viral_${Date.now()}.png`);
+  const bg = bgColor || '#22b0f0';
+
+  let imgPaths;
+  try {
+    imgPaths = fs.readdirSync(animalDir)
+      .filter(f => /\.(png|jpg|jpeg)$/i.test(f))
+      .map(f => ({ p: path.join(animalDir, f), size: fs.statSync(path.join(animalDir, f)).size }))
+      .sort((a, b) => b.size - a.size)
+      .slice(0, 8)
+      .map(f => f.p.replace(/\\/g, '/'));
+  } catch (e) { return { ok: false, error: e.message }; }
+  if (!imgPaths.length) return { ok: false, error: 'Không có ảnh trong ' + animalDir };
+
+  const W = 1080, H = 1080;
+  const htmlContent = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>*{margin:0;padding:0;overflow:hidden}</style></head>
+<body><canvas id="c" width="${W}" height="${H}"></canvas><script>
+(async()=>{
+  const srcs=${JSON.stringify(imgPaths.map(p=>'file:///'+p))};
+  const bg=${JSON.stringify(bg)};
+  const W=${W},H=${H},COLS=3,ROWS=3,PAD=30;
+  const cellW=Math.floor((W-PAD*2)/COLS),cellH=Math.floor((H-PAD*2)/ROWS);
+  const pool=await Promise.all(srcs.map(s=>new Promise(r=>{const i=new Image();i.onload=()=>r(i);i.onerror=()=>r(null);i.src=s;})));
+  const imgs=pool.filter(Boolean);
+  if(!imgs.length){window.__done__='ERROR:no images';return;}
+  const cvs=document.getElementById('c'),ctx=cvs.getContext('2d');
+  ctx.fillStyle=bg;ctx.fillRect(0,0,W,H);
+  for(let row=0;row<ROWS;row++){
+    for(let col=0;col<COLS;col++){
+      const cx=PAD+col*cellW,cy=PAD+row*cellH;
+      const picks=[...imgs].sort(()=>Math.random()-0.5).slice(0,3);
+      const factors=[0.50+Math.random()*0.10,0.62+Math.random()*0.10,0.78+Math.random()*0.12];
+      const ox=[[2+Math.random()*18,2+Math.random()*13],[15+Math.random()*20,10+Math.random()*15],[10+Math.random()*20,15+Math.random()*15]];
+      for(let i=0;i<picks.length;i++){
+        const sz=Math.floor(Math.min(cellW,cellH)*factors[i]);
+        const ang=(Math.random()-0.5)*16*Math.PI/180;
+        ctx.save();ctx.translate(cx+ox[i][0]+sz/2,cy+ox[i][1]+sz/2);ctx.rotate(ang);ctx.drawImage(picks[i],-sz/2,-sz/2,sz,sz);ctx.restore();
+      }
+    }
+  }
+  window.__done__=cvs.toDataURL('image/png');
+})();
+</script></body></html>`;
+
+  const tmpHtml = path.join(os.tmpdir(), `viral_canvas_${Date.now()}.html`);
+  fs.writeFileSync(tmpHtml, htmlContent, 'utf8');
+
+  return new Promise((resolve) => {
+    const win = new HiddenWin({ width: W, height: H, show: false,
+      webPreferences: { offscreen: true, nodeIntegration: false, contextIsolation: false, webSecurity: false } });
+    win.loadFile(tmpHtml);
+    let attempts = 0;
+    const check = setInterval(async () => {
+      attempts++;
+      try {
+        const result = await win.webContents.executeJavaScript('window.__done__');
+        if (result) {
+          clearInterval(check);
+          try { win.close(); } catch {}
+          try { fs.unlinkSync(tmpHtml); } catch {}
+          if (result.startsWith('ERROR:')) return resolve({ ok: false, error: result.slice(6) });
+          const b64 = result.split(',')[1];
+          fs.writeFileSync(outPath, Buffer.from(b64, 'base64'));
+          resolve({ ok: true, path: outPath, animalName: chosen });
+        } else if (attempts > 40) {
+          clearInterval(check);
+          try { win.close(); } catch {}
+          resolve({ ok: false, error: 'Timeout tạo ảnh' });
+        }
+      } catch (_) {
+        if (attempts > 40) { clearInterval(check); try { win.close(); } catch {}; resolve({ ok: false, error: 'Lỗi canvas' }); }
+      }
+    }, 300);
+  });
 });
 
 // ── Crop-zoom video để che logo Veo góc dưới phải ────────────────────────────
@@ -9183,7 +9452,59 @@ ipcMain.handle('remotion:get-public-dir', () => {
 });
 
 // Copy file vào remotion/public/{destName} (mặc định narration.wav)
-ipcMain.handle('remotion:copy-audio-to-public', async (_, { srcPath, destName }) => {
+// Clip DVIDS mở đầu bằng slate (chữ trắng trên nền đen: mã hiệu, người quay, email) + màn đen,
+// đôi khi dải màu kiểm tra; time_start của DVIDS thường = 0 → tự dò khung hình đầu tiên là cảnh thật.
+// Quét 30s đầu ở 4 khung/giây, thu nhỏ 32x18 xám. Không tìm thấy (vd cảnh đêm tối cả đoạn) → giữ startSec.
+function detectContentStart(src, startSec = 0) {
+  return new Promise((resolve) => {
+    const W = 32, H = 18, FPS = 4, SCAN_SEC = 30;
+    const ffmpegPath = require('ffmpeg-static');
+    const args = ['-v', 'error', ...(startSec > 0 ? ['-ss', String(startSec)] : []), '-t', String(SCAN_SEC), '-i', src,
+      '-vf', `fps=${FPS},scale=${W}:${H}:flags=area,format=gray`, '-f', 'rawvideo', '-'];
+    const proc = require('child_process').spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    const chunks = [];
+    proc.stdout.on('data', d => chunks.push(d));
+    proc.on('error', () => resolve(startSec));
+    proc.on('close', () => {
+      const buf = Buffer.concat(chunks);
+      const n = Math.floor(buf.length / (W * H));
+      const frameAt = (f) => buf.subarray(f * W * H, (f + 1) * W * H);
+      // Khung đứng yên so với khung kề: slate là ảnh tĩnh, cảnh đêm thật vẫn có chuyển động
+      const isStatic = (f) => {
+        const g = f > 0 ? f - 1 : f + 1;
+        if (g >= n) return false;
+        const a = frameAt(f), b = frameAt(g);
+        let d = 0;
+        for (let i = 0; i < a.length; i++) d += Math.abs(a[i] - b[i]);
+        return d / a.length < 1.5;
+      };
+      const isFiller = (f) => {
+        const px = frameAt(f);
+        let dark = 0, sum = 0;
+        for (const v of px) { if (v < 35) dark++; sum += v; }
+        if (dark / px.length > 0.85) return true;             // màn đen / slate ít chữ
+        if (dark / px.length > 0.6 && sum / px.length < 40 && isStatic(f)) return true; // slate nhiều chữ trên nền đen
+        let uniformCols = 0;                                   // dải màu kiểm tra: mỗi cột gần như một màu
+        for (let x = 0; x < W; x++) {
+          let mn = 255, mx = 0;
+          for (let y = 0; y < H; y++) { const v = px[y * W + x]; if (v < mn) mn = v; if (v > mx) mx = v; }
+          if (mx - mn < 12) uniformCols++;
+        }
+        return uniformCols / W > 0.9 && sum / px.length > 60;
+      };
+      for (let f = 0; f + FPS <= n; f++) {
+        let ok = true;
+        for (let k = 0; k < FPS; k++) if (isFiller(f + k)) { ok = false; break; }
+        if (ok) return resolve(startSec + f / FPS);
+      }
+      resolve(startSec);
+    });
+  });
+}
+
+// startSec/maxDurationSec (clip stock): chỉ chuyển mã đoạn cảnh dùng tới — clip DVIDS dài vài phút
+// mà cảnh chỉ 4-8s, chuyển mã cả clip x10 luồng song song rất chậm và nặng RAM
+ipcMain.handle('remotion:copy-audio-to-public', async (_, { srcPath, destName, startSec = 0, maxDurationSec = 0 }) => {
   const { REMOTION_DIR } = require('./services/remotion-render');
   const publicDir = path.join(REMOTION_DIR, 'public');
   const destPath = path.join(publicDir, destName || 'narration.wav');
@@ -9198,25 +9519,32 @@ ipcMain.handle('remotion:copy-audio-to-public', async (_, { srcPath, destName })
   // Video: transcode sang H.264 30fps CFR để Remotion render mượt (tránh giật frame)
   const isVideo = /\.(mp4|mov|avi|mkv|webm)$/i.test(resolvedSrc);
   if (isVideo) {
+    const trim = maxDurationSec > 0;
+    // Clip stock: bỏ slate/màn đen/dải màu đầu clip
+    const contentStart = trim ? await detectContentStart(resolvedSrc, startSec) : startSec;
     try {
       const ffmpegPath = require('ffmpeg-static');
       await new Promise((res, rej) => {
         const proc = require('child_process').spawn(ffmpegPath, [
-          '-y', '-i', resolvedSrc,
+          '-y',
+          ...(trim && contentStart > 0 ? ['-ss', String(contentStart)] : []),
+          '-i', resolvedSrc,
+          ...(trim ? ['-t', String(maxDurationSec)] : []),
           // Force 30fps CFR — bắt buộc để Remotion không bị giật khi FPS khác nhau
           '-vf', 'fps=30,scale=trunc(iw/2)*2:trunc(ih/2)*2',
           '-r', '30',
           '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
           '-profile:v', 'high', '-level', '4.1',
           '-pix_fmt', 'yuv420p',         // Chrome/Puppeteer cần yuv420p
-          '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
+          // B-roll luôn muted trong Remotion → clip đã cắt bỏ luôn tiếng
+          ...(trim ? ['-an'] : ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100']),
           '-movflags', '+faststart',
           destPath,
         ], { stdio: 'ignore' });
         proc.on('close', code => code === 0 ? res() : rej(new Error(`ffmpeg exit ${code}`)));
         proc.on('error', rej);
       });
-      return { success: true, destPath };
+      return { success: true, destPath, contentStartSec: contentStart };
     } catch (_) {
       fs.copyFileSync(resolvedSrc, destPath);
     }
@@ -9260,6 +9588,43 @@ ipcMain.handle('remotion:copy-ref-images-to-public', async (_, { filePaths }) =>
 });
 
 const _refExtMime = { jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', webp:'image/webp', gif:'image/gif', mp4:'video/mp4', mov:'video/quicktime', avi:'video/x-msvideo', mkv:'video/x-matroska', webm:'video/webm' };
+
+// Chọn video nguồn để chỉnh sửa + copy vào remotion/public/input.mp4
+ipcMain.handle('remotion:select-source-video', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Chọn video nguồn để chỉnh sửa',
+    properties: ['openFile'],
+    filters: [{ name: 'Video', extensions: ['mp4','mov','avi','mkv','webm'] }],
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  const fp = result.filePaths[0];
+  const ext = path.extname(fp).slice(1).toLowerCase();
+  const stat = fs.statSync(fp);
+  // Lấy duration bằng ffprobe
+  let durationSec = 0;
+  try {
+    const out = require('child_process').execSync(
+      `"${ffprobePath}" -v quiet -print_format json -show_format "${fp}"`,
+      { timeout: 10000 }
+    ).toString();
+    durationSec = parseFloat(JSON.parse(out)?.format?.duration || '0');
+  } catch (_) {}
+  return { path: fp, name: path.basename(fp), mimeType: _refExtMime[ext] || 'video/mp4', size: stat.size, durationSec };
+});
+
+// Copy video nguồn vào remotion/public/input.mp4 (dùng cho <Video src={staticFile('input.mp4')} />)
+ipcMain.handle('remotion:copy-video-to-public', async (_, { srcPath }) => {
+  const { REMOTION_DIR } = require('./services/remotion-render');
+  const publicDir = path.join(REMOTION_DIR, 'public');
+  fs.mkdirSync(publicDir, { recursive: true });
+  const destPath = path.join(publicDir, 'input.mp4');
+  try {
+    fs.copyFileSync(srcPath, destPath);
+    return { success: true, destPath };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
 
 ipcMain.handle('remotion:select-reference-files', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
@@ -9470,6 +9835,34 @@ ipcMain.handle('remixer:cut-clip', async (event, { inputPath, startSec, endSec, 
   });
 });
 
+// Open Remotion Studio preview server — write plan then launch studio in browser
+let _previewProc = null;
+ipcMain.handle('remixer:open-preview', async (event, { plan }) => {
+  const { REMOTION_DIR } = require('./services/remotion-render');
+  // 1. Write plan
+  const planPath = path.join(REMOTION_DIR, 'src', 'remixer', 'edit-plan.json');
+  fs.mkdirSync(path.dirname(planPath), { recursive: true });
+  fs.writeFileSync(planPath, JSON.stringify(plan, null, 2), 'utf8');
+  // 2. Kill existing preview if running
+  if (_previewProc && !_previewProc.killed) {
+    try { _previewProc.kill(); } catch (_) {}
+    _previewProc = null;
+  }
+  // 3. Start Remotion Studio on port 3099
+  const entryFile = path.join('src', 'remixer', 'RemixerIndex.jsx');
+  const PORT = 3099;
+  _previewProc = spawn('npx', ['remotion', 'studio', entryFile, `--port=${PORT}`], {
+    cwd: REMOTION_DIR, shell: true, detached: false,
+  });
+  _previewProc.on('error', () => {});
+  _previewProc.stdout?.on('data', () => {});
+  _previewProc.stderr?.on('data', () => {});
+  // 4. Wait ~4s for server to start then open browser
+  await new Promise(r => setTimeout(r, 4000));
+  require('electron').shell.openExternal(`http://localhost:${PORT}`);
+  return { success: true, port: PORT };
+});
+
 // Write edit-plan.json to remotion/src/remixer/
 ipcMain.handle('remixer:write-plan', async (_, { plan }) => {
   const { REMOTION_DIR } = require('./services/remotion-render');
@@ -9479,16 +9872,108 @@ ipcMain.handle('remixer:write-plan', async (_, { plan }) => {
   return { success: true, planPath };
 });
 
+// Độ sáng trung bình (0-255) của ảnh, hoặc của 1 khung video tại atSec. null = không đọc/giải mã được
+function measureBrightness(file, atSec = null) {
+  return new Promise((resolve) => {
+    const args = ['-v', 'error', ...(atSec != null ? ['-ss', String(atSec)] : []), '-i', file,
+      '-frames:v', '1', '-vf', 'scale=1:1:flags=area,format=gray', '-f', 'rawvideo', '-'];
+    const proc = require('child_process').spawn(require('ffmpeg-static'), args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    const chunks = [];
+    const timer = setTimeout(() => { try { proc.kill(); } catch (_) {} resolve(null); }, 20000);
+    proc.stdout.on('data', d => chunks.push(d));
+    proc.on('error', () => { clearTimeout(timer); resolve(null); });
+    proc.on('close', () => { clearTimeout(timer); const b = Buffer.concat(chunks); resolve(b.length ? b[0] : null); });
+  });
+}
+
+// Chốt chặn cuối trước render: ảnh/video bị thiếu, hỏng, đen thui (ảnh AI lỗi, fallback trống, tải hỏng)
+// → đổi cảnh thành thẻ dữ kiện vẽ từ lời thoại. Video xuất ra không bao giờ có cảnh đen vì asset lỗi.
+async function sanitizePlanVisuals(planPath, publicDir) {
+  const plan = JSON.parse(fs.readFileSync(planPath, 'utf8'));
+  const segs = (plan.segments || []).filter(s => s.visual?.file && ['broll', 'ai_image', 'image', 'ai_video', 'original'].includes(s.visual.type));
+  const BLACK_LUMA = 10;
+  const bad = [];
+  const fixedStart = [];
+  const check = async (seg) => {
+    const v = seg.visual;
+    const fp = path.isAbsolute(v.file) ? v.file : path.join(publicDir, v.file);
+    let reason = null;
+    if (!fs.existsSync(fp)) reason = 'thiếu file';
+    else if (fs.statSync(fp).size < 5000) reason = 'file hỏng';
+    else {
+      const isVideo = /\.(mp4|mov|webm|mkv)$/i.test(fp);
+      let luma = await measureBrightness(fp, isVideo ? (v.startSec || 0) + 1 : null);
+      // Video mở đầu tối (slate/màn đen chưa được cắt) → dời điểm phát tới cảnh thật thay vì bỏ cả clip
+      if (isVideo && luma != null && luma < 40) {
+        const start = await detectContentStart(fp, v.startSec || 0);
+        if (start > (v.startSec || 0)) {
+          const l2 = await measureBrightness(fp, start + 0.5);
+          if (l2 != null && l2 >= BLACK_LUMA) { v.startSec = start; luma = l2; fixedStart.push(seg.id); }
+        }
+      }
+      if (luma == null) reason = 'không đọc được';
+      else if (luma < BLACK_LUMA) reason = `đen (độ sáng ${luma})`;
+    }
+    if (reason) bad.push({ seg, reason });
+  };
+  for (let i = 0; i < segs.length; i += 6) await Promise.all(segs.slice(i, i + 6).map(check));
+  for (const { seg } of bad) {
+    seg.visual = { type: 'graphic', template: 'default', data: { subtext: seg.narration?.text || seg.caption || '' } };
+  }
+  if (bad.length || fixedStart.length) fs.writeFileSync(planPath, JSON.stringify(plan, null, 2), 'utf8');
+  return { replaced: bad.map(b => ({ id: b.seg.id, reason: b.reason })), fixedStart };
+}
+
 // Render remixer video via Remotion CLI
 ipcMain.handle('remixer:render', async (event, { outputPath }) => {
   const { REMOTION_DIR } = require('./services/remotion-render');
+  try {
+    event.sender.send('remixer:log', '🛡️ Đang kiểm tra ảnh/video trước khi render (bỏ file đen/hỏng, slate đầu clip)...');
+    const { replaced, fixedStart } = await sanitizePlanVisuals(path.join(REMOTION_DIR, 'src', 'remixer', 'edit-plan.json'), path.join(REMOTION_DIR, 'public'));
+    if (fixedStart.length) event.sender.send('remixer:log', `🛡️ Bỏ slate/màn đen đầu clip: cảnh ${fixedStart.map(id => `#${id}`).join(', ')}`);
+    if (replaced.length) {
+      event.sender.send('remixer:log', `🛡️ ${replaced.length} cảnh có ảnh/video lỗi → thay bằng thẻ dữ kiện: ${replaced.map(r => `#${r.id} (${r.reason})`).join(', ')}`);
+    }
+  } catch (e) {
+    event.sender.send('remixer:log', `⚠️ Không kiểm tra được asset trước render: ${e.message}`);
+  }
+
+  // Render nhanh: stock/ảnh dùng thẳng file gốc qua FFmpeg, chỉ graphic/text + phụ đề qua Remotion.
+  // Lỗi → rơi về render Remotion toàn bộ như cũ bên dưới.
+  const engine = await db.getSetting('render_engine', 'hybrid');
+  if (engine !== 'remotion') {
+    try {
+      const freeGB = require('os').freemem() / 1024 ** 3;
+      const { hybridRender } = require('./services/hybrid-render');
+      await hybridRender({ outputPath, concurrency: Math.max(1, Math.min(4, Math.floor(freeGB / 2))), log: (m) => event.sender.send('remixer:log', m) });
+      return { success: true, outputPath };
+    } catch (e) {
+      const msg = String(e?.message || e);
+      try { fs.writeFileSync(path.join(require('electron').app.getPath('userData'), 'last-render-error.log'), `${new Date().toISOString()}\nhybrid render\n\n${msg}`, 'utf8'); } catch (_) {}
+      event.sender.send('remixer:log', `⚠️ Render nhanh lỗi → chuyển sang Remotion: ${msg.slice(0, 160)}`);
+    }
+  }
+
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
     const stripAnsi = (s) => s.replace(/\x1B\[[\d;]*[A-Za-z]/g, '').replace(/\x1B[()][0-9A-Za-z]/g, '');
     const qp = (p) => (p.includes(' ') ? `"${p}"` : p);
-    const entryFile = path.join('src', 'remixer', 'RemixerIndex.jsx');
-    const args = ['remotion', 'render', qp(entryFile), 'RemixerVideo', qp(outputPath)];
-    event.sender.send('remixer:log', `▶ npx ${args.join(' ')}`);
+    // Use forward slashes — Remotion CLI handles them on all platforms
+    const entryFile = 'src/remixer/RemixerIndex.jsx';
+    // gl=angle: Chrome vẽ bằng GPU (scale/brightness trên video 1080p rất tốn CPU nếu render phần mềm)
+    // x264 veryfast: encode nhanh ~2-3x so với medium, crf 18 giữ chất lượng
+    // Mỗi tab Chrome render ~500MB + compositor giải mã video; máy thiếu RAM → "memory allocation failed"
+    // → số luồng theo RAM trống, cache video giới hạn; lowMem = render lại 1 luồng khi đã hết RAM
+    const freeGB = require('os').freemem() / 1024 ** 3;
+    const autoConcurrency = Math.max(1, Math.min(4, Math.floor(freeGB / 2)));
+    const buildArgs = (useGpu, lowMem) => [
+      'remotion', 'render', entryFile, 'RemixerVideo', qp(outputPath),
+      '--x264-preset=veryfast',
+      `--offthreadvideo-cache-size-in-bytes=${lowMem ? 268435456 : 536870912}`,
+      `--concurrency=${lowMem ? 1 : autoConcurrency}`,
+      ...(useGpu ? ['--gl=angle'] : []),
+    ];
+    const errLogPath = path.join(require('electron').app.getPath('userData'), 'last-render-error.log');
     event.sender.send('remixer:log', `📁 Output: ${outputPath}`);
     // Chỉ gửi mốc 10% thay vì mỗi frame; strip ANSI
     let lastRendM = -1, lastEncM = -1;
@@ -9500,9 +9985,8 @@ ipcMain.handle('remixer:render', async (event, { outputPath }) => {
         const cur = parseInt(rm[1]), tot = parseInt(rm[2]);
         if (tot > 0) {
           const pct = Math.floor((cur / tot) * 100);
-          const ms = Math.floor(pct / 10) * 10;
-          if (ms === lastRendM && cur !== tot) return;
-          lastRendM = ms;
+          if (pct === lastRendM && cur !== tot) return;
+          lastRendM = pct;
           const eta = line.match(/time remaining:\s*(.+)/i)?.[1] || '';
           event.sender.send('remixer:log', `⚙️ Render ${cur}/${tot} (${pct}%)${eta ? ' · còn ' + eta : ''}`);
           return;
@@ -9522,14 +10006,48 @@ ipcMain.handle('remixer:render', async (event, { outputPath }) => {
       }
       event.sender.send('remixer:log', line);
     };
-    const proc = spawn('npx', args, { cwd: REMOTION_DIR, shell: true });
-    proc.stdout.on('data', d => sink(d));
-    proc.stderr.on('data', d => sink(d));
-    proc.on('close', code => {
-      if (code === 0) resolve({ success: true, outputPath });
-      else reject(new Error(`Remotion exited code ${code}`));
-    });
-    proc.on('error', err => reject(new Error(`npx error: ${err.message}`)));
+    const run = (useGpu, lowMem = false) => {
+      const args = buildArgs(useGpu, lowMem);
+      event.sender.send('remixer:log', `▶ npx ${args.join(' ')}`);
+      lastRendM = -1; lastEncM = -1;
+      const errorLines = [];
+      const proc = spawn('npx', args, { cwd: REMOTION_DIR, shell: true, env: require('./services/remotion-render').remotionEnv() });
+      proc.stdout.on('data', d => {
+        sink(d);
+        // Remotion in lỗi compositor (hết RAM) ra stdout → phải gom cả ở đây
+        const line = stripAnsi(d.toString()).trim();
+        if (/memory allocation|out of memory|Compositor exited|error rendering frame|An error occurred/i.test(line)) errorLines.push(line.slice(0, 300));
+      });
+      proc.stderr.on('data', d => {
+        const raw = d.toString();
+        const line = stripAnsi(raw).trim();
+        if (!line) return;
+        // Always emit stderr lines (don't filter) so errors are visible in the log
+        event.sender.send('remixer:log', line);
+        // Collect meaningful error lines for the rejection message
+        if (/error|failed|cannot|exception|at\s+\w+\s+\(/i.test(line)) {
+          errorLines.push(line.slice(0, 300));
+        }
+      });
+      proc.on('close', code => {
+        if (code === 0) return resolve({ success: true, outputPath });
+        const allErr = errorLines.join('\n');
+        try { fs.writeFileSync(errLogPath, `${new Date().toISOString()}\n${args.join(' ')}\n\n${allErr}`, 'utf8'); } catch (_) {}
+        if (!lowMem && /memory allocation|out of memory|ENOMEM|bad_alloc|3221226505/i.test(allErr)) {
+          event.sender.send('remixer:log', '⚠️ Máy thiếu RAM → render lại 1 luồng (chậm hơn nhưng ổn định). Nên tắt bớt trình duyệt/app khác.');
+          return run(useGpu, true);
+        }
+        if (useGpu && /\bgl\b|\bangle\b|gpu|webgl|context lost|d3d/i.test(allErr)) {
+          event.sender.send('remixer:log', '⚠️ GPU render lỗi → render lại bằng CPU');
+          return run(false, lowMem);
+        }
+        const detail = errorLines.slice(-8).join('\n') || `exit code ${code}`;
+        event.sender.send('remixer:log', `❌ Remotion failed (code ${code}):\n${detail}`);
+        reject(new Error(`Remotion failed (code ${code}): ${errorLines.slice(-3).join(' | ') || `exit code ${code}`}`));
+      });
+      proc.on('error', err => reject(new Error(`npx error: ${err.message}`)));
+    };
+    run(true);
   });
 });
 
@@ -9787,6 +10305,20 @@ ipcMain.handle('agent:find-music', async (_, mood) => {
   }
 });
 
+// ── AGENT: Save synthesized BGM (WAV ArrayBuffer) to disk ────────────────────
+ipcMain.handle('agent:save-synth-bgm', async (_, { buffer, mood }) => {
+  try {
+    const safeMood = (mood || 'synth').replace(/[^a-z0-9]/gi, '_');
+    const musicDir = path.join(require('electron').app.getPath('userData'), 'assets', 'music');
+    fs.mkdirSync(musicDir, { recursive: true });
+    const destPath = path.join(musicDir, `synth_${safeMood}_${Date.now()}.wav`);
+    fs.writeFileSync(destPath, Buffer.from(buffer));
+    return { success: true, path: destPath };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
 // ── AGENT: Save reference images from base64 to temp disk ────────────────────
 ipcMain.handle('agent:save-ref-images', async (_, { images }) => {
   const os = require('os');
@@ -9804,7 +10336,7 @@ ipcMain.handle('agent:save-ref-images', async (_, { images }) => {
 });
 
 // ── AGENT: Acquire B-roll (search local → AI generate fallback) ──────────────
-ipcMain.handle('agent:acquire-broll', async (_, { query, segmentId, durationSec, mode = 'video', veoModel = 'Veo 3.1 - Lite [Lower Priority]', refImagePaths = [], voiceId = null }) => {
+ipcMain.handle('agent:acquire-broll', async (_, { query, segmentId, durationSec, mode = 'image', refImagePaths = [] }) => {
   const { REMOTION_DIR } = require('./services/remotion-render');
   const brollPublicDir = path.join(REMOTION_DIR, 'public', 'broll');
   if (!fs.existsSync(brollPublicDir)) fs.mkdirSync(brollPublicDir, { recursive: true });
@@ -9822,10 +10354,11 @@ ipcMain.handle('agent:acquire-broll', async (_, { query, segmentId, durationSec,
     proc.on('error', () => res(0));
   });
 
+  const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+
   // 1. Search local assets/broll/ by keyword match
   const localBrollDir = path.join(__dirname, '..', '..', 'assets', 'broll');
   if (fs.existsSync(localBrollDir)) {
-    const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 3);
     const files = fs.readdirSync(localBrollDir).filter(f => /\.(mp4|mov|webm|mkv)$/i.test(f));
     const match = files.find(f => {
       const name = f.toLowerCase().replace(/[_\-]/g, ' ');
@@ -9843,7 +10376,6 @@ ipcMain.handle('agent:acquire-broll', async (_, { query, segmentId, durationSec,
   const existingFiles = fs.existsSync(brollPublicDir)
     ? fs.readdirSync(brollPublicDir).filter(f => /\.(mp4|mov|webm)$/i.test(f))
     : [];
-  const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 3);
   const existMatch = existingFiles.find(f => {
     const name = f.toLowerCase().replace(/[_\-]/g, ' ');
     return queryWords.some(w => name.includes(w));
@@ -9855,116 +10387,169 @@ ipcMain.handle('agent:acquire-broll', async (_, { query, segmentId, durationSec,
     return { success: true, file: `broll/${destName}`, duration: dur };
   }
 
-  // 3. Generate via VeoEngine — requires Chrome extension connected
-  try {
+  // 3. AI image mode — dùng VeoEngine Nano Banana Pro/GEM_PIX_2 (tạo ẢNH, không phải video)
+  if (mode === 'image') {
+    // Fail fast nếu Extension chưa kết nối (tránh chờ 15s checkCookie timeout)
     const auth = global.googleLabsAuth;
-    // Image mode: Flow API (ogiZ0b) chỉ cần cookie + atToken/projectId, KHÔNG cần bearerToken
-    // Video mode: cần cookie hoặc bearerToken (VeoEngine tự chọn path)
-    const hasImageAuth = auth?.cookie && (auth?.atToken || auth?.projectId);
-    const hasVideoAuth = auth?.cookie || auth?.bearerToken;
-    if (mode === 'image' ? hasImageAuth : hasVideoAuth) {
-      const taskId = `broll_${segmentId}_${Date.now()}`;
+    if (!auth || (!auth.bearerToken && !(auth.cookie && auth.projectId))) {
+      const reason = !auth ? 'googleLabsAuth chưa khởi tạo'
+        : !auth.cookie ? 'Chưa có cookie Google — mở flow.google.com trong Chrome có Extension'
+        : 'Chưa có projectId — F5 tab flow.google.com để Extension quét lại';
+      console.warn('[agent:acquire-broll] Auth missing:', reason);
+      return { success: false, error: reason };
+    }
 
-      if (mode === 'image') {
-        // Tạo ảnh AI (nhanh hơn T2V)
-        if (!auth.projectId) return { success: false, error: 'Chưa có projectId — F5 Google Labs' };
-        const imagesDir = path.join(REMOTION_DIR, 'public', 'images');
-        if (!fs.existsSync(imagesDir)) fs.mkdirSync(imagesDir, { recursive: true });
-
-        const aiPrompt = `${query}, cinematic still, professional photography, high quality, no text overlay, no watermark`;
-        // Try with reference images first; if fail → fallback without
-        const refAttempts = refImagePaths?.length > 0 ? [refImagePaths, []] : [[]];
-        for (const refs of refAttempts) {
-          const imgTask = { id: taskId, prompt: aiPrompt };
-          if (refs.length) imgTask.referenceImages = refs;
-          let imgResult;
-          try {
-            imgResult = await VeoEngine.run({
-              mediaType: 'Image',
-              tasks: [imgTask],
-              model: 'Nano Banana Pro',
-              genCount: '1x',
-              quality: '1K',
-              outputFolder: imagesDir,
-              aspectRatio: '16:9',
-            }, () => {});
-          } catch (e) {
-            console.warn('[agent:acquire-broll] Image attempt with refs failed:', e?.message);
-            continue;
-          }
-          if (imgResult?.success) {
-            const files = Array.isArray(imgResult.files) ? imgResult.files : [];
-            const good = files.find(r => !r.isError && r.filePath);
-            if (good) {
-              const imgName = `broll_seg_${String(segmentId).padStart(3, '0')}${path.extname(good.filePath) || '.png'}`;
-              const imgDest = path.join(imagesDir, imgName);
-              try { fs.renameSync(good.filePath, imgDest); } catch { fs.copyFileSync(good.filePath, imgDest); try { fs.unlinkSync(good.filePath); } catch (_) {} }
-              return { success: true, type: 'ai_image', file: `images/${imgName}`, absolutePath: imgDest };
-            }
-          }
+    try {
+      const imagesDir = path.join(REMOTION_DIR, 'public', 'images');
+      if (!fs.existsSync(imagesDir)) fs.mkdirSync(imagesDir, { recursive: true });
+      // Reframe prompt: tập trung vào CẢNH/CONCEPT, không phải nhân vật
+      // Nếu query đã nói về concept → giữ nguyên; nếu về người → chuyển sang góc nhìn tài sản/hành động
+      const conceptSuffix = 'cinematic wide shot, dramatic lighting, rich warm colors, symbolic visual metaphor, 4K sharp detail, no text overlay, no watermark, no UI elements, no graphic design';
+      const aiPrompt = `${query}, ${conceptSuffix}`;
+      const taskId = `broll_img_${segmentId}_${Date.now()}`;
+      const veoLog = (msg) => console.log(`[VeoEngine broll#${segmentId}]`, msg);
+      const imgResult = await VeoEngine.run({
+        mediaType: 'Image', tasks: [{ id: taskId, prompt: aiPrompt }],
+        model: 'Nano Banana Pro', genCount: '1x', quality: '1K', outputFolder: imagesDir, aspectRatio: '16:9',
+      }, veoLog);
+      if (imgResult?.success) {
+        const files = Array.isArray(imgResult.files) ? imgResult.files : [];
+        const good = files.find(r => !r.isError && r.filePath);
+        if (good) {
+          const imgName = `broll_seg_${String(segmentId).padStart(3, '0')}${path.extname(good.filePath) || '.jpg'}`;
+          const imgDest = path.join(imagesDir, imgName);
+          try { fs.renameSync(good.filePath, imgDest); } catch { fs.copyFileSync(good.filePath, imgDest); try { fs.unlinkSync(good.filePath); } catch (_) {} }
+          return { success: true, type: 'ai_image', file: `images/${imgName}`, absolutePath: imgDest };
         }
-      } else {
-        // Tạo video T2V/R2V — fallback: with ingredients first, then without
-        const isOmni = veoModel.includes('Omni');
-        const durSec = isOmni ? Math.min(10, Math.ceil(durationSec || 10)) : Math.min(8, Math.ceil(durationSec || 8));
+        // Trả về lỗi thật từ VeoEngine thay vì generic message
+        const firstErr = files.find(r => r.isError)?.error;
+        if (firstErr) {
+          console.warn('[agent:acquire-broll] VeoEngine error:', firstErr);
+          return { success: false, error: firstErr };
+        }
+      }
+      if (imgResult?.error) {
+        console.warn('[agent:acquire-broll] VeoEngine run error:', imgResult.error);
+        return { success: false, error: imgResult.error };
+      }
+    } catch (imgErr) {
+      console.warn('[agent:acquire-broll] Nano Banana Pro exception:', imgErr?.message);
+      return { success: false, error: imgErr?.message || 'Nano Banana Pro exception' };
+    }
+    return { success: false, error: 'Nano Banana Pro không tạo được ảnh — kiểm tra Extension đã kết nối Google Labs' };
+  }
 
-        // Build base prompt
-        let aiPrompt = `${query}, cinematic documentary footage, professional camera work, smooth motion, no text overlay, no watermark`;
+  // 4. Video mode — tìm stock từ Pexels/Pixabay (không fallback VeoEngine)
+  if (mode === 'video' || mode === 'broll') {
+    try {
+      const { searchStockVideo, downloadStockClip } = require('./services/stock-video');
+      const pexelsKey = (await db.getSetting('pexels_api_key', '') || '').trim();
+      const pixabayKey = (await db.getSetting('pixabay_api_key', '') || '').trim();
+      if (!pexelsKey && !pixabayKey) {
+        return { success: false, error: 'Thiếu Pexels/Pixabay API key — vào Cài đặt để thêm key' };
+      }
+      const provider = pexelsKey ? 'pexels' : 'pixabay';
+      const apiKey = pexelsKey || pixabayKey;
+      const englishQuery = query.replace(/[^\x00-\x7F]/g, ' ').trim().split(',')[0].trim().slice(0, 60) || 'nature landscape';
+      const searchRes = await searchStockVideo({ keyword: englishQuery, provider, apiKey, perPage: 3 });
+      if (searchRes?.results?.length > 0) {
+        const clip = searchRes.results[0];
+        // Temp file vào system tmp để không rác output dir
+        const os = require('os');
+        const tempPath = path.join(os.tmpdir(), `broll_stock_${segmentId}_${Date.now()}.mp4`);
+        const dlRes = await downloadStockClip({ url: clip.url, destPath: tempPath });
+        if (dlRes?.success && fs.existsSync(tempPath)) {
+          try { fs.renameSync(tempPath, destPath); } catch { fs.copyFileSync(tempPath, destPath); try { fs.unlinkSync(tempPath); } catch (_) {} }
+          const dur = await getVideoDur(destPath);
+          return { success: true, type: 'broll', source: provider, file: `broll/${destName}`, absolutePath: destPath, duration: dur || clip.duration };
+        }
+        try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (_) {}
+      }
+    } catch (stockErr) {
+      console.error('[agent:acquire-broll] Stock search error:', stockErr?.message || stockErr);
+    }
+    return { success: false, error: 'Không tìm thấy stock video phù hợp từ Pexels/Pixabay' };
+  }
 
-        const refAttempts = refImagePaths?.length > 0 ? [refImagePaths, []] : [[]];
-        for (const refs of refAttempts) {
-          const videoTask = {
-            id: taskId,
-            prompt: aiPrompt,
-            duration: `${durSec}s`,
-            aspectRatio: '16:9',
-          };
-          if (refs.length) videoTask.ingredientImages = refs;
-          if (voiceId) videoTask.voiceId = voiceId; // always apply voiceId when provided
-          let veoResult;
-          try {
-            veoResult = await VeoEngine.run({
-              mediaType: 'Video',
-              tasks: [videoTask],
-              model: veoModel,
-              genCount: 1,
-              quality: '720p',
-              outputFolder: brollPublicDir,
-              duration: `${durSec}s`,
-              aspectRatio: '16:9',
-            }, () => {});
-          } catch (e) {
-            console.warn('[agent:acquire-broll] Video attempt with refs failed:', e?.message);
-            continue;
-          }
-          if (veoResult?.success) {
-            const files = Array.isArray(veoResult.files) ? veoResult.files : [];
-            const good = files.find(r => !r.isError && (r.filePath || r.videoPath));
-            if (good) {
-              const srcPath = good.filePath || good.videoPath;
-              if (srcPath !== destPath) {
-                try { fs.renameSync(srcPath, destPath); } catch { fs.copyFileSync(srcPath, destPath); try { fs.unlinkSync(srcPath); } catch (_) {} }
-              }
-              const dur = await getVideoDur(destPath);
-              return { success: true, type: 'broll', file: `broll/${destName}`, duration: dur };
-            }
-          }
+  return { success: false, error: `Unknown mode: ${mode}` };
+});
+
+// ── AGENT: Fix render error — patch edit-plan.json, remove broken assets ────────
+ipcMain.handle('agent:fix-render-error', async (_, { errorText = '' } = {}) => {
+  const { REMOTION_DIR } = require('./services/remotion-render');
+  const planPath  = path.join(REMOTION_DIR, 'src', 'remixer', 'edit-plan.json');
+  const publicDir = path.join(REMOTION_DIR, 'public');
+
+  try {
+    const plan  = JSON.parse(fs.readFileSync(planPath, 'utf8'));
+    const fixes = [];
+    const missingVisuals = [];
+
+    // 1. Check each segment's visual file
+    for (const seg of plan.segments || []) {
+      const vFile = seg.visual?.file;
+      if (vFile) {
+        const fp = path.join(publicDir, vFile);
+        if (!fs.existsSync(fp)) {
+          fixes.push(`seg ${seg.id}: xóa file hỏng "${vFile}"`);
+          missingVisuals.push({ id: seg.id, old_type: seg.visual.type, was: vFile });
+          seg.visual.file = null;
+          seg.visual.type = 'text'; // fallback → TextScene render bằng narration text
+        }
+      }
+      // Check narration audio
+      if (seg.narration?.file) {
+        const fp = path.join(publicDir, seg.narration.file);
+        if (!fs.existsSync(fp)) {
+          fixes.push(`seg ${seg.id}: narration audio thiếu "${seg.narration.file}"`);
+          missingVisuals.push({ id: seg.id, missing_audio: true, was: seg.narration.file });
+          seg.narration.file = null;
         }
       }
     }
-  } catch (veoErr) {
-    console.error('[agent:acquire-broll] VeoEngine error:', veoErr?.message || veoErr);
-  }
 
-  // Auth chưa set → extension chưa kết nối Google Labs
-  const auth2 = global.googleLabsAuth;
-  const noAuth = !auth2?.atToken && !auth2?.bearerToken && !auth2?.projectId;
-  return {
-    success: false,
-    error: noAuth
-      ? 'Extension chưa kết nối Google VideoFX — Mở Chrome → flow.google.com với FluxyExtension bật → F5 để bắt Token'
-      : 'Veo không tạo được file — kiểm tra Google Labs đang mở và Extension hoạt động',
-  };
+    // 2. Fix bgMusic path
+    if (plan.bgMusic?.musicFile) {
+      const mf = plan.bgMusic.musicFile;
+      if (/^[A-Za-z]:[/\\]|^\//.test(mf)) {
+        // Absolute path → try to copy to public/audio/
+        const destName = `audio/music_fixed_${Date.now()}.wav`;
+        const destPath = path.join(publicDir, destName);
+        if (fs.existsSync(mf)) {
+          try {
+            fs.mkdirSync(path.join(publicDir, 'audio'), { recursive: true });
+            fs.copyFileSync(mf, destPath);
+            plan.bgMusic.musicFile = destName;
+            fixes.push(`bgMusic: copy absolute path → ${destName}`);
+          } catch (_) {
+            plan.bgMusic.musicFile = null;
+            fixes.push('bgMusic: xóa absolute path lỗi');
+          }
+        } else {
+          plan.bgMusic.musicFile = null;
+          fixes.push(`bgMusic: xóa path không tồn tại "${mf}"`);
+        }
+      } else {
+        const fp = path.join(publicDir, mf);
+        if (!fs.existsSync(fp)) {
+          plan.bgMusic.musicFile = null;
+          fixes.push(`bgMusic: xóa file thiếu "${mf}"`);
+        }
+      }
+    }
+
+    // 3. Save patched plan
+    fs.writeFileSync(planPath, JSON.stringify(plan, null, 2), 'utf8');
+
+    return {
+      success: true,
+      fixes,
+      missing_visuals: missingVisuals,
+      message: `Đã patch ${fixes.length} vấn đề. ${missingVisuals.length} cảnh cần generate lại visual/audio.`,
+    };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
 });
 
 // ── Voice preview via Flow no0P6 RPC ─────────────────────────────────────────
@@ -10012,6 +10597,42 @@ ipcMain.handle('agent:render-thumbnail', async (_, { thumbnailData, outputPath }
   }
 });
 
+// ── Xóa file AI Agent sinh ra trong remotion/public (clip stock, ảnh AI, giọng đọc, nhạc) ──
+// Chỉ xóa theo mẫu tên của AI Agent — giữ assets/, sfx/ và file của Remotion Studio ở gốc public.
+// Remotion chép toàn bộ public vào bundle mỗi lần render → để tồn đọng là render chậm dần.
+const AGENT_PUBLIC_PATTERNS = {
+  broll:  /^seg_\d+(_stock|_broll)?\.(mp4|mov|webm)$/i,
+  images: /^(fallback_seg|broll_seg|broll_img|illustration_seg|veo_img)_\d+\.(png|jpe?g|webp)$/i,
+  audio:  /^(agent_seg_\d+\.(wav|mp3)|music_[\w-]+\.(mp3|wav))$/i,
+  tts:    /./,
+  '.':    /^broll_stock_\d+_tmp\.mp4$/i,
+};
+function cleanAgentRemotionPublic() {
+  const { REMOTION_DIR } = require('./services/remotion-render');
+  const publicDir = path.join(REMOTION_DIR, 'public');
+  let files = 0, bytes = 0;
+  for (const [sub, re] of Object.entries(AGENT_PUBLIC_PATTERNS)) {
+    const dir = path.join(publicDir, sub);
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir)) {
+      if (!re.test(f)) continue;
+      const full = path.join(dir, f);
+      try {
+        const st = fs.statSync(full);
+        if (!st.isFile()) continue;
+        fs.unlinkSync(full);
+        files++; bytes += st.size;
+      } catch (_) {}
+    }
+  }
+  return { files, mb: Math.round(bytes / 1024 / 1024) };
+}
+
+ipcMain.handle('agent:clean-remotion-public', async () => {
+  try { return { success: true, ...cleanAgentRemotionPublic() }; }
+  catch (err) { return { success: false, error: err.message }; }
+});
+
 // ── Cleanup output dir — keep final video, SEO txt, thumbnail ─────────────────
 ipcMain.handle('agent:cleanup-output', async (_, { outputDir, keepFiles = [], seoText, seoPath }) => {
   try {
@@ -10021,17 +10642,7 @@ ipcMain.handle('agent:cleanup-output', async (_, { outputDir, keepFiles = [], se
       fs.writeFileSync(seoPath, seoText, 'utf8');
     }
 
-    // Delete remotion/public temp dirs
-    const { REMOTION_DIR } = require('./services/remotion-render');
-    const dirsToClean = ['tts', 'broll', 'images'].map(d => path.join(REMOTION_DIR, 'public', d));
-    for (const dir of dirsToClean) {
-      if (fs.existsSync(dir)) {
-        const files = fs.readdirSync(dir);
-        for (const f of files) {
-          try { fs.unlinkSync(path.join(dir, f)); } catch (_) {}
-        }
-      }
-    }
+    cleanAgentRemotionPublic();
 
     // Delete intermediate video files in outputDir (keep keepFiles)
     const keepSet = new Set(keepFiles.map(f => path.resolve(f)));
@@ -10051,3 +10662,1327 @@ ipcMain.handle('agent:cleanup-output', async (_, { outputDir, keepFiles = [], se
   }
 });
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Eyes Challenge — render IPC
+// ─────────────────────────────────────────────────────────────────────────────
+ipcMain.handle('eyes:render-video', async (event, { plan, assetPaths, voicePath, voiceIntroPath, voiceOutroPath, bgmPath, outputPath }) => {
+  try {
+    const { renderEyesVideo } = require('./services/eyes-render');
+    const onLog = (msg) => mainWindow?.webContents?.send('eyes:log', msg);
+    const result = await renderEyesVideo({
+      plan, assetPaths, voicePath, voiceIntroPath, voiceOutroPath, bgmPath, outputPath, onLog,
+    });
+    return result;
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// ── TIKTOK PLAYWRIGHT ─────────────────────────────────────────────────────────
+const TIKTOK_PROFILE_DIR = path.join(app.getPath('userData'), 'tiktok-chrome-profile');
+
+function ttProfileDir(profileId) {
+  return path.join(app.getPath('userData'), `tiktok-profile-${profileId || 'default'}`);
+}
+
+ipcMain.handle('tiktok:open-login', async (_e, { profileId } = {}) => {
+  try {
+    const { openTikTokLogin } = require('./services/tiktok-playwright');
+    const onLog = (msg) => mainWindow?.webContents?.send('tiktok:log', { profileId, msg });
+    return await openTikTokLogin({ profileDir: ttProfileDir(profileId), onLog });
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+ipcMain.handle('tiktok:check-login', async (_e, { profileId } = {}) => {
+  try {
+    const { checkTikTokLogin } = require('./services/tiktok-playwright');
+    return await checkTikTokLogin({ profileDir: ttProfileDir(profileId) });
+  } catch (e) { return { ok: false, loggedIn: false, error: e.message }; }
+});
+
+ipcMain.handle('tiktok:post-video', async (_e, { videoPath, caption, product, profileId }) => {
+  try {
+    const { postToTikTok } = require('./services/tiktok-playwright');
+    const onLog      = (msg) => mainWindow?.webContents?.send('tiktok:log', { profileId, msg });
+    const onProgress = (pct) => mainWindow?.webContents?.send('tiktok:progress', { profileId, pct });
+    return await postToTikTok({ videoPath, caption, product, profileDir: ttProfileDir(profileId), headless: true, onLog, onProgress });
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+ipcMain.handle('tiktok:fetch-products', async (_e, { profileId, keyword } = {}) => {
+  try {
+    const { fetchAffiliateProducts } = require('./services/tiktok-playwright');
+    const onLog = (msg) => mainWindow?.webContents?.send('tiktok:log', { profileId, msg });
+    return await fetchAffiliateProducts({ profileDir: ttProfileDir(profileId), keyword: keyword || '', onLog });
+  } catch (e) { return { ok: false, products: [], error: e.message }; }
+});
+
+// ── FACEBOOK AUTO POST ────────────────────────────────────────────────────────
+ipcMain.handle('fb:get-pages', async (_e, { userToken }) => {
+  try {
+    const { getPages } = require('./services/facebook-post');
+    return { success: true, pages: await getPages(userToken) };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('fb:debug-token', async (_e, { token }) => {
+  try {
+    const { debugToken } = require('./services/facebook-post');
+    return { success: true, info: await debugToken(token) };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('fb:post-reel', async (event, { pageId, pageToken, videoPath, description }) => {
+  try {
+    const { postReel } = require('./services/facebook-post');
+    const onLog      = (msg) => mainWindow?.webContents?.send('fb:log', msg);
+    const onProgress = (pct) => mainWindow?.webContents?.send('fb:progress', pct);
+    const result = await postReel({ pageId, pageToken, videoPath, description, onLog, onProgress });
+    return { success: true, ...result };
+  } catch (e) {
+    mainWindow?.webContents?.send('fb:log', '❌ ' + e.message);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('fb:post-comment', async (_e, { videoId, message, pageToken }) => {
+  try {
+    const { postComment } = require('./services/facebook-post');
+    const data = await postComment(videoId, message, pageToken);
+    return { success: true, commentId: data?.id };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('fb:oauth-login', async (_e) => {
+  const { BrowserWindow: PopupWin } = require('electron');
+  const { FB_APP_ID: appId, FB_APP_SECRET: appSecret } = require('./fb-config');
+  if (!appSecret) return { success: false, error: 'Chưa cấu hình FB_APP_SECRET trong src/main/fb-config.js' };
+
+  // Dùng auth.expo.io làm redirect URI (đã được thêm vào Valid OAuth Redirect URIs)
+  // Electron intercept will-navigate + preventDefault để không thực sự load trang đó
+  const redirectUri = 'https://auth.expo.io/@thanhcong195/fb-autopost';
+  const scope = 'pages_manage_posts,pages_read_engagement,pages_show_list,pages_manage_metadata';
+  const oauthUrl = `https://www.facebook.com/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&response_type=token`;
+
+  return new Promise((resolve) => {
+    const popup = new PopupWin({
+      width: 550, height: 680,
+      title: 'Đăng nhập Facebook',
+      webPreferences: { nodeIntegration: false, contextIsolation: true },
+    });
+    popup.setMenu(null);
+    popup.loadURL(oauthUrl);
+
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      try { popup.close(); } catch {}
+      resolve(result);
+    };
+
+    const parseAndFinish = async (fullHref) => {
+      try {
+        const parsed = new URL(fullHref);
+        const frag = new URLSearchParams(parsed.hash.slice(1));
+        const accessToken = frag.get('access_token');
+        const error = frag.get('error') || parsed.searchParams.get('error');
+        if (error || !accessToken) { finish({ success: false, error: error || 'no_token' }); return; }
+        const { getPages, exchangeToken } = require('./services/facebook-post');
+        const long  = await exchangeToken(accessToken, appId, appSecret);
+        const pages = await getPages(long.access_token);
+        finish({ success: true, pages, expiresIn: long.expires_in });
+      } catch(e) { finish({ success: false, error: e.message }); }
+    };
+
+    // Intercept TRƯỚC khi Electron load trang redirect — fragment có trong URL lúc này
+    popup.webContents.on('will-navigate', (event, url) => {
+      if (!url.startsWith('https://auth.expo.io/')) return;
+      event.preventDefault(); // không load trang, chỉ đọc token từ URL
+      parseAndFinish(url);
+    });
+
+    // Fallback: nếu dùng did-redirect-navigation
+    popup.webContents.on('did-redirect-navigation', (_, url) => {
+      if (!url.startsWith('https://auth.expo.io/')) return;
+      parseAndFinish(url);
+    });
+
+    popup.on('closed', () => finish({ success: false, error: 'Đóng cửa sổ chưa đăng nhập' }));
+  });
+});
+
+// ── TRUYỆN MA AUDIO (Horror Story with Stock Video) ──────────────────────────
+let _horrorAborted = false;
+
+// Lấy bản chép lời YouTube qua yt-dlp (không xử lý gì thêm)
+ipcMain.handle('horror:fetch-transcript', async (event, ytUrl) => {
+  if (!ytUrl) return { ok: false, error: 'Thiếu URL' };
+  const { app: eApp } = require('electron');
+  const os = require('os');
+  const findYtDlp = () => {
+    const local = path.join(eApp.getPath('userData'), 'tools', 'yt-dlp.exe');
+    if (fs.existsSync(local)) return local;
+    try { const r = path.join(process.resourcesPath, 'yt-dlp.exe'); if (fs.existsSync(r)) return r; } catch {}
+    return null;
+  };
+  const ytdlpBin = findYtDlp();
+  if (!ytdlpBin) return { ok: false, error: 'yt-dlp chưa được cài — vào tab Tải Xuống để cài đặt' };
+
+  const tmpDir = path.join(os.tmpdir(), `fluxy_subs_${Date.now()}`);
+  try {
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const raw = await new Promise((resolve) => {
+      const proc = spawn(ytdlpBin, [
+        '--write-subs', '--write-auto-subs',
+        '--sub-langs', 'vi,vi-VN,en',
+        '--sub-format', 'vtt/srt/best',
+        '--skip-download',
+        '-o', path.join(tmpDir, 'sub'),
+        ytUrl.trim()
+      ]);
+      proc.on('close', () => {
+        try {
+          const files = fs.readdirSync(tmpDir);
+          const viFile  = files.find(f => /\.(vi|vi-VN)\.(vtt|srt)$/i.test(f));
+          const enFile  = files.find(f => /\.en\.(vtt|srt)$/i.test(f));
+          const anyFile = files.find(f => /\.(vtt|srt)$/i.test(f));
+          const chosen = viFile || enFile || anyFile;
+          if (chosen) resolve({ file: chosen, content: fs.readFileSync(path.join(tmpDir, chosen), 'utf8') });
+          else resolve(null);
+        } catch { resolve(null); }
+      });
+      proc.on('error', () => resolve(null));
+      setTimeout(() => { try { proc.kill(); } catch {} resolve(null); }, 30000);
+    });
+
+    if (!raw) return { ok: false, error: 'Không tìm thấy bản chép lời — video này chưa có transcript' };
+
+    // Parse VTT/SRT → plain text with timestamps
+    const lines = raw.content
+      .replace(/WEBVTT[\s\S]*?\n\n/, '')
+      .replace(/^\d+\s*\n/gm, '')
+      .split('\n');
+
+    const entries = [];
+    let curTime = '', curText = [];
+    for (const line of lines) {
+      const tc = line.match(/(\d{1,2}:\d{2}[:.]\d{2,3})\s*-->/);
+      if (tc) {
+        if (curText.length) entries.push({ time: curTime, text: curText.join(' ') });
+        curTime = tc[1].replace(/\.\d+/, '');
+        curText = [];
+      } else {
+        const t = line.replace(/<[^>]+>/g, '').replace(/\{[^}]+\}/g, '').replace(/align:.*$/, '').trim();
+        if (t) curText.push(t);
+      }
+    }
+    if (curText.length) entries.push({ time: curTime, text: curText.join(' ') });
+
+    // Also produce plain text
+    const plainText = entries.map(e => e.text).join(' ').replace(/\s{2,}/g, ' ').trim();
+    const lang = raw.file.includes('.vi') ? 'Tiếng Việt' : 'Tiếng Anh';
+
+    return { ok: true, entries, plainText, lang, charCount: plainText.length };
+  } catch(e) {
+    return { ok: false, error: e.message };
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+ipcMain.handle('horror:cancel', async () => { _horrorAborted = true; return { ok: true }; });
+
+// ── horror:pre-trim — cắt đầu/cuối nguồn bằng stream copy (nhanh, không re-encode) ──
+ipcMain.handle('horror:pre-trim', async (_e, { inputPath, startSec = 0, durationSec }) => {
+  try {
+    const { spawn: _sp } = require('child_process');
+    const ffmpegBin = require('ffmpeg-static');
+    const os = require('os');
+    const outPath = path.join(os.tmpdir(), `horror-pretrim-${Date.now()}.mp4`);
+    return await new Promise((resolve) => {
+      const args = ['-y', '-ss', String(startSec), '-i', inputPath];
+      if (durationSec > 0) args.push('-t', String(durationSec));
+      args.push('-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', outPath);
+      const proc = _sp(ffmpegBin, args);
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => code === 0
+        ? resolve({ ok: true, path: outPath })
+        : resolve({ ok: false, error: stderr.split('\n').filter(Boolean).slice(-2).join(' ') }));
+      proc.on('error', e => resolve({ ok: false, error: e.message }));
+    });
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:trim-segment — cắt một đoạn video, re-encode để fix choppy + đảm bảo audio ──
+ipcMain.handle('horror:trim-segment', async (event, { inputPath, startSec, durationSec, segIndex }) => {
+  try {
+    const os = require('os');
+    const ffmpegBin = require('ffmpeg-static');
+    const { spawn: _sp } = require('child_process');
+    const tmpDir = path.join(os.tmpdir(), 'horror-segs');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const outPath = path.join(tmpDir, `seg_${segIndex}_${Date.now()}.mp4`);
+    return await new Promise((resolve) => {
+      // Re-encode thay vì -c copy: tránh timestamp lệch → Remotion decode sai → video giật
+      // -ss trước -i = fast seek; re-encode đảm bảo keyframe đúng đầu segment
+      const args = [
+        '-y', '-ss', String(startSec), '-i', inputPath,
+        '-t', String(durationSec + 3),  // +3s buffer: tránh Chromium seek past EOF khi startFrom sót lại
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
+        '-g', '30', '-keyint_min', '30',  // keyframe mỗi 1s — Remotion seek nhanh
+        '-c:a', 'aac', '-ar', '44100', '-ac', '2',
+        '-movflags', '+faststart',
+        '-avoid_negative_ts', 'make_zero',
+        outPath,
+      ];
+      const proc = _sp(ffmpegBin, args);
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => code === 0
+        ? resolve({ ok: true, path: outPath })
+        : resolve({ ok: false, error: stderr.split('\n').filter(Boolean).slice(-2).join(' ') }));
+      proc.on('error', e => resolve({ ok: false, error: e.message }));
+    });
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:extract-frame — lấy frame đầu tiên của video làm ảnh preview ──
+ipcMain.handle('horror:extract-frame', async (event, { videoPath, timeSec = 0 }) => {
+  try {
+    const os = require('os');
+    const ffmpegBin = require('ffmpeg-static');
+    const { spawn: _sp } = require('child_process');
+    const tmpFile = path.join(os.tmpdir(), `horror-frame-${Date.now()}.jpg`);
+    return await new Promise((resolve) => {
+      const args = ['-y', '-ss', String(timeSec), '-i', videoPath,
+        '-vframes', '1', '-q:v', '3', '-vf', 'scale=640:-1', tmpFile];
+      const proc = _sp(ffmpegBin, args);
+      proc.on('close', code => {
+        if (code === 0 && fs.existsSync(tmpFile)) {
+          const data = fs.readFileSync(tmpFile).toString('base64');
+          try { fs.unlinkSync(tmpFile); } catch {}
+          resolve({ ok: true, dataUrl: `data:image/jpeg;base64,${data}` });
+        } else {
+          resolve({ ok: false });
+        }
+      });
+      proc.on('error', e => resolve({ ok: false, error: e.message }));
+    });
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:bg-extract-frames — trích xuất toàn bộ frame video thành JPEG ──
+ipcMain.handle('horror:bg-extract-frames', async (_e, { videoPath }) => {
+  try {
+    const { spawn: _sp } = require('child_process');
+    const ffmpegBin = require('ffmpeg-static');
+    const os = require('os');
+    const ts = Date.now();
+    const tmpDir = path.join(os.tmpdir(), `hbg-in-${ts}`);
+    const outDir = path.join(os.tmpdir(), `hbg-out-${ts}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    fs.mkdirSync(outDir, { recursive: true });
+    // Lấy fps và kích thước từ ffmpeg stderr
+    const info = await new Promise(r => {
+      const p = _sp(ffmpegBin, ['-i', videoPath]);
+      let s = '';
+      p.stderr.on('data', d => { s += d.toString(); });
+      p.on('close', () => r(s));
+      p.on('error', () => r(''));
+    });
+    const fpsM = info.match(/(\d+(?:\.\d+)?)\s+fps/);
+    const fps  = fpsM ? Math.round(parseFloat(fpsM[1]) * 100) / 100 : 30;
+    const dimM = info.match(/Video:.*?[,\s](\d{3,4})x(\d{3,4})/);
+    const width  = dimM ? parseInt(dimM[1]) : 1920;
+    const height = dimM ? parseInt(dimM[2]) : 1080;
+    // Trích xuất frames
+    await new Promise((resolve, reject) => {
+      const p = _sp(ffmpegBin, ['-y', '-i', videoPath, '-vsync', 'cfr', '-q:v', '2', path.join(tmpDir, 'frame_%06d.jpg')]);
+      let stderr = '';
+      p.stderr.on('data', d => { stderr += d.toString(); });
+      p.on('close', code => code === 0 ? resolve() : reject(new Error(stderr.slice(-300))));
+      p.on('error', reject);
+    });
+    const count = fs.readdirSync(tmpDir).filter(f => f.endsWith('.jpg')).length;
+    return { ok: true, tmpDir, outDir, count, fps, width, height };
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:bg-save-frame — renderer gửi frame đã xử lý, main lưu file ──
+ipcMain.handle('horror:bg-save-frame', async (_e, { outDir, frameIndex, dataUrl }) => {
+  try {
+    const b64 = dataUrl.replace(/^data:image\/\w+;base64,/, '');
+    fs.writeFileSync(path.join(outDir, `frame_${String(frameIndex).padStart(6,'0')}.jpg`), Buffer.from(b64, 'base64'));
+    return { ok: true };
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:bg-reassemble — ghép frames đã xử lý + audio gốc thành MP4 ──
+ipcMain.handle('horror:bg-reassemble', async (_e, { outDir, videoPath, outputPath, fps }) => {
+  try {
+    const { spawn: _sp } = require('child_process');
+    const ffmpegBin = require('ffmpeg-static');
+    await new Promise((resolve, reject) => {
+      const p = _sp(ffmpegBin, [
+        '-y',
+        '-framerate', String(fps),
+        '-i', path.join(outDir, 'frame_%06d.jpg'),
+        '-i', videoPath,
+        '-map', '0:v:0', '-map', '1:a:0',
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
+        '-g', '30', '-keyint_min', '30',
+        '-c:a', 'aac', '-ar', '44100', '-ac', '2',
+        '-movflags', '+faststart', '-shortest', outputPath,
+      ]);
+      let stderr = '';
+      p.stderr.on('data', d => { stderr += d.toString(); });
+      p.on('close', code => code === 0 ? resolve() : reject(new Error(stderr.slice(-300))));
+      p.on('error', reject);
+    });
+    return { ok: true, outputPath };
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:pitch-shift — đổi pitch audio để lách Content ID (không thay đổi tốc độ) ──
+ipcMain.handle('horror:pitch-shift', async (_e, { inputPath, factor = 1.06 }) => {
+  try {
+    const { spawn: _sp } = require('child_process');
+    const ffmpegBin = require('ffmpeg-static');
+    const outPath = inputPath.replace(/\.mp4$/i, `_ps${Date.now()}.mp4`);
+    const sampleRate = 44100;
+    const shiftedRate = Math.round(sampleRate * factor);
+    const tempoFix = (1 / factor).toFixed(6);
+    return await new Promise((resolve) => {
+      const args = [
+        '-y', '-i', inputPath,
+        '-af', `asetrate=${shiftedRate},atempo=${tempoFix}`,
+        '-c:v', 'copy',
+        '-c:a', 'aac', '-b:a', '192k',
+        '-movflags', '+faststart',
+        outPath,
+      ];
+      const proc = _sp(ffmpegBin, args);
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => code === 0
+        ? resolve({ ok: true, path: outPath })
+        : resolve({ ok: false, error: stderr.split('\n').filter(Boolean).slice(-2).join(' ') }));
+      proc.on('error', e => resolve({ ok: false, error: e.message }));
+    });
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:bg-save-generated — lưu ảnh nền AI (base64) vào file temp ──
+ipcMain.handle('horror:bg-save-generated', async (_e, { b64, mime }) => {
+  try {
+    const os = require('os');
+    const ext = mime?.includes('png') ? 'png' : 'jpg';
+    const outPath = path.join(os.tmpdir(), `horror-bg-gen-${Date.now()}.${ext}`);
+    fs.writeFileSync(outPath, Buffer.from(b64, 'base64'));
+    return { ok: true, path: outPath };
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:pre-crop — cắt về aspect ratio đích trước BG Replace để giảm pixel count ──
+// Chỉ hữu ích khi source landscape (16:9) → output square (1:1): giảm 44% pixel, nhanh hơn 44%
+ipcMain.handle('horror:pre-crop', async (_e, { inputPath, outputAspect, cropX = 50 }) => {
+  try {
+    if (outputAspect !== 'square') return { ok: false, error: 'only square supported' };
+    const outPath = path.join(require('os').tmpdir(), `horror-precrop-${Date.now()}.mp4`);
+    // crop=ih:ih:x:0  — cắt hình vuông chiều cao × chiều cao, offset X theo cropX%
+    const xOff = `trunc((iw-ih)*${(cropX / 100).toFixed(4)})`;
+    const cropFilter = `crop=ih:ih:${xOff}:0`;
+    const { spawn: _sp } = require('child_process');
+    const ffmpegBin = require('ffmpeg-static');
+    const args = [
+      '-y', '-i', inputPath,
+      '-vf', cropFilter,
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
+      '-c:a', 'copy',
+      '-movflags', '+faststart',
+      outPath,
+    ];
+    return await new Promise((resolve) => {
+      const proc = _sp(ffmpegBin, args);
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => code === 0
+        ? resolve({ ok: true, path: outPath })
+        : resolve({ ok: false, error: stderr.split('\n').filter(Boolean).slice(-2).join(' ') }));
+      proc.on('error', e => resolve({ ok: false, error: e.message }));
+    });
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:bg-cleanup — xóa thư mục temp sau khi xử lý xong ──
+ipcMain.handle('horror:bg-cleanup', async (_e, { tmpDir, outDir }) => {
+  try {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (outDir) fs.rmSync(outDir, { recursive: true, force: true });
+    return { ok: true };
+  } catch { return { ok: true }; }
+});
+
+// ── horror:bg-extract-video-frames — extract frames từ video nền động ──
+ipcMain.handle('horror:bg-extract-video-frames', async (_e, { videoPath, fps }) => {
+  try {
+    const framesDir = path.join(require('os').tmpdir(), `hbg-vframes-${Date.now()}`);
+    fs.mkdirSync(framesDir, { recursive: true });
+    const { spawn } = require('child_process');
+    const ffmpegBin = require('ffmpeg-static');
+    const args = [
+      '-y', '-i', videoPath,
+      '-vf', `fps=${fps}`,
+      '-q:v', '3',
+      path.join(framesDir, 'frame_%06d.jpg'),
+    ];
+    return await new Promise((resolve) => {
+      const proc = spawn(ffmpegBin, args);
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => {
+        if (code !== 0) {
+          fs.rmSync(framesDir, { recursive: true, force: true });
+          return resolve({ ok: false, error: stderr.split('\n').filter(Boolean).slice(-2).join(' ') });
+        }
+        const count = fs.readdirSync(framesDir).filter(f => f.endsWith('.jpg')).length;
+        resolve({ ok: true, framesDir, count });
+      });
+      proc.on('error', e => resolve({ ok: false, error: e.message }));
+    });
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:cleanup-cache — dọn dẹp tất cả temp files của horror pipeline ──
+ipcMain.handle('horror:cleanup-cache', async (_e, { keepPaths = [] } = {}) => {
+  try {
+    const tmpDir = require('os').tmpdir();
+    const keepSet = new Set((keepPaths || []).map(p => p?.toLowerCase?.()));
+    let removed = 0, freed = 0;
+
+    const tryRm = (p) => {
+      try {
+        if (!p) return;
+        if (keepSet.has(p.toLowerCase())) return;
+        const st = fs.statSync(p);
+        freed += st.size || 0;
+        fs.rmSync(p, { recursive: true, force: true });
+        removed++;
+      } catch {}
+    };
+
+    // 1. horror-segs/ thư mục trim segments
+    tryRm(path.join(tmpDir, 'horror-segs'));
+
+    // 2. Quét %TEMP% tìm các file pattern horror-*
+    const entries = fs.readdirSync(tmpDir);
+    for (const e of entries) {
+      if (/^horror-/i.test(e) || /^hbg-/i.test(e)) {
+        tryRm(path.join(tmpDir, e));
+      }
+    }
+
+    // 3. Pitch-shift files nằm cùng chỗ với input (_ps*.mp4)
+    //    keepPaths thường là finalSegPaths → pitch-shift file có thể là keepPath
+    //    Chúng ta chỉ xóa các _ps*.mp4 KHÔNG có trong keepSet
+    for (const e of entries) {
+      if (/_ps\d+\.mp4$/i.test(e)) {
+        tryRm(path.join(tmpDir, e));
+      }
+    }
+
+    const mb = (freed / 1024 / 1024).toFixed(1);
+    return { ok: true, removed, mb };
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:concat-segments — ghép các segment MP4 thành 1 file cuối ──
+ipcMain.handle('horror:concat-segments', async (event, { segmentPaths, outputPath }) => {
+  try {
+    const os = require('os');
+    const ffmpegBin = require('ffmpeg-static');
+    const { spawn: _sp } = require('child_process');
+    const listFile = path.join(os.tmpdir(), `horror-concat-${Date.now()}.txt`);
+    const lines = segmentPaths.map(p => `file '${p.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n');
+    fs.writeFileSync(listFile, lines, 'utf8');
+    return await new Promise((resolve) => {
+      const args = ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', outputPath];
+      const proc = _sp(ffmpegBin, args);
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => {
+        try { fs.unlinkSync(listFile); } catch {}
+        code === 0
+          ? resolve({ ok: true, path: outputPath })
+          : resolve({ ok: false, error: stderr.split('\n').filter(Boolean).slice(-2).join(' ') });
+      });
+      proc.on('error', e => resolve({ ok: false, error: e.message }));
+    });
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+ipcMain.handle('horror:process', async (event, {
+  videoPath, outputFolder,
+  geminiKeys, geminiModel,
+  sceneDuration, orientation, cropAnchor, storyTitle, horrorStyle, addSubtitles,
+  trimStart, trimEnd,
+  ytUrl,
+  zoomType, zoomDir, zoomLevel,
+  audioSpeed,
+  audioFilter,
+}) => {
+  _horrorAborted = false;
+  const log = (msg) => { try { event.sender.send('horror-log', msg); } catch {} };
+  const tmpDir = path.join(outputFolder, `_horror_tmp_${Date.now()}`);
+  const https = require('https');
+  const http  = require('http');
+
+  const httpsGet = (url, opts = {}) => new Promise((resolve, reject) => {
+    const mod = url.startsWith('https') ? https : http;
+    const req = mod.get(url, { ...opts, headers: { 'User-Agent': 'Mozilla/5.0', ...(opts.headers || {}) } }, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
+        return httpsGet(res.headers.location, opts).then(resolve).catch(reject);
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('error', reject);
+    req.setTimeout(20000, () => { req.destroy(); reject(new Error('timeout')); });
+  });
+
+  const downloadFile = (url, dest) => new Promise((resolve, reject) => {
+    const mod = url.startsWith('https') ? https : http;
+    const file = fs.createWriteStream(dest);
+    const req = mod.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
+        return downloadFile(res.headers.location, dest).then(resolve).catch(reject);
+      res.pipe(file);
+      file.on('finish', () => { file.close(); resolve(dest); });
+    });
+    req.on('error', err => { fs.unlink(dest, () => {}); reject(err); });
+    req.setTimeout(60000, () => { req.destroy(); reject(new Error('download timeout')); });
+  });
+
+  // Gemini generateContent — chạy trong renderer context giống hệt ReupVideoPanel.callGemini
+  const geminiGenerate = async (key, model, contents) => {
+    // Chuẩn hóa contents sang format không có role (giống ReupVideoPanel)
+    const normalizedContents = contents.map(c => ({
+      parts: c.parts || c.content?.parts || []
+    }));
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+    const bodyStr = JSON.stringify({ contents: normalizedContents });
+    const result = await event.sender.executeJavaScript(`
+      (async () => {
+        const res = await fetch(${JSON.stringify(url)}, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: ${JSON.stringify(bodyStr)},
+        });
+        const txt = await res.text();
+        if (!res.ok) throw new Error(txt);
+        const d = JSON.parse(txt);
+        return d?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+      })()
+    `);
+    if (!result) throw new Error('Gemini trả về rỗng');
+    return result;
+  };
+
+  try {
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    // ── Đọc API keys từ DB ───────────────────────────────────────────────────
+    let keys = Array.isArray(geminiKeys) && geminiKeys.length ? geminiKeys : [];
+    if (!keys.length) {
+      try { keys = JSON.parse(await db.getSetting('fluxy_gemini_api_keys', '[]') || '[]'); } catch {}
+    }
+    if (!keys.length) throw new Error('Chưa có Gemini API Key — vào Cài đặt để thêm');
+    log(`🔑 Gemini: ${keys.length} key(s), đầu tiên: ...${keys[0].slice(-8)}`);
+    let geminiKeyIdx = 0;
+    const getGeminiKey = () => { const k = keys[geminiKeyIdx % keys.length]; geminiKeyIdx++; return k; };
+    const model = geminiModel || 'gemini-3.5-flash';
+    log(`🤖 Model: ${model}`);
+
+    // Retry toàn bộ keys trước, sau đó mới fallback model
+    const geminiGenerateWithRotation = async (model2, contents) => {
+      const fallbackModels = [model2, 'gemini-3.5-flash', 'gemini-3.1-flash-lite'].filter((m, i, a) => a.indexOf(m) === i);
+      for (const tryModel of fallbackModels) {
+        if (tryModel !== model2) log(`⚠ Thử fallback model ${tryModel}...`);
+        const tried = new Set();
+        let lastErr;
+        for (let attempt = 0; attempt < keys.length; attempt++) {
+          const key = getGeminiKey();
+          if (tried.has(key)) break; // đã thử hết
+          tried.add(key);
+          try {
+            return await geminiGenerate(key, tryModel, contents);
+          } catch (err) {
+            lastErr = err;
+            const msg = err?.message || '';
+            const isRetryable = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota')
+              || msg.includes('503') || msg.includes('overloaded') || msg.includes('unavailable')
+              || msg.includes('403') || msg.includes('PERMISSION_DENIED') || msg.includes('denied access');
+            if (isRetryable) continue; // thử key tiếp
+            throw err;                 // lỗi khác (4xx khác, parse error...) → dừng
+          }
+        }
+        // Thử hết key của model này vẫn fail → thử model tiếp theo
+        log(`⚠ ${tried.size} key thất bại với ${tryModel}`);
+      }
+      throw new Error('Tất cả keys đều thất bại. Kiểm tra lại Gemini API key.');
+    };
+
+    const DEFAULT_PEXELS  = 'WKTsaxocXMQX4dzC71CCsMmqgVulpD69gWgrMb1KKEoa568zPtWWgnCg';
+    const DEFAULT_PIXABAY = '56053263-d50fe3d92779b295085043216';
+    const pexelsKey  = ((await db.getSetting('pexels_api_key',  '') || '').trim()) || DEFAULT_PEXELS;
+    const pixabayKey = ((await db.getSetting('pixabay_api_key', '') || '').trim()) || DEFAULT_PIXABAY;
+
+    // ── Bước 0 (optional): Trim đầu/đuôi video nguồn ────────────────────────
+    let srcVideoPath = videoPath;
+    const ts = parseInt(trimStart) || 0;
+    const te = parseInt(trimEnd)   || 0;
+    if (ts > 0 || te > 0) {
+      log(`✂ Cắt ${ts}s đầu${te>0?` + ${te}s cuối`:''} video nguồn...`);
+      const trimmedPath = path.join(tmpDir, 'trimmed_src.mp4');
+      const trimArgs = ['-i', videoPath, '-ss', String(ts)];
+      if (te > 0) {
+        // Get duration first to calculate end time
+        let durSec2 = 0;
+        try {
+          const p2 = require('child_process').execSync(
+            `"${ffprobePath}" -v quiet -print_format json -show_format "${videoPath}"`,
+            { timeout: 10000 }
+          ).toString();
+          durSec2 = parseFloat(JSON.parse(p2)?.format?.duration || '0');
+        } catch(_) {}
+        if (durSec2 > 0) trimArgs.push('-to', String(Math.max(ts + 1, durSec2 - te)));
+      }
+      trimArgs.push('-c', 'copy', '-avoid_negative_ts', 'make_zero', '-y', trimmedPath);
+      const trimRes = await runFFmpeg(trimArgs);
+      if (trimRes.ok) { srcVideoPath = trimmedPath; log('✔ Đã cắt video nguồn.'); }
+      else log('⚠ Cắt thất bại, dùng video gốc.');
+    }
+
+    // ── Bước 1: Trích xuất audio WAV ─────────────────────────────────────────
+    log('🎵 Bước 1/5: Trích xuất audio từ video...');
+    const audioPath = path.join(tmpDir, 'audio.wav');
+    const extractResult = await runFFmpeg(['-i', srcVideoPath, '-vn', '-ac', '1', '-ar', '16000', '-y', audioPath]);
+    if (!extractResult.ok) throw new Error('Lỗi trích xuất audio: ' + extractResult.stderr.slice(-300));
+    if (_horrorAborted) throw new Error('Đã hủy');
+    log('✔ Đã trích xuất audio.');
+
+    // ── Bước 2: Lấy phụ đề YouTube hoặc phiên âm Gemini ─────────────────────
+    log('📊 Bước 2/5: Lấy văn bản truyện...');
+    // Get audio duration
+    let totalDurSec = 0;
+    try {
+      const probeOut = require('child_process').execSync(
+        `"${ffprobePath}" -v quiet -print_format json -show_format "${audioPath}"`,
+        { timeout: 10000 }
+      ).toString();
+      totalDurSec = parseFloat(JSON.parse(probeOut)?.format?.duration || '0');
+    } catch(_) {}
+    log(`📏 Duration: ${Math.round(totalDurSec)}s`);
+
+    let fullTranscript = '';
+    let usedYtSubs = false;
+
+    // ── Thử lấy phụ đề YouTube nếu có URL ─────────────────────────────────
+    if (ytUrl && ytUrl.trim()) {
+      log('📋 Thử lấy phụ đề từ YouTube...');
+      try {
+        const { app: electronApp } = require('electron');
+        const ytdlpBin = (() => {
+          const local = path.join(electronApp.getPath('userData'), 'tools', 'yt-dlp.exe');
+          if (fs.existsSync(local)) return local;
+          try { const r = path.join(process.resourcesPath, 'yt-dlp.exe'); if (fs.existsSync(r)) return r; } catch {}
+          return null;
+        })();
+
+        if (ytdlpBin) {
+          const subsDir = path.join(tmpDir, 'subs_yt');
+          fs.mkdirSync(subsDir, { recursive: true });
+
+          // Try vi, vi-VN first, then en
+          const ytSubsRaw = await new Promise((resolve) => {
+            const proc = spawn(ytdlpBin, [
+              '--write-subs', '--write-auto-subs',
+              '--sub-langs', 'vi,vi-VN,en',
+              '--sub-format', 'vtt/srt/best',
+              '--skip-download',
+              '-o', path.join(subsDir, 'sub'),
+              ytUrl.trim()
+            ]);
+            let stderr = '';
+            proc.stderr.on('data', d => stderr += d);
+            proc.on('close', () => {
+              // Find downloaded subtitle file
+              try {
+                const files = fs.readdirSync(subsDir);
+                // Prefer Vietnamese
+                const viFile = files.find(f => /\.(vi|vi-VN)\.(vtt|srt)$/i.test(f));
+                const enFile = files.find(f => /\.en\.(vtt|srt)$/i.test(f));
+                const anyFile = files.find(f => /\.(vtt|srt)$/i.test(f));
+                const chosen = viFile || enFile || anyFile;
+                if (chosen) resolve(fs.readFileSync(path.join(subsDir, chosen), 'utf8'));
+                else resolve(null);
+              } catch { resolve(null); }
+            });
+            proc.on('error', () => resolve(null));
+            setTimeout(() => { try { proc.kill(); } catch {} resolve(null); }, 30000);
+          });
+
+          if (ytSubsRaw) {
+            // Parse VTT/SRT to plain text
+            const parseSubText = (raw) => {
+              return raw
+                .replace(/WEBVTT[\s\S]*?\n\n/, '')     // strip VTT header
+                .replace(/^\d+\s*\n/gm, '')             // strip SRT sequence numbers
+                .replace(/\d{2}:\d{2}[:.]\d{2,3}\s*-->\s*\d{2}:\d{2}[:.]\d{2,3}[^\n]*/gm, '') // strip timecodes
+                .replace(/<[^>]+>/g, '')                // strip HTML tags (<c>, <b>, etc.)
+                .replace(/\{[^}]+\}/g, '')              // strip SSA tags
+                .replace(/align:.*$/gm, '')             // strip VTT positioning
+                .split('\n')
+                .map(l => l.trim())
+                .filter(Boolean)
+                .join(' ')
+                .replace(/\s{2,}/g, ' ')
+                .trim();
+            };
+            const parsed = parseSubText(ytSubsRaw);
+            if (parsed.length > 100) {
+              fullTranscript = parsed;
+              usedYtSubs = true;
+              log(`✅ Đã lấy phụ đề YouTube: ${parsed.length} ký tự`);
+            }
+          }
+        } else {
+          log('⚠ Không tìm thấy yt-dlp — bỏ qua phụ đề YouTube');
+        }
+      } catch(e) { log(`⚠ Lấy phụ đề thất bại: ${e.message}`); }
+    }
+
+    // ── Fallback: Gemini transcription nếu không có phụ đề YouTube ────────
+    if (!fullTranscript) {
+      log(`🎙 Phiên âm bằng Gemini ${model}...`);
+      const CHUNK_SEC = 110;
+      const numChunks = totalDurSec > 0 ? Math.ceil(totalDurSec / CHUNK_SEC) : 1;
+
+      for (let ci = 0; ci < numChunks; ci++) {
+        if (_horrorAborted) throw new Error('Đã hủy');
+        const startSec = ci * CHUNK_SEC;
+        const chunkPath = path.join(tmpDir, `chunk_${ci}.wav`);
+        const chunkArgs = ['-i', audioPath, '-ss', String(startSec)];
+        if (ci < numChunks - 1) chunkArgs.push('-t', String(CHUNK_SEC));
+        chunkArgs.push('-y', chunkPath);
+        const chunkRes = await runFFmpeg(chunkArgs);
+        if (!chunkRes.ok) { log(`⚠ Lỗi chunk ${ci}`); continue; }
+
+        const b64 = fs.readFileSync(chunkPath).toString('base64');
+        log(`  Chunk ${ci+1}/${numChunks}...`);
+        const transcript = await geminiGenerateWithRotation(model, [{
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType: 'audio/wav', data: b64 } },
+            { text: 'Hãy chuyển toàn bộ nội dung âm thanh này thành văn bản tiếng Việt. Chỉ trả về đúng văn bản, không giải thích thêm.' }
+          ]
+        }]);
+        fullTranscript += (fullTranscript ? '\n' : '') + transcript.trim();
+        log(`  ✔ Chunk ${ci+1}: ${transcript.trim().length} ký tự`);
+      }
+    }
+    if (!fullTranscript.trim()) throw new Error('Không nhận được văn bản');
+
+    // Save transcript
+    const transcriptPath = path.join(outputFolder, (storyTitle||'truyen_ma') + '_transcript.txt');
+    fs.writeFileSync(transcriptPath, fullTranscript, 'utf8');
+    log(`📄 Đã lưu transcript: ${path.basename(transcriptPath)}`);
+    if (_horrorAborted) throw new Error('Đã hủy');
+
+    // ── Bước 3: Phân tích cảnh + tạo từ khóa tìm video ──────────────────────
+    log('🎬 Bước 3/5: Phân tích cảnh và tạo từ khóa...');
+    // Tính số stock clips cần: sau 2 phút đầu, mỗi chu kỳ 15s gốc + Xs stock
+    const _INTRO_DUR  = 120;
+    const _ORIG_CHUNK = 15;
+    const _STOCK_PER  = sceneDuration || 10;
+    const _stockCycles = Math.ceil(Math.max(0, totalDurSec - _INTRO_DUR) / (_ORIG_CHUNK + _STOCK_PER));
+    const approxSceneCount = Math.max(5, Math.min(120, _stockCycles));
+
+    const scenePrompt = `Phân tích đoạn truyện ma sau và chia thành ${approxSceneCount} cảnh (scene) theo mạch kể chuyện.
+Mỗi cảnh khoảng ${sceneDuration || 10} giây.
+Trả về JSON (không markdown, không giải thích):
+[
+  {
+    "id": 1,
+    "startSec": 0,
+    "endSec": ${sceneDuration || 10},
+    "searchKeyword": "dark foggy forest night horror",
+    "description": "mô tả ngắn cảnh"
+  }
+]
+
+QUY TẮC TẠO searchKeyword (tiếng Anh, 3-5 từ):
+- TRÁNH: cảnh người đi lại, khuôn mặt người, đường phố đô thị hiện đại có chữ tiếng Anh
+- ƯU TIÊN cảnh thiên nhiên u tối, trung tính:
+  * foggy forest night, misty road dark, rainy night empty road
+  * candlelight flickering smoke, old wooden door night
+  * moonlit graveyard fog, stormy night lightning
+  * dark abandoned hallway, swamp night fog
+  * old clock shadow dark, wind blowing leaves night
+  * dark river night mist, empty path forest
+- Cảnh phải phù hợp bối cảnh truyện Việt (không có chữ/biển báo tiếng Anh nổi bật)
+
+Truyện: ${fullTranscript.slice(0, 3000)}`;
+
+    const sceneJson = await geminiGenerateWithRotation(model, [{ role: 'user', parts: [{ text: scenePrompt }] }]);
+    if (_horrorAborted) throw new Error('Đã hủy');
+
+    let scenes = [];
+    try {
+      const cleaned = sceneJson.replace(/```json\n?/g,'').replace(/```\n?/g,'').trim();
+      scenes = JSON.parse(cleaned);
+    } catch(e) {
+      // Try to extract JSON array
+      const m = sceneJson.match(/\[[\s\S]*\]/);
+      if (m) { try { scenes = JSON.parse(m[0]); } catch {} }
+    }
+    if (!scenes.length) throw new Error('Không parse được danh sách cảnh từ Gemini');
+    log(`🎬 Đã tạo ${scenes.length} cảnh`);
+
+    // ── Bước 4: Tải video stock cho mỗi cảnh ─────────────────────────────────
+    log(`📥 Bước 4/5: Tải video stock...`);
+    const stockDir  = path.join(tmpDir, 'stock');
+    const clipsDir  = path.join(tmpDir, 'clips');
+    fs.mkdirSync(stockDir,  { recursive: true });
+    fs.mkdirSync(clipsDir,  { recursive: true });
+
+    const wRes = orientation === 'portrait' ? 1080 : orientation === 'square' ? 1080 : 1920;
+    const hRes = orientation === 'portrait' ? 1920 : orientation === 'square' ? 1080 : 1080;
+    const oriParam = orientation === 'portrait' ? 'portrait' : 'landscape';
+
+    // Crop filter for square output: chọn vùng cắt theo cropAnchor
+    let squareCropVF = '';
+    if (orientation === 'square') {
+      // crop=min(iw,ih):min(iw,ih):x:y
+      const anchor = cropAnchor || 'center';
+      const xExpr = anchor === 'left'   ? '0'
+                  : anchor === 'right'  ? 'iw-min(iw\\,ih)'
+                  : '(iw-min(iw\\,ih))/2'; // center/top/bottom
+      const yExpr = anchor === 'top'    ? '0'
+                  : anchor === 'bottom' ? 'ih-min(iw\\,ih)'
+                  : '(ih-min(iw\\,ih))/2'; // center/left/right
+      squareCropVF = `crop=min(iw\\,ih):min(iw\\,ih):${xExpr}:${yExpr},`;
+      log(`✂️ Crop 1:1 (${anchor}): ${wRes}x${hRes}`);
+    }
+
+    const colorFilter = {
+      dark:      'eq=brightness=-0.08:contrast=1.3:saturation=0.55',
+      horror:    'colorchannelmixer=rr=1.15:gg=0.65:bb=0.65,eq=brightness=-0.12:contrast=1.5:saturation=0.4',
+      fog:       'eq=contrast=1.1:saturation=0.45:brightness=-0.06,unsharp=3:3:-0.3:3:3:-0.3',
+      cinematic: 'curves=r=\'0/0.02 1/0.9\':g=\'0/0.01 0.5/0.48 1/0.88\':b=\'0/0.04 1/0.8\',eq=contrast=1.2:saturation=0.7',
+    }[horrorStyle] || 'eq=brightness=-0.08:contrast=1.3:saturation=0.55';
+
+    const processedClips = [];
+    let downloadErrors = 0;
+    const usedVideoIds = new Set(); // track used video IDs to avoid duplicates
+
+    // Search stock from Pexels — returns array of {id, url} candidates
+    const searchPexels = async (keyword, count = 8) => {
+      if (!pexelsKey) return [];
+      try {
+        const r = await httpsGet(
+          `https://api.pexels.com/videos/search?query=${encodeURIComponent(keyword)}&per_page=${count}&orientation=${oriParam}&size=medium`,
+          { headers: { 'Authorization': pexelsKey } }
+        );
+        if (r.status !== 200) return [];
+        const data = JSON.parse(r.body);
+        return (data.videos || []).map(v => {
+          const files = v.video_files || [];
+          const f = files.find(f => f.quality === 'hd') || files.find(f => f.quality === 'sd') || files[0];
+          return f?.link ? { id: `pex_${v.id}`, url: f.link } : null;
+        }).filter(Boolean);
+      } catch { return []; }
+    };
+
+    // Search stock from Pixabay — returns array of {id, url} candidates
+    const searchPixabay = async (keyword, count = 8) => {
+      if (!pixabayKey) return [];
+      try {
+        const r = await httpsGet(
+          `https://pixabay.com/api/videos/?key=${pixabayKey}&q=${encodeURIComponent(keyword)}&per_page=${count}&video_type=film&safesearch=true`
+        );
+        if (r.status !== 200) return [];
+        const data = JSON.parse(r.body);
+        return (data.hits || []).map(v => {
+          const u = v.videos?.medium?.url || v.videos?.small?.url || v.videos?.tiny?.url;
+          return u ? { id: `pix_${v.id}`, url: u } : null;
+        }).filter(Boolean);
+      } catch { return []; }
+    };
+
+    for (let si = 0; si < scenes.length; si++) {
+      if (_horrorAborted) throw new Error('Đã hủy');
+      const scene = scenes[si];
+      const keyword = scene.searchKeyword || 'dark forest night';
+      log(`  [${si+1}/${scenes.length}] "${keyword}"`);
+
+      const sceneDurFinal = Math.max(3, (scene.endSec || 0) - (scene.startSec || 0)) || (sceneDuration || 10);
+      let videoUrl = null;
+
+      try {
+        // Try both Pexels + Pixabay, pick first unused result
+        const [pexelsCandidates, pixabayCandidates] = await Promise.all([
+          searchPexels(keyword),
+          searchPixabay(keyword),
+        ]);
+        // Interleave: pick from both, avoid duplicates
+        const allCandidates = [];
+        const maxLen = Math.max(pexelsCandidates.length, pixabayCandidates.length);
+        for (let ci = 0; ci < maxLen; ci++) {
+          if (pexelsCandidates[ci])  allCandidates.push(pexelsCandidates[ci]);
+          if (pixabayCandidates[ci]) allCandidates.push(pixabayCandidates[ci]);
+        }
+        const unused = allCandidates.filter(c => !usedVideoIds.has(c.id));
+        const chosen = unused[0] || allCandidates[0]; // fallback to any if all used
+        if (chosen) { videoUrl = chosen.url; usedVideoIds.add(chosen.id); }
+        else if (!pexelsKey && !pixabayKey) { /* no keys */ }
+        else log(`  ⚠ Không tìm thấy video cho cảnh ${si+1}`);
+      } catch(e) { log(`  ⚠ Search lỗi: ${e.message}`); }
+
+      const clipOut = path.join(clipsDir, `clip_${String(si).padStart(3,'0')}.mp4`);
+
+      if (videoUrl) {
+        try {
+          const dlPath = path.join(stockDir, `raw_${si}.mp4`);
+          await downloadFile(videoUrl, dlPath);
+
+          // Trim + scale + color grade (square: crop center fill; portrait/landscape: fill+crop)
+          const vf = orientation === 'square'
+            ? `crop=min(iw\\,ih):min(iw\\,ih):(iw-min(iw\\,ih))/2:(ih-min(iw\\,ih))/2,scale=${wRes}:${hRes},${colorFilter}`
+            : `scale=${wRes}:${hRes}:force_original_aspect_ratio=increase,crop=${wRes}:${hRes},${colorFilter}`;
+          const trimRes = await runFFmpeg([
+            '-i', dlPath, '-ss', '0', '-t', String(sceneDurFinal),
+            '-vf', vf, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-an', '-r', '30', '-y', clipOut
+          ]);
+          if (trimRes.ok) {
+            processedClips.push(clipOut);
+            log(`  ✔ Clip ${si+1} OK`);
+          } else {
+            log(`  ⚠ FFmpeg lỗi clip ${si+1}`);
+            downloadErrors++;
+          }
+        } catch(e) { log(`  ⚠ Download lỗi: ${e.message}`); downloadErrors++; }
+      } else {
+        log(`  ⚠ Không tìm thấy video cho cảnh ${si+1}, tạo cảnh tối...`);
+        // Fallback: black screen with duration
+        const fallRes = await runFFmpeg([
+          '-f', 'lavfi', '-i', `color=c=black:s=${wRes}x${hRes}:r=30:d=${sceneDurFinal}`,
+          '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-y', clipOut
+        ]);
+        if (fallRes.ok) processedClips.push(clipOut);
+        downloadErrors++;
+      }
+    }
+    if (!processedClips.length) throw new Error('Không có clip nào được tạo thành công');
+    log(`📦 Đã xử lý ${processedClips.length} clips (${downloadErrors} lỗi)`);
+
+    // ── Bước 5: 2' đầu gốc → xen kẽ 15s gốc / Xs stock → ghép cuối ──────────
+    log('🎞️ Bước 5/5: Ghép video cuối cùng...');
+
+    // 5a. Pre-grade + scale video gốc 1 lần (+ zoom nếu bật)
+    log('🎨 Chuẩn bị video gốc (color grading)...');
+
+    // Tính zoom filter cho zoompan (slow progressive zoom in/out)
+    // zoompan là CPU-only, cực chậm với video dài → tự động tắt nếu > 10 phút
+    const ZOOM_MAX_SEC = 600; // 10 phút
+    let zoomVF = '';
+    if (zoomType && zoomType !== 'none' && totalDurSec > 0) {
+      if (totalDurSec > ZOOM_MAX_SEC) {
+        log(`⚠ Zoom tắt tự động — video dài ${Math.round(totalDurSec/60)} phút (zoompan quá chậm > 10 phút)`);
+      } else {
+        const fps = 30;
+        const totalFrames = Math.max(1, Math.round(totalDurSec * fps));
+        const zoomAmt  = Math.max(0.03, Math.min(0.25, (zoomLevel || 8) / 100));
+        const zoomStep = (zoomAmt / totalFrames).toFixed(9);
+        const maxZ     = (1 + zoomAmt).toFixed(6);
+        const zExpr = zoomType === 'in'
+          ? `min(zoom+${zoomStep},${maxZ})`
+          : `if(eq(on,1),${maxZ},max(zoom-${zoomStep},1))`;
+        const yExpr = zoomDir === 'up'   ? '0'
+                    : zoomDir === 'down' ? 'ih-(ih/zoom)'
+                    : 'ih/2-(ih/zoom/2)';
+        zoomVF = `,zoompan=z='${zExpr}':x='iw/2-(iw/zoom/2)':y='${yExpr}':d=1:s=${wRes}x${hRes}:fps=${fps}`;
+        log(`🔍 Zoom: ${zoomType} ${zoomDir} ${zoomAmt*100}% (step=${zoomStep}/frame)`);
+      }
+    }
+
+    const srcGradedPath = path.join(tmpDir, 'src_graded.mp4');
+    // squareCropVF: '' cho portrait/landscape, 'crop=...' cho 1:1 (trước scale)
+    const gradeVF = orientation === 'square'
+      ? `${squareCropVF}scale=${wRes}:${hRes},${colorFilter}${zoomVF}`
+      : `scale=${wRes}:${hRes}:force_original_aspect_ratio=decrease,pad=${wRes}:${hRes}:(ow-iw)/2:(oh-ih)/2,${colorFilter}${zoomVF}`;
+    const gradeRes = await runFFmpeg([
+      '-i', srcVideoPath,
+      '-vf', gradeVF,
+      '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+      '-an', '-r', '30', '-y', srcGradedPath
+    ]);
+    if (!gradeRes.ok) log('⚠ Grade video gốc thất bại — dùng video gốc không graded');
+    const srcForMix = gradeRes.ok ? srcGradedPath : srcVideoPath;
+
+    // 5b. Build concat: 120s đầu gốc → xen kẽ 15s gốc + Xs stock (không loop)
+    const INTRO_DUR  = 120;                  // 2 phút đầu giữ nguyên video gốc
+    const ORIG_CHUNK = 15;                   // giây gốc mỗi chu kỳ xen kẽ
+    const STOCK_CHUNK = sceneDuration || 10; // giây stock mỗi chu kỳ
+
+    const concatList = path.join(tmpDir, 'concat.txt');
+    const concatLines = [];
+    let cur = 0, si = 0;
+
+    // Phần intro 2 phút đầu
+    const introDur = Math.min(INTRO_DUR, totalDurSec);
+    concatLines.push(`file '${srcForMix.replace(/\\/g, '/')}'`);
+    concatLines.push(`inpoint 0.000`);
+    concatLines.push(`outpoint ${introDur.toFixed(3)}`);
+    cur = introDur;
+
+    // Phần xen kẽ: 15s gốc → Xs stock → 15s gốc → Xs stock ...
+    // Không loop: si < processedClips.length → dừng dùng stock khi hết clip
+    while (cur < totalDurSec - 0.5) {
+      if (_horrorAborted) throw new Error('Đã hủy');
+      const od = Math.min(ORIG_CHUNK, totalDurSec - cur);
+      concatLines.push(`file '${srcForMix.replace(/\\/g, '/')}'`);
+      concatLines.push(`inpoint ${cur.toFixed(3)}`);
+      concatLines.push(`outpoint ${(cur + od).toFixed(3)}`);
+      cur += od;
+      if (cur >= totalDurSec - 0.5) break;
+      if (si < processedClips.length) {
+        concatLines.push(`file '${processedClips[si].replace(/\\/g, '/')}'`);
+        si++;
+        cur += STOCK_CHUNK;
+      }
+      // Hết stock → tiếp tục gốc (vòng lặp tiếp theo sẽ chỉ thêm gốc)
+    }
+
+    fs.writeFileSync(concatList, concatLines.join('\n'), 'utf8');
+    log(`📋 Concat: ${INTRO_DUR}s intro + ${si}/${processedClips.length} stock clips`);
+
+    const concatPath = path.join(tmpDir, 'concat_raw.mp4');
+    const concatRes = await runFFmpeg([
+      '-f', 'concat', '-safe', '0', '-i', concatList,
+      '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-y', concatPath
+    ]);
+    if (!concatRes.ok) throw new Error('Lỗi concat video: ' + concatRes.stderr.slice(-300));
+    if (_horrorAborted) throw new Error('Đã hủy');
+
+    const safeTitle = (storyTitle || 'truyen_ma').replace(/[^a-zA-Z0-9_\-À-ɏḀ-ỿ ]/g, '_');
+    const finalPath = path.join(outputFolder, `${safeTitle}_${Date.now()}.mp4`);
+
+    // Mix: video từ concat + audio gốc (không subtitle, tuỳ chọn atempo + audio filter)
+    const spd = parseFloat(audioSpeed) || 1.0;
+    const needAtempo = Math.abs(spd - 1.0) > 0.005;
+    if (needAtempo) log(`🎙️ Tốc độ giọng: ${spd.toFixed(2)}x (atempo)`);
+
+    // Build audio filter chain
+    const AF_PRESETS = {
+      none:   '',
+      light:  'highpass=f=100,lowpass=f=7500',
+      medium: 'highpass=f=100,lowpass=f=7500,afftdn=nf=-20:nt=w',
+      strong: 'highpass=f=120,lowpass=f=7000,afftdn=nf=-25:nt=w,equalizer=f=250:width_type=o:width=200:gain=-4,equalizer=f=3000:width_type=o:width=500:gain=3,dynaudnorm=p=0.95:m=100:s=5',
+    };
+    const afPreset = AF_PRESETS[audioFilter] || '';
+    if (afPreset) log(`🎚️ Lọc âm thanh: ${audioFilter} (${afPreset.split(',').length} filter)`);
+
+    const afChain = [
+      needAtempo ? `atempo=${spd.toFixed(4)}` : '',
+      afPreset,
+    ].filter(Boolean).join(',');
+
+    const mixArgs = afChain ? [
+      '-i', concatPath, '-i', srcVideoPath,
+      '-map', '0:v', '-map', '1:a',
+      '-filter:a', afChain,
+      '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+      '-shortest', '-y', finalPath
+    ] : [
+      '-i', concatPath, '-i', srcVideoPath,
+      '-map', '0:v', '-map', '1:a',
+      '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
+      '-shortest', '-y', finalPath
+    ];
+
+    const finalRes = await runFFmpeg(mixArgs);
+    if (!finalRes.ok) throw new Error('Lỗi ghép âm thanh: ' + finalRes.stderr.slice(-300));
+
+    log(`✅ Hoàn tất! → ${path.basename(finalPath)}`);
+    return { ok: true, outputPath: finalPath };
+
+  } catch(e) {
+    log(`❌ ${e.message}`);
+    return { ok: false, error: e.message };
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// ── HONGGUO (红果短剧) ─────────────────────────────────────────────────────────
+async function hongguoFetch(url) {
+  const https = require('https');
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://hongguoduanju.com/',
+      }
+    }, (res) => {
+      let raw = '';
+      res.on('data', d => { raw += d; });
+      res.on('end', () => {
+        try {
+          const firstLine = raw.split('\n')[0].trim();
+          resolve({ ok: true, data: JSON.parse(firstLine), status: res.statusCode });
+        } catch(e) {
+          reject(new Error(`JSON parse failed: ${e.message} | preview: ${raw.substring(0, 200)}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Hongguo fetch timeout')); });
+  });
+}
+
+ipcMain.handle('hongguo:get-home', async () => {
+  try {
+    const url = 'https://hongguoduanju.com/?__loader=page&__ssrDirect=true';
+    const { data } = await hongguoFetch(url);
+    const homeSections = (data?.homeSections || []).map(s => ({
+      tab_type: s.tab_type,
+      tab_name: s.tab_name,
+      video_list: (s.video_list || []).map(v => ({
+        series_id: v.series_id,
+        title: v.series_title || v.series_name,
+        cover: v.series_cover,
+        episode_cnt: v.episode_cnt,
+        episode_right_text: v.episode_right_text,
+        tags: (v.category_list || []).map(c => c.name),
+        intro: v.series_intro,
+        pay_type: v.pay_type,
+        rank: v.rank,
+      })),
+    }));
+    const bannerList = (data?.bannerList || []).map(b => ({
+      series_id: b.series_id,
+      title: b.series_name,
+      cover: b.series_cover,
+      intro: b.series_intro,
+      tags: b.tags || [],
+    }));
+    return { ok: true, homeSections, bannerList };
+  } catch(e) { return { ok: false, error: e.message }; }
+});
+
+ipcMain.handle('hongguo:get-series-info', async (event, seriesId) => {
+  try {
+    const url = `https://hongguoduanju.com/detail?series_id=${seriesId}&__loader=detail_page&__ssrDirect=true`;
+    const { data } = await hongguoFetch(url);
+    const sd = data?.seriesDetail;
+    if (!sd) return { ok: false, error: 'Không tìm thấy series' };
+    return {
+      ok: true,
+      series_id: sd.series_id,
+      name: sd.series_name,
+      cover: sd.series_cover,
+      episode_cnt: sd.episode_cnt,
+      accessible_episode_cnt: sd.accessible_episode_cnt,
+      tags: sd.tags || [],
+      vid_list: sd.vid_list || [],
+      intro: sd.series_intro,
+    };
+  } catch(e) { return { ok: false, error: e.message }; }
+});
+
+ipcMain.handle('hongguo:get-video-url', async (event, seriesId, vidId) => {
+  try {
+    const url = `https://hongguoduanju.com/player/${seriesId}?vid=${vidId}&__loader=player_%28series_id%29%2Fpage&__ssrDirect=true`;
+    const { data } = await hongguoFetch(url);
+    const vpi = data?.video_player_info;
+    if (!vpi?.main_url) return { ok: false, error: 'Không lấy được URL video' };
+    return {
+      ok: true,
+      main_url: vpi.main_url,
+      poster_url: vpi.poster_url,
+      duration: vpi.duration,
+      width: vpi.width,
+      height: vpi.height,
+    };
+  } catch(e) { return { ok: false, error: e.message }; }
+});
+
+ipcMain.handle('hongguo:download-episode', async (event, { seriesId, vidId, outPath, epNum }) => {
+  const https = require('https');
+  const http = require('http');
+  const win = BrowserWindow.getAllWindows()[0];
+  const send = (data) => win?.webContents?.send('hongguo:download-progress', data);
+  try {
+    // 1. Get fresh video URL
+    send({ epNum, status: 'fetching', msg: 'Đang lấy URL...' });
+    const ssrUrl = `https://hongguoduanju.com/player/${seriesId}?vid=${vidId}&__loader=player_%28series_id%29%2Fpage&__ssrDirect=true`;
+    const { data } = await hongguoFetch(ssrUrl);
+    const videoUrl = data?.video_player_info?.main_url;
+    if (!videoUrl) return { ok: false, error: 'Không lấy được URL video' };
+
+    // 2. Download with progress
+    const dir = path.dirname(outPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    send({ epNum, status: 'downloading', msg: 'Đang tải...', percent: 0 });
+
+    await new Promise((resolve, reject) => {
+      const doGet = (url, redirectCount = 0) => {
+        const proto = url.startsWith('https') ? https : http;
+        proto.get(url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://hongguoduanju.com/',
+          }
+        }, (res) => {
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectCount < 5) {
+            return doGet(res.headers.location, redirectCount + 1);
+          }
+          if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+          const total = parseInt(res.headers['content-length'] || '0');
+          let received = 0;
+          const ws = fs.createWriteStream(outPath);
+          res.on('data', chunk => {
+            received += chunk.length;
+            if (total > 0) {
+              const pct = Math.round(received / total * 100);
+              send({ epNum, status: 'downloading', msg: `${pct}% (${(received/1048576).toFixed(1)}MB)`, percent: pct });
+            }
+          });
+          res.pipe(ws);
+          ws.on('finish', resolve);
+          ws.on('error', reject);
+          res.on('error', reject);
+        }).on('error', reject);
+      };
+      doGet(videoUrl);
+    });
+
+    send({ epNum, status: 'done', msg: '✅ Xong', path: outPath });
+    return { ok: true, path: outPath };
+  } catch(e) {
+    send({ epNum, status: 'error', msg: e.message });
+    return { ok: false, error: e.message };
+  }
+});

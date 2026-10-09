@@ -5,6 +5,8 @@ import {
   buildSystemPrompt, isVideoRequest,
   callGeminiPlan, callGeminiChat,
 } from '../services/aiAgent';
+import FXCatalogModal from './FXCatalogModal';
+import { MILITARY_IDEAS, MILITARY_TOPIC_TOTAL, pickMilitaryTopic, markMilitaryTopicUsed, countUsedMilitaryTopics } from '../services/militaryTopics';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 const narrationText = (n) => typeof n === 'string' ? n : (n?.text || '');
@@ -26,7 +28,7 @@ const fmtDur  = (s) => { if (!s) return '—'; const m = Math.floor(s/60); retur
 
 const PROD_STAGES = [
   { id:'research', icon:'🔍', label:'Nghiên cứu',    tools:['research_topic'] },
-  { id:'plan',     icon:'📋', label:'Kịch bản',      tools:['plan_video','set_platform_config'] },
+  { id:'plan',     icon:'📋', label:'Kịch bản',      tools:['plan_video','extend_plan','set_platform_config'] },
   { id:'voice',    icon:'🎙️', label:'Voice Over',    tools:['generate_tts'] },
   { id:'visual',   icon:'🖼️', label:'Hình ảnh / Video', tools:['acquire_broll','generate_image','search_stock_footage'] },
   { id:'audio',    icon:'🎵', label:'Nhạc & SFX',    tools:['add_background_music','add_sfx'] },
@@ -36,7 +38,7 @@ const PROD_STAGES = [
 ];
 
 const RUNNING_LABELS = {
-  plan_video:'Lên kế hoạch video', research_topic:'Nghiên cứu chủ đề', set_platform_config:'Cấu hình platform',
+  plan_video:'Lên kế hoạch video', extend_plan:'Viết tiếp kế hoạch', research_topic:'Nghiên cứu chủ đề', set_platform_config:'Cấu hình platform',
   acquire_broll:'Tìm B-roll', generate_image:'Tạo hình ảnh AI', generate_tts:'Tổng hợp giọng nói',
   add_background_music:'Thêm nhạc nền', add_sfx:'Thêm hiệu ứng âm thanh', generate_subtitles:'Tạo phụ đề',
   render_video:'Render video', quality_check:'Kiểm tra chất lượng', search_stock_footage:'Tìm stock footage',
@@ -50,6 +52,7 @@ const VISUAL_ICONS = {
 
 const PRESETS = [
   { id:'auto',        label:'Auto',       icon:'⚡', color:'#a855f7', desc:'AI tự chọn phong cách' },
+  { id:'military',    label:'Quân sự',    icon:'🎖️', color:'#84cc16', desc:'Vũ khí, quốc phòng, lịch sử quân sự — footage DVIDS mới nhất' },
   { id:'documentary', label:'Documentary',icon:'🎬', color:'#6366f1', desc:'Phim tài liệu' },
   { id:'explainer',   label:'Explainer',  icon:'💡', color:'#0ea5e9', desc:'Giải thích, giáo dục' },
   { id:'news',        label:'News',       icon:'📰', color:'#ef4444', desc:'Tin tức' },
@@ -60,17 +63,38 @@ const PRESETS = [
   { id:'shorts',      label:'Shorts',     icon:'📱', color:'#ec4899', desc:'Short-form viral' },
 ];
 
+
 const MODELS = [
-  { id:'gemini-3.5-flash',      label:'3.5 Flash (Default)'    },
-  { id:'gemini-3.1-flash-lite', label:'3.1 Flash Lite (Cheap)' },
-  { id:'gemini-3-flash-preview',label:'3.0 Flash Preview'      },
+  { id:'gemini-3.5-flash',       label:'3.5 Flash',     badge:'Default',  desc:'Nhanh & cân bằng' },
+  { id:'gemini-3.1-flash-lite',  label:'3.1 Flash Lite',badge:'Cheap',    desc:'Tiết kiệm, nhẹ'  },
+  { id:'gemini-3-flash-preview', label:'3.0 Preview',   badge:'Preview',  desc:'Mô hình xem trước' },
+];
+const DIRECTOR_MODES = [
+  { id:'youtube', icon:'📺', label:'YouTube',      tagline:'Giữ chân cao'       },
+  { id:'cinematic',icon:'🎬',label:'Cinematic',    tagline:'Điện ảnh'           },
+  { id:'viral',   icon:'🔥', label:'Viral',        tagline:'TikTok / Reels'     },
+  { id:'commercial',icon:'✨',label:'Commercial',  tagline:'Quảng cáo'         },
+  { id:'documentary',icon:'🧭',label:'Documentary',tagline:'Tài liệu chân thực' },
 ];
 const FORMATS  = [{ id:'vi',icon:'🇻🇳',label:'Tiếng Việt'},{id:'en',icon:'🇺🇸',label:'English'},{id:'ja',icon:'🇯🇵',label:'日本語'},{id:'ko',icon:'🇰🇷',label:'한국어'}];
-const DURATIONS= [{id:0,label:'Auto (AI tự chọn)'},{id:60,label:'1 phút'},{id:120,label:'2 phút'},{id:180,label:'3 phút'},{id:300,label:'5 phút'},{id:480,label:'8 phút'},{id:600,label:'10 phút'},{id:900,label:'15 phút'}];
+const DURATIONS= [
+  {id:0,    label:'Auto (AI tự chọn)'},
+  {id:15,   label:'15 giây (3-4 cảnh • nhịp 3-5s)'},
+  {id:30,   label:'30 giây (5-7 cảnh • nhịp 3-6s)'},
+  {id:60,   label:'60 giây / 1 phút (8-12 cảnh • nhịp 4-6s, max 8s)'},
+  {id:120,  label:'120 giây / 2 phút (15-20 cảnh • nhịp 5-8s)'},
+  {id:180,  label:'180 giây / 3 phút (22-30 cảnh • nhịp 5-8s)'},
+  {id:300,  label:'300 giây / 5 phút (37-50 cảnh • nhịp 5-8s)'},
+  {id:480,  label:'8 phút (~60 cảnh • nhịp 6-8s)'},
+  {id:600,  label:'10 phút (~75 cảnh • Video tài liệu)'},
+  {id:900,  label:'15 phút (~112 cảnh • Podcast / Báo cáo)'},
+  {id:1200, label:'20 phút (~150 cảnh • Phim tài liệu chuyên sâu)'},
+  {id:1800, label:'30 phút (~225 cảnh • Full Documentary)'},
+  {id:-1,   label:'Tùy chỉnh số phút (1–30 phút)...'},
+];
 const RATIOS   = [{id:'auto',label:'Auto (AI tự chọn)'},{id:'16:9',label:'16:9 YouTube'},{id:'9:16',label:'9:16 TikTok/Reels'},{id:'1:1',label:'1:1 Instagram'}];
 const TTS_PROVIDERS=[{id:'edge',label:'Edge TTS',badge:'Free',color:'#3b82f6'},{id:'kokoro',label:'Kokoro',badge:'Local',color:'#8b5cf6'},{id:'vieneu',label:'VieNeu',badge:'Clone',color:'#f59e0b'},{id:'groq',label:'Groq',badge:'Fast',color:'#10b981'}];
-const BROLL_MODES=[{id:'image',label:'AI Image',color:'#6366f1'},{id:'video',label:'AI Video',color:'#ec4899'},{id:'auto',label:'Auto',color:'#f59e0b'}];
-const VEO_MODELS=[{id:'Veo 3.1 - Lite [Lower Priority]',label:'Veo 3.1 Lite'},{id:'Omni 1.1 Flash',label:'Omni 1.1 Flash'}];
+const BROLL_MODES=[{id:'image',label:'AI Image',color:'#6366f1'},{id:'stock',label:'Stock Video',color:'#ec4899'},{id:'auto',label:'Auto Mix',color:'#f59e0b'}];
 const VOICE_MAP={
   edge:[
     {id:'vi-VN-NamMinhNeural',    label:'Nam Minh (VI Nam)',   lang:'vi'},
@@ -168,13 +192,15 @@ export default function AIVideoRemixer() {
   // ── Form / config ─────────────────────────────────────────────────────────
   const [command,      setCommand]      = useState('');
   const [preset,       setPreset]       = useState('auto');
+  const [directorMode, setDirectorMode] = useState('youtube');
   const [model,        setModel]        = useState('gemini-3.5-flash');
   const [lang,         setLang]         = useState('vi');
   const [duration,     setDuration]     = useState(0);
+  const [isCustomDuration, setIsCustomDuration] = useState(false);
+  const [customMinutes,    setCustomMinutes]    = useState(5);
   const [ratio,        setRatio]        = useState('16:9');
   const [ttsProvider,  setTtsProvider]  = useState('edge');
   const [brollMode,    setBrollMode]    = useState('auto');
-  const [veoModel,     setVeoModel]     = useState('Veo 3.1 - Lite [Lower Priority]');
   const [voice,        setVoice]        = useState('vi-VN-NamMinhNeural');
   const [outputDir,    setOutputDir]    = useState('');
   const [attachments,  setAttachments]  = useState([]);
@@ -199,6 +225,8 @@ export default function AIVideoRemixer() {
   const [showLog,         setShowLog]         = useState(false);
   const [leftPanelTab,    setLeftPanelTab]    = useState('media');
   const [mediaCat,        setMediaCat]        = useState('all');
+  const [showFXCatalog,   setShowFXCatalog]   = useState(false);
+  const [fxTargetSegId,   setFxTargetSegId]   = useState(null);
 
   // ── VieNeu ────────────────────────────────────────────────────────────────
   const [vieNeuReady,       setVieNeuReady]       = useState(false);
@@ -219,6 +247,7 @@ export default function AIVideoRemixer() {
   const playIntervalRef = useRef(null);
   const langInitRef     = useRef(false);
   const chatEndRef      = useRef(null);
+  const streamContentRef = useRef(''); // thoughts/text từ AI stream (không bị timer ghi đè)
   const chatScrollRef   = useRef(null);
   const logScrollRef    = useRef(null);
 
@@ -228,6 +257,15 @@ export default function AIVideoRemixer() {
     if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [chatMessages]);
+
+  // Tiến độ render từ main process (⚙️ Render x/y · còn ..., 🔧 Encode x/y) → thanh trạng thái
+  useEffect(() => {
+    const off = api?.onRemixerLog?.((line) => {
+      const s = String(line || '');
+      if (/^(⚙️ Render|🔧 Encode|⚠️|🛡️)/.test(s)) setStatus(s);
+    });
+    return () => off?.();
+  }, [api]);
 
   // Auto-scroll editor log tab when new tool entries arrive
   useEffect(() => {
@@ -439,6 +477,26 @@ export default function AIVideoRemixer() {
     if (p) try { await api.remotionOpenDir?.(p); } catch (_) {}
   }, [renderPath, planData]);
 
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+  const handleOpenPreview = useCallback(async () => {
+    if (!planData) { setStatus('❌ Chưa có kịch bản để preview'); return; }
+    setIsPreviewLoading(true);
+    setStatus('👁 Đang khởi động Remotion Studio...');
+    try {
+      // Build edit-plan from current planData + liveAssets
+      const { buildEditPlan } = await import('../services/aiAgent');
+      const assetReg = {};
+      liveAssets.forEach(a => { if (a.segId != null) assetReg[a.segId] = a; });
+      const editPlan = buildEditPlan(planData, assetReg);
+      await api.remixerOpenPreview?.({ plan: editPlan });
+      setStatus('✅ Remotion Studio đang mở trong browser (localhost:3099)');
+    } catch (err) {
+      setStatus(`❌ Preview lỗi: ${err?.message || err}`);
+    } finally {
+      setIsPreviewLoading(false);
+    }
+  }, [planData, liveAssets]);
+
   const handlePlayToggle = useCallback(() => {
     const vid = videoRef.current;
     if (!vid) return;
@@ -458,6 +516,16 @@ export default function AIVideoRemixer() {
     const vid = videoRef.current;
     if (vid && renderPath) vid.currentTime = cursor;
   }, [planData, renderPath]);
+
+  const handleApplyFX = useCallback((updates) => {
+    if (!fxTargetSegId || !planData?.segments) return;
+    setPlanData(prev => ({
+      ...prev,
+      segments: prev.segments.map(s => s.id === fxTargetSegId ? { ...s, ...updates } : s),
+    }));
+    setShowFXCatalog(false);
+    setFxTargetSegId(null);
+  }, [fxTargetSegId, planData]);
 
   const handleAttachFile = useCallback(async (e) => {
     const files = Array.from(e.target.files || []);
@@ -493,7 +561,10 @@ export default function AIVideoRemixer() {
     setStatus('🚀 Khởi động AI...');
     setRenderPath(null);
 
-    const projectState = { plan: null, assets: {}, assetRegistry: {}, lang };
+    // Dự án mới → xóa clip/ảnh/giọng đọc của dự án trước trong remotion/public (bản sao đã nằm ở thư mục output)
+    try { await api.agentCleanRemotionPublic?.(); } catch (_) {}
+
+    const projectState = { plan: null, assets: {}, assetRegistry: {}, lang, preset };
     projectStateRef.current = projectState;
 
     let refImagePaths = [];
@@ -514,15 +585,50 @@ export default function AIVideoRemixer() {
     const execData = overrideExec || runOverrideRef.current;
     const userPrompt = execData?.prompt || command;
     const approvedPlan = execData?.planText || null;
+    if (preset === 'military') markMilitaryTopicUsed(command);
     const ratioHint = ratio !== 'auto' ? `tỉ lệ ${ratio}` : '';
-    const baseReq = duration > 0
-      ? `[Yêu cầu BẮT BUỘC: Video PHẢI DÀI ${duration} giây (${Math.floor(duration/60)} phút ${duration%60 > 0 ? duration%60+'s' : ''}). total_duration_sec=${duration}. Số cảnh ≥ ${Math.round(duration/7)} scene. ${ratioHint ? ratioHint + '. ' : ''}Ngôn ngữ: ${lang}.]`
-      : `[Yêu cầu: ${ratioHint ? ratioHint + ', ' : ''}ngôn ngữ ${lang}. Thời lượng và tỉ lệ: AI tự quyết định phù hợp với nội dung]`;
+    const dmInfo = DIRECTOR_MODES.find(d => d.id === directorMode);
+    const directorHint = dmInfo ? `Phong cách đạo diễn: ${dmInfo.label} (${dmInfo.tagline}).` : '';
+
+    // Auto-detect duration from prompt when user leaves it at 0 (Auto)
+    let effectiveDuration = duration;
+    let durationSource = '';
+    if (duration === 0) {
+      const wordMatch = userPrompt.match(/(\d[\d.]*)\s*(?:nghìn\s*)?từ\b/i);
+      const rangeMinMatch = userPrompt.match(/(\d+)\s*[-–]\s*(\d+)\s*phút/i);
+      const singleMinMatch = userPrompt.match(/(\d+)\s*phút/i);
+      if (wordMatch) {
+        const raw = wordMatch[1].replace(/\./g, '');
+        const wordCount = parseInt(raw, 10) * (userPrompt.toLowerCase().includes('nghìn') ? 1000 : 1);
+        effectiveDuration = Math.round((wordCount / 135) * 60); // ~135 từ/phút tiếng Việt
+        durationSource = `${wordCount} từ → ~${Math.round(effectiveDuration/60)} phút`;
+      } else if (rangeMinMatch) {
+        const avg = (parseInt(rangeMinMatch[1]) + parseInt(rangeMinMatch[2])) / 2;
+        effectiveDuration = Math.round(avg * 60);
+        durationSource = `${rangeMinMatch[1]}-${rangeMinMatch[2]} phút (trung bình)`;
+      } else if (singleMinMatch) {
+        effectiveDuration = parseInt(singleMinMatch[1]) * 60;
+        durationSource = `${singleMinMatch[1]} phút`;
+      }
+    }
+
+    const avgSecForBase = effectiveDuration <= 0 ? 5
+      : effectiveDuration <= 120 ? 4
+      : effectiveDuration <= 300 ? 5
+      : effectiveDuration <= 600 ? 6
+      : effectiveDuration <= 900 ? 7
+      : 8;
+    const baseReq = effectiveDuration > 0
+      ? `[Yêu cầu BẮT BUỘC: Video PHẢI DÀI ${effectiveDuration} giây (~${Math.round(effectiveDuration/60)} phút${durationSource ? ', tính từ: ' + durationSource : ''}). total_duration_sec=${effectiveDuration}. Số cảnh ≥ ${Math.round(effectiveDuration/avgSecForBase)} scene (mỗi cảnh ~${avgSecForBase}s). Narration mỗi cảnh ~${Math.round(avgSecForBase*2.25)} từ để đạt đủ thời lượng.${effectiveDuration >= 180 ? ' Video dài: plan_video (outline + 15–20 cảnh đầu) rồi extend_plan từng đợt 15–20 cảnh đến khi đủ.' : ''} ${ratioHint ? ratioHint + '. ' : ''}${directorHint} Ngôn ngữ: ${lang}.]`
+      : `[Yêu cầu: ${ratioHint ? ratioHint + ', ' : ''}${directorHint} ngôn ngữ ${lang}. Thời lượng và tỉ lệ: AI tự quyết định phù hợp với nội dung]`;
     const enrichedPrompt = approvedPlan
       ? `${userPrompt}\n\n${baseReq}\n\n━━━ KẾ HOẠCH ĐÃ ĐƯỢC NGƯỜI DÙNG DUYỆT ━━━\n${approvedPlan}\n\nQUAN TRỌNG: Người dùng đã XEM và DUYỆT kế hoạch trên. KHÔNG gọi research_topic. Trực tiếp gọi plan_video theo đúng kế hoạch đã duyệt (cảnh, visual_type, narration), rồi sản xuất ngay.`
       : `${userPrompt}\n\n${baseReq}`;
 
-    const systemPrompt = buildSystemPrompt(preset, lang, refImagePaths.length > 0, brollMode, veoModel, duration);
+    // Store requested duration so plan_video validator can enforce it
+    if (effectiveDuration > 0) projectState.requestedDuration = effectiveDuration;
+
+    const systemPrompt = buildSystemPrompt(preset, lang, refImagePaths.length > 0, brollMode, effectiveDuration);
 
     const onAsset = (asset) => {
       setLiveAssets(prev => {
@@ -532,7 +638,7 @@ export default function AIVideoRemixer() {
       });
     };
 
-    const execOpts = { apiKeys: keys, model, voice, ttsProvider, brollMode, veoModel,
+    const execOpts = { apiKeys: keys, model, voice, ttsProvider, brollMode,
       outputDir: outputDir || undefined, vieNeuSavedVoices, projectState, refImagePaths, onAsset, manualSfxList };
 
     try {
@@ -560,12 +666,16 @@ export default function AIVideoRemixer() {
           ? (cycle === 1 ? '🧠 AI đang lên kế hoạch' : `🔄 Vòng ${cycle} — AI đang xử lý`)
           : '⚙️ AI đang ra lệnh công việc';
         let keyNote = '';
+        streamContentRef.current = ''; // reset thought buffer mỗi cycle
         const cycleTimerInterval = setInterval(() => {
           const elapsed = Math.round((Date.now() - cycleStart) / 1000);
-          setAiStreamText(`${timerLabel}... (${elapsed}s)${keyNote}`);
+          const header = `⏱️ ${timerLabel} (${elapsed}s)${keyNote}`;
+          const thoughts = streamContentRef.current;
+          // Merge timer header + AI thoughts — thoughts hiển thị phía dưới header
+          setAiStreamText(thoughts ? `${header}\n\n${thoughts}` : header);
         }, 1000);
 
-        // Round-robin: mỗi cycle dùng key tiếp theo trong vòng xoay, không gửi trùng
+        // Round-robin streaming — hiển thị thoughts/text realtime, extract tool calls khi xong
         let res, lastErr;
         try {
           const cfg = {
@@ -573,49 +683,129 @@ export default function AIVideoRemixer() {
             toolConfig: { functionCallingConfig: { mode: fcMode, ...(allowedFns ? { allowedFunctionNames: allowedFns } : {}) } },
             systemInstruction: systemPrompt,
             temperature: 0.4,
-            maxOutputTokens: 4096,
-            thinkingConfig: { thinkingBudget: 0 },
+            maxOutputTokens: 65536,
           };
+          const usedModel = model;
+          const CYCLE_TIMEOUT_MS = 3 * 60 * 1000; // 3 phút tổng / cycle
+          // Mọi key đều hết quota → KHÔNG hủy phiên (mất hết tiến độ video dài) mà chờ rồi thử lại đúng bước đang dở.
+          // contents giữ nguyên nên key nào nhận lại cũng làm tiếp đúng chỗ.
+          const QUOTA_WAITS_SEC = [30, 60, 120, 180, 300];
+          let cycleDeadline = Date.now() + CYCLE_TIMEOUT_MS;
+
+          for (let attempt = 0; !res; attempt++) {
+          let quotaBlocked = false;
           for (let ki = 0; ki < keys.length && !res; ki++) {
-            // Bắt đầu từ vị trí xoay hiện tại để phân tải đều
+            if (Date.now() > cycleDeadline) { quotaBlocked = true; break; }
             const keyIdx = (cycle - 1 + ki) % keys.length;
-            if (ki > 0) keyNote = ` — thử key ${ki + 1}`;
+            if (ki > 0) keyNote = ` — key ${ki + 1}`;
             try {
               const g = new GoogleGenAI({ apiKey: keys[keyIdx] });
-              const callPromise = g.models.generateContent({ model, contents, config: cfg });
-              const timeoutPromise = new Promise((_, rej) => setTimeout(() => rej(Object.assign(
-                new Error('Gemini timeout 90s'), { isTimeout: true }
-              )), 90000));
-              res = await Promise.race([callPromise, timeoutPromise]);
+              let accParts = [];
+              let thoughtBuf = '';
+              let textBuf = '';
+              let chunkCount = 0;
+              let funcCallNames = [];
+
+              // Stream với timeout tổng còn lại
+              await new Promise(async (resolve, reject) => {
+                const remaining = cycleDeadline - Date.now();
+                const timer = setTimeout(() => reject(Object.assign(
+                  new Error(`Gemini stream timeout ${Math.round(remaining/1000)}s`), { isTimeout: true }
+                )), Math.min(90000, remaining));
+                try {
+                  const stream = await g.models.generateContentStream({ model: usedModel, contents, config: cfg });
+                  for await (const chunk of stream) {
+                    if (abortRef.current) { clearTimeout(timer); reject(new Error('abort')); return; }
+                    chunkCount++;
+                    const cParts = chunk.candidates?.[0]?.content?.parts || [];
+                    accParts.push(...cParts);
+                    // Thu thập thought/text và tên function call nếu có
+                    for (const p of cParts) {
+                      if (p.functionCall?.name && !funcCallNames.includes(p.functionCall.name)) {
+                        funcCallNames.push(p.functionCall.name);
+                      }
+                      if (!p.text) continue;
+                      if (p.thought) { thoughtBuf += p.text; }
+                      else { textBuf += p.text; }
+                    }
+                    // Luôn cập nhật ref — kể cả khi chưa có text (hiện chunk counter)
+                    const dots = '.'.repeat((chunkCount % 4) + 1);
+
+                    // Action hint dựa vào tên function call đang được sinh
+                    const actionHint = funcCallNames.includes('plan_video')
+                      ? '📋 AI đang viết kịch bản + lên kế hoạch sản xuất...'
+                      : funcCallNames.includes('research_topic')
+                      ? '🔍 AI đang thu thập thông tin và số liệu...'
+                      : funcCallNames.some(n => ['generate_tts','batch_generate_tts','batch_acquire_images','batch_search_stock','batch_acquire_all'].includes(n))
+                      ? `⚡ AI đang điều phối ${funcCallNames.length} tác vụ sản xuất song song...`
+                      : funcCallNames.length > 0
+                      ? `🔄 AI đang chuẩn bị: ${funcCallNames.slice(0,4).join(', ')}${funcCallNames.length > 4 ? ` +${funcCallNames.length-4}` : ''}`
+                      : '';
+
+                    // Extract kế hoạch từ plan_video args khi vừa stream xong
+                    let planPreview = '';
+                    const planPart = accParts.find(p => p.functionCall?.name === 'plan_video');
+                    if (planPart?.functionCall?.args) {
+                      const { title, segments } = planPart.functionCall.args;
+                      if (title) planPreview += `📹 "${title}"\n`;
+                      if (segments?.length) {
+                        planPreview += `📋 ${segments.length} cảnh:\n`;
+                        planPreview += segments.slice(0, 6).map((s, i) =>
+                          `  ${String(i+1).padStart(2)}. [${s.visual_type||'?'}] ${(s.narration||'').slice(0,70)}${(s.narration||'').length>70?'…':''}`
+                        ).join('\n');
+                        if (segments.length > 6) planPreview += `\n  ... +${segments.length-6} cảnh nữa`;
+                      }
+                    }
+
+                    const display = [
+                      thoughtBuf  ? `💭 ${thoughtBuf.slice(-1200)}` : '',
+                      textBuf     ? `📝 ${textBuf.slice(-600)}`     : '',
+                      planPreview || '',
+                      (!thoughtBuf && !textBuf && !planPreview) ? `⚡ Đang xử lý${dots} (${chunkCount} chunks)` : '',
+                      actionHint  || '',
+                    ].filter(Boolean).join('\n\n');
+                    streamContentRef.current = display;
+                  }
+                  clearTimeout(timer); resolve();
+                } catch (e) { clearTimeout(timer); reject(e); }
+              });
+
+              // Dựng res object tương đương generateContent để code sau dùng được
+              res = { candidates: [{ content: { parts: accParts } }] };
             } catch (err) {
+              if (err?.message === 'abort') throw err;
+              lastErr = err;
               const msg = String(err?.message || err);
-              const rotatable = err?.isTimeout
+              const quotaLike = err?.isTimeout
                 || msg.includes('429') || msg.includes('503')
                 || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('UNAVAILABLE')
-                || msg.includes('quota') || msg.includes('overloaded')
-                || msg.includes('403') || msg.includes('PERMISSION_DENIED')
+                || msg.includes('quota') || msg.includes('overloaded');
+              const badKey = msg.includes('403') || msg.includes('PERMISSION_DENIED')
                 || msg.includes('denied access') || msg.includes('API_KEY_INVALID');
-              if (rotatable && ki < keys.length - 1) { lastErr = err; continue; }
+              if (quotaLike) quotaBlocked = true;
+              if ((quotaLike || badKey) && ki < keys.length - 1) continue;
+              if (quotaLike) break;
               throw err;
             }
           }
-          if (!res) throw lastErr || new Error('All API keys failed');
-
-          // Hiển thị thought tokens + text nếu model có trả về
-          if (!planCalled) {
-            const rParts = res.candidates?.[0]?.content?.parts || [];
-            const thoughts = rParts.filter(p => p.text && p.thought).map(p => p.text).join('').trim();
-            const txt = rParts.filter(p => p.text && !p.thought).map(p => p.text).join('').trim();
-            const display = [thoughts ? `💭 ${thoughts.slice(0, 500)}` : '', txt].filter(Boolean).join('\n\n');
-            if (display) setAiStreamText(display);
+          if (res || !quotaBlocked || abortRef.current || attempt >= QUOTA_WAITS_SEC.length) break;
+          const waitSec = QUOTA_WAITS_SEC[attempt];
+          for (let t = waitSec; t > 0 && !abortRef.current; t--) {
+            keyNote = ` — ⏸️ ${keys.length} key đều hết quota, chờ ${t}s rồi làm tiếp (lần ${attempt + 1}/${QUOTA_WAITS_SEC.length})`;
+            setStatus(`⏸️ Hết quota Gemini — chờ ${t}s rồi tiếp tục đúng bước đang dở (lần ${attempt + 1}/${QUOTA_WAITS_SEC.length})`);
+            await new Promise(r => setTimeout(r, 1000));
           }
+          keyNote = '';
+          cycleDeadline = Date.now() + CYCLE_TIMEOUT_MS;
+          }
+          if (!res) throw lastErr || new Error(`Model ${usedModel} đang quá tải. Vui lòng thử lại sau vài phút.`);
         } finally {
           clearInterval(cycleTimerInterval);
         }
         if (!res) throw lastErr || new Error('All API keys failed');
         if (abortRef.current) break;
 
-        const parts = res.candidates?.[0]?.content?.parts || [];
+        const parts = (res.candidates?.[0]?.content?.parts || []).filter(p => p); // flatten streaming chunks
         // Support both camelCase (SDK) and snake_case (raw proto) function call format
         const funcCalls = parts.filter(p => p.functionCall || p.function_call);
         contents.push({ role: 'model', parts });
@@ -643,7 +833,7 @@ export default function AIVideoRemixer() {
         // TTS dùng pool riêng (5 luồng) để tránh rate-limit Edge TTS
         // Visual dùng pool riêng (12 luồng) — 2 pool chạy đồng thời via Promise.all
         const TTS_TOOLS    = new Set(['generate_tts']);
-        const VISUAL_TOOLS = new Set(['generate_image','acquire_broll','search_stock_footage','add_sfx','search_music','add_background_music']);
+        const VISUAL_TOOLS = new Set(['generate_image','acquire_broll','search_stock_footage','batch_acquire_images','batch_search_stock','batch_acquire_all','batch_generate_tts','create_character_reference','add_sfx','search_music','add_background_music']);
         const PARALLEL_TOOLS = new Set([...TTS_TOOLS, ...VISUAL_TOOLS]);
         const TTS_CONCURRENCY    = 4;
         const VISUAL_CONCURRENCY = 20;
@@ -672,20 +862,42 @@ export default function AIVideoRemixer() {
         // Giảm ~80% kích thước context → Gemini xử lý nhanh hơn đáng kể
         const compactForContext = (toolName, result) => {
           if (!result) return { success: false };
+          if (result.error === 'plan_incomplete')
+            return { success: false, error: result.error, instruction: result.instruction, next_scene_id: result.next_scene_id };
           if (toolName === 'generate_tts')
             return { success: result.success, duration: result.duration, segment_id: result.segment_id, error: result.error };
           if (['acquire_broll','generate_image','search_stock_footage'].includes(toolName))
             return { success: result.success, acquired: result.success ? true : undefined,
               source: result.source, fallback_level: result.fallback_level,
               warning: result.warning?.slice?.(0, 160), error: result.error?.slice?.(0, 80) };
+          if (['batch_acquire_images','batch_search_stock','batch_acquire_all','batch_generate_tts'].includes(toolName)) {
+            const results = result.results || [];
+            const done = results.filter(r => r.success).length;
+            const failed = results.filter(r => !r.success);
+            return {
+              success: result.success,
+              message: result.message,
+              done, total: results.length,
+              failed_ids: failed.slice(0, 5).map(r => r.segId),
+              errors: failed.slice(0, 3).map(r => ({ segId: r.segId, error: String(r.error || '').slice(0, 60) })),
+            };
+          }
           if (toolName === 'add_sfx' || toolName === 'add_background_music')
             return { success: result.success };
           if (toolName === 'quality_check')
             return { success: result.success, score: result.score, passed: result.passed, summary: result.summary, patch: result.patch?.slice(0,5), required_fixes: result.required_fixes };
           if (toolName === 'research_topic')
             return { success: result.success, message: result.message };
-          if (toolName === 'plan_video')
-            return { success: result.success, segments_count: result.segments?.length, must_acquire: result.must_acquire };
+          // Phải giữ instruction/result: đây là chỗ AI biết plan thiếu bao nhiêu và phải viết tiếp từ đâu
+          if (toolName === 'plan_video' || toolName === 'extend_plan')
+            return {
+              success: result.success, error: result.error,
+              message: result.message, result: result.result, instruction: result.instruction,
+              plan_incomplete: result.plan_incomplete, scenes_so_far: result.scenes_so_far,
+              seconds_so_far: result.seconds_so_far, target_sec: result.target_sec,
+              next_scene_id: result.next_scene_id, last_narration: result.last_narration,
+              segments_count: result.segments, must_acquire: result.must_acquire,
+            };
           if (toolName === 'render_video')
             return { success: result.success, output_path: result.output_path, qa: result.qa, required_fixes: result.required_fixes, instruction: result.instruction };
           return result;
@@ -710,22 +922,25 @@ export default function AIVideoRemixer() {
             toolResult = { success: false, error: String(err?.message || err) };
           }
 
-          if (toolName === 'plan_video') {
-            planCalled = true;
-            const segs = toolArgs.segments || projectState.plan?.segments;
+          if (toolName === 'plan_video' || toolName === 'extend_plan') {
+            if (toolName === 'plan_video') planCalled = true;
+            // plan đã gộp mọi đợt (plan_video + extend_plan) nằm trong projectState.plan
+            const fullPlan = projectState.plan || toolArgs;
+            const segs = fullPlan.segments || toolArgs.segments;
             if (segs?.length) {
               try {
-                const builtPlan = buildEditPlan({ ...toolArgs }, projectState.assetRegistry || {});
-                setPlanData(prev => ({ ...(prev || {}), ...toolArgs, ...builtPlan, segments: segs }));
+                const builtPlan = buildEditPlan({ ...fullPlan }, projectState.assetRegistry || {});
+                setPlanData(prev => ({ ...(prev || {}), ...fullPlan, ...builtPlan, segments: segs }));
               } catch (_) {
-                setPlanData(prev => ({ ...(prev || {}), ...toolArgs, segments: segs }));
+                setPlanData(prev => ({ ...(prev || {}), ...fullPlan, segments: segs }));
               }
               setAppMode('editor');
               setLeftPanelTab('log');
-              // Hiện tóm tắt kế hoạch thay vì xóa trắng
               const typeCounts = segs.reduce((acc, s) => { acc[s.visual_type] = (acc[s.visual_type]||0)+1; return acc; }, {});
               const typeStr = Object.entries(typeCounts).map(([t,n]) => `${t}×${n}`).join(' · ');
-              setAiStreamText(`✅ Kế hoạch xong: "${toolArgs.title || 'Video'}" — ${segs.length} cảnh\n📊 ${typeStr}\n\n⏳ Bắt đầu sản xuất...`);
+              setAiStreamText(toolResult.plan_incomplete
+                ? `📋 Đang viết kế hoạch: "${fullPlan.title || 'Video'}" — ${segs.length} cảnh (~${toolResult.seconds_so_far}s / ${toolResult.target_sec}s)\n📊 ${typeStr}\n\n✍️ AI đang viết tiếp các cảnh sau...`
+                : `✅ Kế hoạch xong: "${fullPlan.title || 'Video'}" — ${segs.length} cảnh\n📊 ${typeStr}\n\n⏳ Bắt đầu sản xuất...`);
             }
           }
           if (toolName === 'render_video' && toolResult.success !== false) {
@@ -814,13 +1029,22 @@ export default function AIVideoRemixer() {
       if (!abortRef.current) setStatus('✅ Hoàn thành');
     } catch (err) {
       const msg = String(err?.message || err);
-      setStatus(`❌ ${msg.slice(0, 120)}`);
+      console.error('[AI Agent] handleRun error:', err);
+      const is503 = msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('high demand') || msg.includes('quá tải');
+      const is429 = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
+      const friendlyMsg = is503
+        ? '⚠️ Model Gemini đang quá tải (503). Hãy thử lại sau 1-2 phút.'
+        : is429
+        ? '⚠️ Hết quota API Gemini. Thêm key mới hoặc thử lại sau.'
+        : `❌ Lỗi: ${msg.slice(0, 180)}`;
+      setStatus(friendlyMsg);
+      setAiStreamText(friendlyMsg + (is503 || is429 ? '' : `\n\n${msg}`));
     } finally {
       setIsRunning(false);
       setCurrentTool(null);
       runOverrideRef.current = null;
     }
-  }, [command, model, preset, lang, ttsProvider, brollMode, veoModel, voice, outputDir, duration, ratio, attachments, manualSfxList, vieNeuSavedVoices]);
+  }, [command, model, preset, directorMode, lang, ttsProvider, brollMode, voice, outputDir, duration, ratio, attachments, manualSfxList, vieNeuSavedVoices]);
 
   const handleSend = useCallback(async () => {
     const text = command.trim();
@@ -858,7 +1082,7 @@ export default function AIVideoRemixer() {
 
   // ── RENDER ───────────────────────────────────────────────────────────────
   return (
-    <div style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',background:'#080c14',color:'#e2e8f0',fontFamily:'-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',overflow:'hidden',fontSize:14}}>
+    <div style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',background:'#06060f',color:'#e2e8f0',fontFamily:'-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',overflow:'hidden',fontSize:14}}>
       <style>{`
         @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
@@ -868,10 +1092,15 @@ export default function AIVideoRemixer() {
         .fadein{animation:fadein .3s ease forwards}
         *::-webkit-scrollbar{width:5px;height:5px}
         *::-webkit-scrollbar-track{background:transparent}
-        *::-webkit-scrollbar-thumb{background:#1e2d4a;border-radius:3px}
+        *::-webkit-scrollbar-thumb{background:#1e2940;border-radius:3px}
         button:focus{outline:none}
         textarea:focus{outline:none}
         select:focus{outline:none}
+        .model-card:hover{border-color:rgba(99,102,241,0.5)!important;background:rgba(99,102,241,0.12)!important}
+        .dir-btn:hover{border-color:rgba(99,102,241,0.4)!important;color:#a5b4fc!important}
+        .broll-card:hover{border-color:rgba(6,182,212,0.4)!important}
+        .preset-pill:hover{opacity:.85}
+        .example-btn:hover{border-color:rgba(99,102,241,0.35)!important;color:#cbd5e1!important}
       `}</style>
 
       {/* ════════════════════════════════════════════════════════════════
@@ -880,56 +1109,93 @@ export default function AIVideoRemixer() {
       {appMode === 'home' && (
         <div style={{flex:1,display:'flex',flexDirection:'column',overflowY:'auto'}}>
           {/* TOP mini bar */}
-          <div style={{height:44,flexShrink:0,display:'flex',alignItems:'center',padding:'0 24px',gap:12,background:'#04070f',borderBottom:'1px solid #0d1728'}}>
-            <span style={{fontSize:16,fontWeight:900,color:'#7c3aed',letterSpacing:'-0.02em'}}>⚡ Fluxy AI</span>
+          <div style={{height:48,flexShrink:0,display:'flex',alignItems:'center',padding:'0 24px',gap:10,background:'#07070c',borderBottom:'1px solid rgba(99,102,241,0.18)'}}>
+            <div style={{width:32,height:32,borderRadius:10,background:'rgba(99,102,241,0.18)',border:'1px solid rgba(99,102,241,0.35)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:16}}>✨</div>
+            <div>
+              <div style={{fontSize:13,fontWeight:800,color:'#fff',letterSpacing:'0.05em',textTransform:'uppercase'}}>Đạo Diễn AI · Tự Động Sản Xuất Video</div>
+              <div style={{fontSize:10,color:'#475569'}}>Kịch bản · Ảnh AI · Video stock · Giọng đọc · Nhạc nền · Render</div>
+            </div>
             <div style={{flex:1}}/>
           </div>
 
           {/* HERO SECTION */}
-          <div style={{display:'flex',flexDirection:'column',alignItems:'center',padding:'48px 24px 64px',minHeight:'min-content'}}>
-            <div style={{width:'100%',maxWidth:780,display:'flex',flexDirection:'column',gap:32}}>
+          <div style={{display:'flex',flexDirection:'column',alignItems:'center',padding:'36px 24px 56px',minHeight:'min-content'}}>
+            <div style={{width:'100%',maxWidth:800,display:'flex',flexDirection:'column',gap:24}}>
 
               {/* Heading */}
               <div style={{textAlign:'center'}}>
-                <div style={{fontSize:36,fontWeight:900,color:'#f8fafc',lineHeight:1.15,marginBottom:12,letterSpacing:'-0.03em'}}>
+                <div style={{fontSize:32,fontWeight:900,color:'#f8fafc',lineHeight:1.2,marginBottom:10,letterSpacing:'-0.03em'}}>
                   Bạn muốn tạo video gì<br/>
-                  <span style={{background:'linear-gradient(135deg,#7c3aed,#3b82f6)',WebkitBackgroundClip:'text',WebkitTextFillColor:'transparent'}}>hôm nay?</span>
+                  <span style={{background:'linear-gradient(135deg,#6366f1,#06b6d4)',WebkitBackgroundClip:'text',WebkitTextFillColor:'transparent'}}>hôm nay?</span>
                 </div>
-                <p style={{fontSize:15,color:'#64748b',lineHeight:1.6,maxWidth:560,margin:'0 auto'}}>
+                <p style={{fontSize:14,color:'#475569',lineHeight:1.6,maxWidth:520,margin:'0 auto'}}>
                   AI sẽ tự viết kịch bản, tạo hình ảnh & video, voice, nhạc nền, SFX, subtitle rồi dựng thành video hoàn chỉnh.
                 </p>
               </div>
 
               {/* Preset pills */}
-              <div style={{display:'flex',flexWrap:'wrap',gap:8,justifyContent:'center'}}>
+              <div style={{display:'flex',flexWrap:'wrap',gap:6,justifyContent:'center'}}>
                 {PRESETS.map(p => (
-                  <button key={p.id} onClick={()=>setPreset(p.id)} title={p.desc}
-                    style={{padding:'7px 16px',borderRadius:99,fontSize:13,fontWeight:600,cursor:'pointer',transition:'all .15s',
-                      background:preset===p.id?p.color+'22':'#0d1728',
-                      border:`1.5px solid ${preset===p.id?p.color:'#1a2540'}`,
+                  <button key={p.id} title={p.desc} className="preset-pill"
+                    onClick={()=>{
+                      setPreset(p.id);
+                      // Quân sự cần footage DVIDS thật — chế độ "AI Image" cấm stock video
+                      if (p.id === 'military' && brollMode === 'image') setBrollMode('auto');
+                    }}
+                    style={{padding:'6px 14px',borderRadius:99,fontSize:12,fontWeight:600,cursor:'pointer',transition:'all .15s',
+                      background:preset===p.id?p.color+'22':'rgba(15,15,28,0.8)',
+                      border:`1.5px solid ${preset===p.id?p.color:'rgba(30,41,59,0.8)'}`,
                       color:preset===p.id?p.color:'#475569'}}>
                     {p.icon} {p.label}
                   </button>
                 ))}
               </div>
 
+              {preset === 'military' && (
+                <div className="fadein" style={{display:'flex',flexDirection:'column',gap:8,padding:'12px 14px',
+                  background:'rgba(132,204,22,0.05)',border:'1px solid rgba(132,204,22,0.25)',borderRadius:12}}>
+                  <div style={{fontSize:11,color:'#a3e635',fontWeight:700}}>
+                    🎖️ Kênh quân sự — footage thật từ DVIDS (quân đội Mỹ, public domain), số liệu nghiên cứu trước, giọng tài liệu
+                  </div>
+                  <div style={{fontSize:10,color:'#65a30d'}}>
+                    📚 {MILITARY_TOPIC_TOTAL.toLocaleString('vi-VN')} chủ đề · đã làm {countUsedMilitaryTopics()} · mỗi lần bấm ra 1 chủ đề mới, chủ đề đã làm video sẽ không lặp lại
+                  </div>
+                  <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
+                    {MILITARY_IDEAS.map(idea => (
+                      <button key={idea.id} onClick={()=>setCommand(pickMilitaryTopic(idea))} title={`Bấm để lấy 1 chủ đề ngẫu nhiên (${idea.topics.length} chủ đề)`}
+                        style={{padding:'5px 11px',borderRadius:99,fontSize:11,fontWeight:600,cursor:'pointer',
+                          background:'rgba(15,15,28,0.8)',border:'1px solid rgba(132,204,22,0.3)',color:'#bef264'}}>
+                        {idea.icon} {idea.label}
+                      </button>
+                    ))}
+                    <button
+                      onClick={()=>setCommand(pickMilitaryTopic(MILITARY_IDEAS[Math.floor(Math.random() * MILITARY_IDEAS.length)]))}
+                      title="Rút 1 chủ đề bất kỳ từ tất cả các nhóm"
+                      style={{padding:'5px 11px',borderRadius:99,fontSize:11,fontWeight:700,cursor:'pointer',
+                        background:'rgba(132,204,22,0.15)',border:'1px solid rgba(132,204,22,0.6)',color:'#d9f99d'}}>
+                      🎲 Ngẫu nhiên
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* Banner cảnh báo extension chưa kết nối */}
               {labsConnected === false && (
                 <div className="fadein" style={{display:'flex',alignItems:'flex-start',gap:10,padding:'10px 14px',
-                  background:'rgba(234,179,8,0.08)',border:'1px solid rgba(234,179,8,0.3)',borderRadius:10,marginBottom:8}}>
-                  <span style={{fontSize:18,flexShrink:0}}>⚠️</span>
+                  background:'rgba(234,179,8,0.06)',border:'1px solid rgba(234,179,8,0.25)',borderRadius:12}}>
+                  <span style={{fontSize:16,flexShrink:0}}>⚠️</span>
                   <div style={{flex:1}}>
-                    <div style={{color:'#fbbf24',fontWeight:700,fontSize:13,marginBottom:3}}>
+                    <div style={{color:'#fbbf24',fontWeight:700,fontSize:12,marginBottom:3}}>
                       FluxyExtension chưa kết nối Google VideoFX
                     </div>
-                    <div style={{color:'#94a3b8',fontSize:12,lineHeight:1.5}}>
+                    <div style={{color:'#64748b',fontSize:11,lineHeight:1.5}}>
                       AI Video và AI Image sẽ không tạo được — chỉ dùng ảnh stock.<br/>
                       Để bật: mở Chrome → vào <b style={{color:'#e2e8f0'}}>flow.google.com</b> → bật FluxyExtension → nhấn F5.
                     </div>
                   </div>
                   <button onClick={async()=>{await window.electronAPI?.openExternal?.('https://flow.google.com');}}
-                    style={{flexShrink:0,padding:'4px 10px',background:'rgba(234,179,8,0.15)',border:'1px solid rgba(234,179,8,0.4)',
-                      borderRadius:6,color:'#fbbf24',fontSize:11,cursor:'pointer',whiteSpace:'nowrap'}}>
+                    style={{flexShrink:0,padding:'4px 10px',background:'rgba(234,179,8,0.12)',border:'1px solid rgba(234,179,8,0.3)',
+                      borderRadius:6,color:'#fbbf24',fontSize:10,cursor:'pointer',whiteSpace:'nowrap'}}>
                     Mở flow.google.com
                   </button>
                 </div>
@@ -942,8 +1208,8 @@ export default function AIVideoRemixer() {
                     <div key={msg.id} className="fadein" style={{display:'flex',flexDirection:'column',gap:4,
                       alignItems:msg.role==='user'?'flex-end':'flex-start'}}>
                       <div style={{maxWidth:'85%',padding:'12px 16px',borderRadius:msg.role==='user'?'14px 14px 4px 14px':'14px 14px 14px 4px',
-                        background:msg.role==='user'?`${activePreset.color}22`:'#0a1020',
-                        border:`1px solid ${msg.role==='user'?activePreset.color+'44':'#1a2540'}`,
+                        background:msg.role==='user'?'rgba(99,102,241,0.12)':'rgba(5,5,8,0.9)',
+                        border:`1px solid ${msg.role==='user'?'rgba(99,102,241,0.4)':'rgba(30,41,59,0.6)'}`,
                         color:msg.role==='error'?'#fca5a5':'#e2e8f0',fontSize:13,lineHeight:1.7,
                         whiteSpace:'pre-wrap',wordBreak:'break-word'}}>
                         {msg.role === 'user' && msg.images?.length > 0 && (
@@ -963,8 +1229,8 @@ export default function AIVideoRemixer() {
                     </div>
                   ))}
                   {isThinking && chatMessages[chatMessages.length-1]?.text === '' && (
-                    <div className="fadein" style={{display:'flex',alignItems:'center',gap:6,padding:'10px 14px',background:'#0a1020',border:'1px solid #1a2540',borderRadius:'14px 14px 14px 4px',maxWidth:180}}>
-                      <div className="pulse" style={{width:6,height:6,borderRadius:'50%',background:activePreset.color}}/>
+                    <div className="fadein" style={{display:'flex',alignItems:'center',gap:6,padding:'10px 14px',background:'rgba(5,5,8,0.9)',border:'1px solid rgba(30,41,59,0.6)',borderRadius:'14px 14px 14px 4px',maxWidth:180}}>
+                      <div className="pulse" style={{width:6,height:6,borderRadius:'50%',background:'#6366f1'}}/>
                       <span style={{fontSize:12,color:'#475569'}}>AI đang suy nghĩ...</span>
                     </div>
                   )}
@@ -972,13 +1238,13 @@ export default function AIVideoRemixer() {
                   {pendingExec && (
                     <div className="fadein" style={{display:'flex',gap:10,justifyContent:'center',padding:'8px 0'}}>
                       <button onClick={() => handleRun(pendingExec)}
-                        style={{padding:'12px 28px',background:`linear-gradient(135deg,${activePreset.color},#3b82f6)`,border:'none',
-                          borderRadius:10,color:'#fff',fontSize:14,fontWeight:800,cursor:'pointer',letterSpacing:'-0.01em',
-                          display:'flex',alignItems:'center',gap:8}}>
+                        style={{padding:'12px 28px',background:'linear-gradient(135deg,#6366f1,#06b6d4)',border:'none',
+                          borderRadius:12,color:'#fff',fontSize:14,fontWeight:800,cursor:'pointer',letterSpacing:'-0.01em',
+                          display:'flex',alignItems:'center',gap:8,boxShadow:'0 0 20px rgba(99,102,241,0.4)'}}>
                         ✨ Bắt đầu sản xuất video
                       </button>
                       <button onClick={()=>setPendingExec(null)}
-                        style={{padding:'12px 16px',background:'transparent',border:'1px solid #1a2540',borderRadius:10,color:'#475569',fontSize:13,cursor:'pointer'}}>
+                        style={{padding:'12px 16px',background:'transparent',border:'1px solid rgba(30,41,59,0.6)',borderRadius:12,color:'#475569',fontSize:13,cursor:'pointer'}}>
                         Chỉnh thêm
                       </button>
                     </div>
@@ -988,18 +1254,20 @@ export default function AIVideoRemixer() {
 
               {/* Main textarea */}
               <div style={{position:'relative'}}>
+                <div style={{fontSize:10,fontWeight:700,color:'#6366f1',textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:6,fontFamily:'monospace'}}>Ý tưởng hoặc chủ đề video của bạn</div>
                 <textarea
                   value={command} onChange={e=>setCommand(e.target.value)}
                   onKeyDown={e=>{
-                    if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();handleCreateVideo();return;}
+                    if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();if(command.trim()&&!isRunning)handleRun();return;}
                     if(e.key==='Enter'&&!e.shiftKey&&!e.ctrlKey&&!e.metaKey){e.preventDefault();handleSend();}
                   }}
                   placeholder={chatMessages.length>0
                     ? 'Nhắn tin tiếp hoặc Ctrl+Enter để tạo video ngay...'
-                    : `Mô tả video bạn muốn tạo...\n\nVí dụ: "Documentary cinematic 8 phút giải thích tại sao iPhone và Samsung cạnh tranh khốc liệt, có hình ảnh thực tế và số liệu."\n\nEnter = chat với AI · Ctrl+Enter = tạo video ngay`}
-                  style={{width:'100%',minHeight:chatMessages.length>0?72:130,background:'#0a1020',border:`2px solid ${command?activePreset.color:'#1a2540'}`,borderRadius:14,
-                    padding:'18px 20px',color:'#f1f5f9',fontSize:15,lineHeight:1.65,resize:'vertical',
-                    fontFamily:'inherit',boxSizing:'border-box',transition:'border-color .2s,min-height .2s'}}
+                    : `Ví dụ: "Documentary cinematic 8 phút: Tại sao iPhone và Samsung cạnh tranh khốc liệt..."\n\nEnter = chat với AI · Ctrl+Enter = tạo video ngay`}
+                  style={{width:'100%',minHeight:chatMessages.length>0?72:120,background:'#050508',border:`1.5px solid ${command?'rgba(99,102,241,0.6)':'rgba(30,41,59,0.8)'}`,borderRadius:12,
+                    padding:'14px 16px',color:'#f1f5f9',fontSize:14,lineHeight:1.7,resize:'vertical',
+                    fontFamily:'inherit',boxSizing:'border-box',transition:'border-color .2s',
+                    boxShadow:command?'0 0 0 3px rgba(99,102,241,0.08)':'none'}}
                 />
                 {attachments.length > 0 && (
                   <div style={{display:'flex',gap:6,flexWrap:'wrap',marginTop:8}}>
@@ -1016,38 +1284,159 @@ export default function AIVideoRemixer() {
               {/* Settings toggle header — always visible */}
               {chatMessages.length > 0 && (
                 <button onClick={()=>setSettingsOpen(v=>!v)}
-                  style={{display:'flex',alignItems:'center',gap:6,background:'transparent',border:'1px solid #1a2540',
-                    borderRadius:8,padding:'6px 12px',color:'#334155',cursor:'pointer',fontSize:12,width:'100%',
-                    transition:'all .15s'}}
-                  onMouseEnter={e=>e.currentTarget.style.borderColor='#3b82f655'}
-                  onMouseLeave={e=>e.currentTarget.style.borderColor='#1a2540'}>
+                  style={{display:'flex',alignItems:'center',gap:6,background:'transparent',border:'1px solid rgba(30,41,59,0.8)',
+                    borderRadius:8,padding:'6px 12px',color:'#334155',cursor:'pointer',fontSize:12,width:'100%',transition:'all .15s'}}
+                  onMouseEnter={e=>e.currentTarget.style.borderColor='rgba(99,102,241,0.35)'}
+                  onMouseLeave={e=>e.currentTarget.style.borderColor='rgba(30,41,59,0.8)'}>
                   <span style={{fontSize:10,transform:settingsOpen?'rotate(180deg)':'rotate(0deg)',transition:'transform .2s',display:'inline-block'}}>▲</span>
                   <span>{settingsOpen ? 'Ẩn cài đặt' : '⚙️ Cài đặt'}</span>
                   {!settingsOpen && (
                     <span style={{marginLeft:'auto',fontSize:10,color:'#475569'}}>
-                      {[model.split(' ')[0], lang==='vi'?'Việt':lang, ratio].join(' · ')}
+                      {[MODELS.find(m=>m.id===model)?.label||model, lang==='vi'?'Việt':lang, ratio, DIRECTOR_MODES.find(d=>d.id===directorMode)?.label].filter(Boolean).join(' · ')}
                     </span>
                   )}
                 </button>
               )}
 
-              {/* Collapsible settings */}
-              <div style={{display:settingsOpen?'flex':'none',flexDirection:'column',gap:10,
-                animation:settingsOpen?'fadein .2s ease':'none'}}>
-                {/* Quick settings row */}
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:10}}>
-                  <LabeledSelect label="Thời lượng" value={duration} onChange={v=>setDuration(Number(v))}
-                    options={DURATIONS.map(d=>({value:d.id,label:d.label}))} />
-                  <LabeledSelect label="Tỉ lệ" value={ratio} onChange={setRatio}
-                    options={RATIOS.map(r=>({value:r.id,label:r.label}))} />
-                  <LabeledSelect label="Ngôn ngữ" value={lang} onChange={setLang}
-                    options={FORMATS.map(f=>({value:f.id,label:f.label}))} />
-                  <LabeledSelect label="AI Model" value={model} onChange={setModel}
-                    options={MODELS.map(m=>({value:m.id,label:m.label}))} />
+              {/* Collapsible settings — reference UI design */}
+              <div style={{display:settingsOpen?'flex':'none',flexDirection:'column',gap:10,animation:settingsOpen?'fadein .2s ease':'none'}}>
+
+                {/* ── Section 1: AI Model & Director Mode ── */}
+                <div style={{background:'rgba(99,102,241,0.07)',border:'1px solid rgba(99,102,241,0.22)',borderRadius:14,padding:'14px 16px',display:'flex',flexDirection:'column',gap:12}}>
+                  {/* Header */}
+                  <div style={{display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+                    <div style={{display:'flex',alignItems:'center',gap:8}}>
+                      <div style={{width:20,height:20,borderRadius:'50%',background:'rgba(99,102,241,0.2)',border:'1px solid rgba(99,102,241,0.4)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:11}}>⚙️</div>
+                      <span style={{fontSize:11,fontWeight:800,color:'#fff',textTransform:'uppercase',letterSpacing:'0.07em'}}>Mô Hình & Chế Độ Gemini AI</span>
+                    </div>
+                    <span style={{fontSize:9,padding:'2px 8px',borderRadius:99,background:'rgba(99,102,241,0.18)',border:'1px solid rgba(99,102,241,0.3)',color:'#a5b4fc',fontWeight:700}}>
+                      {MODELS.find(m=>m.id===model)?.badge||'Default'}
+                    </span>
+                  </div>
+
+                  {/* Model cards */}
+                  <div>
+                    <div style={{fontSize:10,color:'#475569',fontWeight:600,marginBottom:7}}>1. Chọn Mô Hình AI:</div>
+                    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:7}}>
+                      {MODELS.map(m => (
+                        <button key={m.id} onClick={()=>setModel(m.id)} className="model-card"
+                          style={{padding:'9px 10px',borderRadius:10,border:`1.5px solid ${model===m.id?'rgba(99,102,241,0.8)':'rgba(30,41,59,0.9)'}`,
+                            background:model===m.id?'rgba(99,102,241,0.18)':'#050508',cursor:'pointer',textAlign:'left',transition:'all .15s',
+                            boxShadow:model===m.id?'0 0 12px rgba(99,102,241,0.2)':'none',position:'relative'}}>
+                          {model===m.id && <div style={{position:'absolute',top:4,right:5,width:12,height:12,borderRadius:'50%',background:'#6366f1',display:'flex',alignItems:'center',justifyContent:'center',fontSize:8,color:'#fff',fontWeight:800}}>✓</div>}
+                          <div style={{fontSize:11,fontWeight:700,color:'#f1f5f9',marginBottom:2}}>{m.label}</div>
+                          <div style={{fontSize:9,color:model===m.id?'#a5b4fc':'#6366f1',fontWeight:600}}>{m.badge}</div>
+                          <div style={{fontSize:9,color:'#475569',marginTop:2,lineHeight:1.3}}>{m.desc}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Director mode */}
+                  <div>
+                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:7}}>
+                      <div style={{fontSize:10,color:'#475569',fontWeight:600}}>2. Phong Cách Đạo Diễn:</div>
+                      <div style={{fontSize:9,color:'#6366f1',fontWeight:600}}>{DIRECTOR_MODES.find(d=>d.id===directorMode)?.tagline}</div>
+                    </div>
+                    <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                      {DIRECTOR_MODES.map(dm => (
+                        <button key={dm.id} onClick={()=>setDirectorMode(dm.id)} className="dir-btn"
+                          style={{padding:'6px 12px',borderRadius:8,fontSize:11,fontWeight:600,cursor:'pointer',transition:'all .15s',
+                            background:directorMode===dm.id?'#6366f1':'rgba(5,5,8,0.9)',
+                            border:`1px solid ${directorMode===dm.id?'#6366f1':'rgba(30,41,59,0.9)'}`,
+                            color:directorMode===dm.id?'#fff':'#475569',
+                            boxShadow:directorMode===dm.id?'0 0 10px rgba(99,102,241,0.3)':'none'}}>
+                          {dm.icon} {dm.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Summary bar */}
+                  <div style={{display:'flex',alignItems:'center',gap:6,padding:'8px 10px',background:'rgba(5,5,8,0.8)',borderRadius:8,border:'1px solid rgba(30,41,59,0.6)'}}>
+                    <span style={{fontSize:11}}>✨</span>
+                    <span style={{fontSize:10,color:'#94a3b8'}}>
+                      <span style={{color:'#e2e8f0',fontWeight:600}}>{MODELS.find(m=>m.id===model)?.label}</span>
+                      <span style={{color:'#334155',margin:'0 4px'}}>·</span>
+                      <span style={{color:'#a5b4fc',fontWeight:600}}>Chế độ {DIRECTOR_MODES.find(d=>d.id===directorMode)?.label}: </span>
+                      <span>{DIRECTOR_MODES.find(d=>d.id===directorMode)?.tagline}</span>
+                    </span>
+                  </div>
                 </div>
 
-                {/* Advanced row */}
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:10}}>
+                {/* ── Section 2: Basic params row ── */}
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8}}>
+                  {/* Duration with scene-count hint + custom input */}
+                  <div style={{display:'flex',flexDirection:'column',gap:5}}>
+                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+                      <span style={{fontSize:10,color:'#475569',fontWeight:700,letterSpacing:'0.05em',textTransform:'uppercase',fontFamily:'monospace'}}>Thời lượng</span>
+                      {duration > 0 && <span style={{fontSize:9,color:'#22d3ee',fontWeight:700,fontFamily:'monospace'}}>{Math.floor(duration/60) > 0 ? `${Math.floor(duration/60)}m${duration%60>0?String(duration%60).padStart(2,'0')+'s':''}` : `${duration}s`}</span>}
+                    </div>
+                    <select
+                      value={isCustomDuration ? -1 : duration}
+                      onChange={e=>{
+                        const v = Number(e.target.value);
+                        if (v === -1) { setIsCustomDuration(true); setDuration(customMinutes * 60); }
+                        else { setIsCustomDuration(false); setDuration(v); }
+                      }}
+                      style={{background:'#050508',border:'1px solid rgba(30,41,59,0.9)',borderRadius:9,padding:'8px 10px',color:'#cbd5e1',fontSize:12,cursor:'pointer',outline:'none'}}
+                      onFocus={e=>e.target.style.borderColor='rgba(99,102,241,0.5)'}
+                      onBlur={e=>e.target.style.borderColor='rgba(30,41,59,0.9)'}>
+                      {DURATIONS.map(d=><option key={d.id} value={d.id}>{d.label}</option>)}
+                    </select>
+                    {isCustomDuration && (
+                      <div style={{display:'flex',alignItems:'center',gap:6}}>
+                        <input type="number" min={1} max={30} value={customMinutes}
+                          onChange={e=>{const v=Math.min(30,Math.max(1,Number(e.target.value)));setCustomMinutes(v);setDuration(v*60);}}
+                          style={{width:56,background:'#050508',border:'1px solid rgba(99,102,241,0.4)',borderRadius:7,padding:'5px 8px',color:'#a5b4fc',fontSize:12,outline:'none',textAlign:'center'}}/>
+                        <span style={{fontSize:11,color:'#475569'}}>phút</span>
+                      </div>
+                    )}
+                    <div style={{display:'flex',alignItems:'center',gap:4,marginTop:1}}>
+                      <span style={{fontSize:9,color:'#10b981'}}>⚡</span>
+                      <span style={{fontSize:9,color:'#10b981',lineHeight:1.3}}>Nhịp giữ chân: 1 cảnh 3-8s, tự chia nhỏ nếu cần</span>
+                    </div>
+                  </div>
+                  <LabeledSelect label="Tỉ lệ khung hình" value={ratio} onChange={setRatio}
+                    options={RATIOS.map(r=>({value:r.id,label:r.label}))} />
+                  <LabeledSelect label="Ngôn ngữ kịch bản" value={lang} onChange={setLang}
+                    options={FORMATS.map(f=>({value:f.id,label:f.label}))} />
+                </div>
+
+                {/* ── Section 3: Visual AI ── */}
+                <div style={{background:'rgba(6,182,212,0.05)',border:'1px solid rgba(6,182,212,0.18)',borderRadius:14,padding:'14px 16px',display:'flex',flexDirection:'column',gap:10}}>
+                  <div style={{display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+                    <div style={{display:'flex',alignItems:'center',gap:7}}>
+                      <div style={{width:20,height:20,borderRadius:'50%',background:'rgba(6,182,212,0.18)',border:'1px solid rgba(6,182,212,0.35)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:11}}>🖼️</div>
+                      <span style={{fontSize:11,fontWeight:800,color:'#fff',textTransform:'uppercase',letterSpacing:'0.07em'}}>Visual AI · Hình Ảnh & Video</span>
+                    </div>
+                    <span style={{fontSize:9,color:'rgba(6,182,212,0.8)',fontWeight:700}}>Imagen 3 + Pexels</span>
+                  </div>
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:7}}>
+                    {BROLL_MODES.map(bm => (
+                      <button key={bm.id} onClick={()=>setBrollMode(bm.id)} className="broll-card"
+                        style={{padding:'8px 10px',borderRadius:9,border:`1.5px solid ${brollMode===bm.id?'rgba(6,182,212,0.7)':'rgba(30,41,59,0.9)'}`,
+                          background:brollMode===bm.id?'rgba(6,182,212,0.14)':'#050508',cursor:'pointer',textAlign:'left',transition:'all .15s',
+                          boxShadow:brollMode===bm.id?'0 0 10px rgba(6,182,212,0.15)':'none'}}>
+                        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:3}}>
+                          <span style={{fontSize:11,fontWeight:700,color:'#f1f5f9'}}>{bm.id==='image'?'🖼 AI Image':bm.id==='stock'?'📹 Stock Video':'⚡ Auto'}</span>
+                          {brollMode===bm.id&&<span style={{fontSize:8,color:'#06b6d4'}}>✓</span>}
+                        </div>
+                        <div style={{fontSize:9,color:'#475569',lineHeight:1.3}}>
+                          {bm.id==='image'?'Imagen 3 / Flow':bm.id==='stock'?'Pexels · Pixabay':'AI tự chọn'}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                  {brollMode==='stock' && (
+                    <div style={{fontSize:9,color:'#475569',padding:'4px 2px',lineHeight:1.4}}>
+                      🔑 Cần Pexels API Key hoặc Pixabay API Key trong <b style={{color:'#94a3b8'}}>Cài đặt</b> để dùng Stock Video. AI sẽ tự dùng ảnh Imagen nếu không có key.
+                    </div>
+                  )}
+                </div>
+
+                {/* ── Section 4: Voice settings ── */}
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
                   <LabeledSelect label="Voice Engine" value={ttsProvider}
                     onChange={v=>{ setTtsProvider(v); const dv=getDefaultVoice(v,lang)||getVoiceOptions(v,lang)[0]?.id||''; if(dv) setVoice(dv); }}
                     options={TTS_PROVIDERS.map(p=>({value:p.id,label:`${p.label} (${p.badge})`}))} />
@@ -1060,78 +1449,87 @@ export default function AIVideoRemixer() {
                           return all.length ? all : [{value:'',label:'(VieNeu chưa kết nối)'}];
                         })()
                       : getVoiceOptions(ttsProvider, lang).map(v=>({value:v.id,label:v.label}))}/>
-                  <LabeledSelect label="Visual AI" value={brollMode} onChange={setBrollMode}
-                    options={BROLL_MODES.map(m=>({value:m.id,label:m.label}))} />
-                  {brollMode==='video'
-                    ? <LabeledSelect label="Veo Model" value={veoModel} onChange={setVeoModel}
-                        options={VEO_MODELS.map(m=>({value:m.id,label:m.label}))} />
-                    : <div/>}
                 </div>
 
-                {/* Output dir row */}
+                {/* ── Output dir ── */}
                 <div style={{display:'flex',flexDirection:'column',gap:5}}>
-                  <span style={{fontSize:11,color:'#475569',fontWeight:600,letterSpacing:'0.04em'}}>Thư mục lưu video</span>
+                  <span style={{fontSize:10,color:'#475569',fontWeight:600,letterSpacing:'0.04em',textTransform:'uppercase',fontFamily:'monospace'}}>Thư mục lưu video</span>
                   <button onClick={selectOutputDir}
-                    style={{background:'#0a1020',border:'1px solid #1a2540',borderRadius:8,padding:'7px 12px',
+                    style={{background:'#050508',border:'1px solid rgba(30,41,59,0.8)',borderRadius:9,padding:'8px 12px',
                       color:outputDir?'#94a3b8':'#334155',fontSize:12,cursor:'pointer',textAlign:'left',
                       display:'flex',alignItems:'center',gap:8,transition:'border-color .15s',outline:'none'}}
-                    onMouseEnter={e=>e.currentTarget.style.borderColor='#3b82f655'}
-                    onMouseLeave={e=>e.currentTarget.style.borderColor='#1a2540'}>
+                    onMouseEnter={e=>e.currentTarget.style.borderColor='rgba(99,102,241,0.35)'}
+                    onMouseLeave={e=>e.currentTarget.style.borderColor='rgba(30,41,59,0.8)'}>
                     <span style={{fontSize:14}}>📁</span>
                     <span style={{flex:1,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
                       {outputDir || 'Chọn thư mục lưu video...'}
                     </span>
-                    {outputDir && <span style={{fontSize:10,color:'#3b82f6',flexShrink:0}}>Thay đổi</span>}
+                    {outputDir && <span style={{fontSize:10,color:'#6366f1',flexShrink:0}}>Thay đổi</span>}
                   </button>
                 </div>
               </div>
 
               {/* CTA + import */}
-              <div style={{display:'flex',gap:10,alignItems:'center',flexWrap:'wrap'}}>
+              <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
                 <button onClick={handleSend} disabled={!command.trim()||isThinking||isRunning}
-                  style={{flex:1,minWidth:180,height:50,
-                    background:command.trim()&&!isThinking&&!isRunning?'#0c1e33':'#0a1020',
-                    border:`1.5px solid ${command.trim()&&!isThinking&&!isRunning?activePreset.color+'88':'#1a2540'}`,
+                  style={{flex:1,minWidth:160,height:48,
+                    background:command.trim()&&!isThinking&&!isRunning?'rgba(99,102,241,0.12)':'rgba(5,5,8,0.8)',
+                    border:`1.5px solid ${command.trim()&&!isThinking&&!isRunning?'rgba(99,102,241,0.55)':'rgba(30,41,59,0.8)'}`,
                     borderRadius:12,
-                    color:command.trim()&&!isThinking&&!isRunning?activePreset.color:'#1e293b',
-                    fontSize:14,fontWeight:700,
+                    color:command.trim()&&!isThinking&&!isRunning?'#a5b4fc':'#1e293b',
+                    fontSize:13,fontWeight:700,
                     cursor:command.trim()&&!isThinking&&!isRunning?'pointer':'not-allowed',
-                    letterSpacing:'-0.01em',transition:'all .2s',
+                    transition:'all .2s',
                     display:'flex',alignItems:'center',justifyContent:'center',gap:7}}>
                   {isThinking
-                    ? <><div className="spin" style={{width:14,height:14,borderRadius:'50%',border:`2px solid ${activePreset.color}`,borderTopColor:'transparent'}}/> Đang phân tích...</>
+                    ? <><div className="spin" style={{width:13,height:13,borderRadius:'50%',border:'2px solid #6366f1',borderTopColor:'transparent'}}/> Đang phân tích...</>
                     : isRunning
-                    ? <><div className="spin" style={{width:14,height:14,borderRadius:'50%',border:`2px solid ${activePreset.color}`,borderTopColor:'transparent'}}/> Đang tạo...</>
-                    : '💬 Gửi'}
+                    ? <><div className="spin" style={{width:13,height:13,borderRadius:'50%',border:'2px solid #6366f1',borderTopColor:'transparent'}}/> Đang tạo...</>
+                    : '💬 Chat với AI'}
                 </button>
-                <label style={{height:50,padding:'0 16px',background:'#0a1020',border:'1px solid #1a2540',borderRadius:12,
+                <button onClick={()=>{if(command.trim()&&!isRunning)handleRun();}}
+                  disabled={!command.trim()||isRunning}
+                  style={{height:48,padding:'0 22px',
+                    background:command.trim()&&!isRunning?'#6366f1':'rgba(30,41,59,0.4)',
+                    border:'none',borderRadius:12,
+                    color:command.trim()&&!isRunning?'#fff':'#1e293b',
+                    fontSize:13,fontWeight:800,cursor:command.trim()&&!isRunning?'pointer':'not-allowed',
+                    transition:'all .2s',display:'flex',alignItems:'center',gap:7,
+                    boxShadow:command.trim()&&!isRunning?'0 0 18px rgba(99,102,241,0.4)':'none'}}>
+                  {isRunning
+                    ? <><div className="spin" style={{width:13,height:13,borderRadius:'50%',border:'2px solid rgba(255,255,255,.4)',borderTopColor:'#fff'}}/> Đang tạo...</>
+                    : <>✨ Tạo Video Ngay</>}
+                </button>
+                <label style={{height:48,padding:'0 14px',background:'rgba(5,5,8,0.8)',border:'1px solid rgba(30,41,59,0.8)',borderRadius:12,
                   color:'#475569',cursor:'pointer',fontSize:13,display:'flex',alignItems:'center',gap:6,whiteSpace:'nowrap'}}>
                   📎
                   <input type="file" multiple accept="image/*,video/*,audio/*" style={{display:'none'}} onChange={handleAttachFile}/>
                 </label>
                 {chatMessages.length > 0 && (
                   <button onClick={()=>{setChatMessages([]);setPendingExec(null);}}
-                    style={{height:50,padding:'0 12px',background:'transparent',border:'1px solid #1a2540',borderRadius:12,
+                    style={{height:48,padding:'0 12px',background:'transparent',border:'1px solid rgba(30,41,59,0.6)',borderRadius:12,
                       color:'#334155',cursor:'pointer',fontSize:12,whiteSpace:'nowrap'}}>
-                    🗑 Xóa chat
+                    🗑
                   </button>
                 )}
               </div>
 
               {/* Example prompts */}
-              <div style={{borderTop:'1px solid #0d1728',paddingTop:20}}>
-                <p style={{fontSize:12,color:'#1e3a5f',marginBottom:12,textAlign:'center',textTransform:'uppercase',letterSpacing:'0.08em',fontWeight:600}}>Ví dụ prompt</p>
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+              <div style={{borderTop:'1px solid rgba(99,102,241,0.1)',paddingTop:18}}>
+                <div style={{display:'flex',alignItems:'center',gap:5,marginBottom:10}}>
+                  <span style={{fontSize:11}}>💡</span>
+                  <p style={{fontSize:10,color:'#334155',textTransform:'uppercase',letterSpacing:'0.07em',fontWeight:700,margin:0}}>Gợi ý ý tưởng nhanh</p>
+                </div>
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:7}}>
                   {[
+                    'Quảng cáo xe điện tương lai với công nghệ tự lái trong thành phố đêm',
                     'Documentary 5 phút: Tại sao người giàu ngày càng giàu hơn?',
                     'Explainer 3 phút: Lịch sử và tương lai của trí tuệ nhân tạo',
-                    'News style: Thị trường chứng khoán Việt Nam 2025 — cơ hội và rủi ro',
                     'Story cinematic: Hành trình từ startup garage đến công ty tỉ đô',
                   ].map((ex,i) => (
-                    <button key={i} onClick={()=>setCommand(ex)}
-                      style={{background:'#0a1020',border:'1px solid #1a2540',borderRadius:8,padding:'10px 14px',
-                        color:'#334155',cursor:'pointer',fontSize:12,textAlign:'left',lineHeight:1.4,
-                        transition:'all .15s',':hover':{borderColor:'#7c3aed'}}}>
+                    <button key={i} onClick={()=>setCommand(ex)} className="example-btn"
+                      style={{background:'#050508',border:'1px solid rgba(30,41,59,0.8)',borderRadius:9,padding:'10px 12px',
+                        color:'#334155',cursor:'pointer',fontSize:11,textAlign:'left',lineHeight:1.45,transition:'all .15s'}}>
                       {ex}
                     </button>
                   ))}
@@ -1149,9 +1547,9 @@ export default function AIVideoRemixer() {
         <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',minHeight:0}}>
 
           {/* Production top bar */}
-          <div style={{height:48,flexShrink:0,display:'flex',alignItems:'center',padding:'0 16px',gap:12,background:'#04070f',borderBottom:'1px solid #0d1728'}}>
+          <div style={{height:48,flexShrink:0,display:'flex',alignItems:'center',padding:'0 16px',gap:12,background:'#07070c',borderBottom:'1px solid rgba(99,102,241,0.18)'}}>
             <button onClick={handleBackToHome} style={{background:'transparent',border:'none',color:'#334155',cursor:'pointer',fontSize:18,padding:'0 4px',lineHeight:1}}>←</button>
-            <span style={{fontSize:14,fontWeight:800,color:'#7c3aed'}}>⚡ AI Production</span>
+            <span style={{fontSize:14,fontWeight:800,color:'#818cf8'}}>✨ AI Production</span>
             {planData?.title && <span style={{fontSize:13,color:'#64748b',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1}}>{planData.title}</span>}
             <div style={{flex:1}}/>
             {/* progress bar */}
@@ -1170,20 +1568,20 @@ export default function AIVideoRemixer() {
           <div style={{flex:1,display:'flex',overflow:'hidden',minHeight:0}}>
 
             {/* LEFT — Production stages */}
-            <div style={{width:200,flexShrink:0,background:'#04070f',borderRight:'1px solid #0d1728',display:'flex',flexDirection:'column',padding:'16px 0'}}>
-              <div style={{padding:'0 16px',marginBottom:12,fontSize:11,fontWeight:700,color:'#1e3a5f',textTransform:'uppercase',letterSpacing:'0.08em'}}>Tiến trình</div>
+            <div style={{width:200,flexShrink:0,background:'#07070c',borderRight:'1px solid rgba(99,102,241,0.15)',display:'flex',flexDirection:'column',padding:'16px 0'}}>
+              <div style={{padding:'0 16px',marginBottom:12,fontSize:10,fontWeight:700,color:'rgba(99,102,241,0.6)',textTransform:'uppercase',letterSpacing:'0.08em',fontFamily:'monospace'}}>Tiến Trình</div>
               {prodStages.map((stage,i) => (
                 <div key={stage.id} style={{display:'flex',alignItems:'center',gap:10,padding:'8px 16px',
-                  background:stage.status==='running'?'#0c1e33':stage.status==='done'?'#042010':'transparent',
-                  borderLeft:`2px solid ${stage.status==='done'?'#16a34a':stage.status==='running'?activePreset.color:'transparent'}`,
+                  background:stage.status==='running'?'rgba(99,102,241,0.1)':stage.status==='done'?'rgba(22,163,74,0.06)':'transparent',
+                  borderLeft:`2px solid ${stage.status==='done'?'#16a34a':stage.status==='running'?'#6366f1':'transparent'}`,
                   transition:'all .2s'}}>
                   <div style={{width:18,height:18,borderRadius:'50%',flexShrink:0,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:800,
-                    background:stage.status==='done'?'#16a34a':stage.status==='running'?activePreset.color:'#0d1728',
-                    color:'#fff'}}>
+                    background:stage.status==='done'?'#16a34a':stage.status==='running'?'#6366f1':'#0d1728',
+                    color:'#fff',boxShadow:stage.status==='running'?'0 0 8px rgba(99,102,241,0.5)':'none'}}>
                     {stage.status==='done'?'✓':stage.status==='running'?<div className="pulse" style={{width:5,height:5,borderRadius:'50%',background:'#fff'}}/>:i+1}
                   </div>
                   <span style={{fontSize:12,fontWeight:stage.status!=='pending'?600:400,
-                    color:stage.status==='done'?'#4ade80':stage.status==='running'?'#93c5fd':'#334155',
+                    color:stage.status==='done'?'#4ade80':stage.status==='running'?'#a5b4fc':'#334155',
                     lineHeight:1.2}}>
                     {stage.icon} {stage.label}
                   </span>
@@ -1192,9 +1590,9 @@ export default function AIVideoRemixer() {
 
               {/* Current tool */}
               {currentTool && (
-                <div style={{margin:'16px 10px 0',background:'#0a1525',border:`1px solid ${activePreset.color}33`,borderRadius:8,padding:'10px 12px'}}>
-                  <div className="pulse" style={{width:6,height:6,borderRadius:'50%',background:activePreset.color,marginBottom:6}}/>
-                  <div style={{fontSize:11,color:'#93c5fd',lineHeight:1.4,fontWeight:500}}>{currentToolLabel}</div>
+                <div style={{margin:'16px 10px 0',background:'rgba(99,102,241,0.08)',border:'1px solid rgba(99,102,241,0.25)',borderRadius:10,padding:'10px 12px'}}>
+                  <div className="pulse" style={{width:6,height:6,borderRadius:'50%',background:'#6366f1',marginBottom:6}}/>
+                  <div style={{fontSize:11,color:'#a5b4fc',lineHeight:1.4,fontWeight:500}}>{currentToolLabel}</div>
                 </div>
               )}
 
@@ -1211,19 +1609,19 @@ export default function AIVideoRemixer() {
               {!planData && isRunning && (
                 <div style={{display:'flex',flexDirection:'column',alignItems:'center',height:'100%',padding:'32px 24px',gap:20,overflowY:'auto'}}>
                   <div style={{display:'flex',alignItems:'center',gap:14,alignSelf:'stretch'}}>
-                    <div className="spin" style={{width:32,height:32,flexShrink:0,border:`2.5px solid ${activePreset.color}33`,borderTop:`2.5px solid ${activePreset.color}`,borderRadius:'50%'}}/>
+                    <div className="spin" style={{width:32,height:32,flexShrink:0,border:'2.5px solid rgba(99,102,241,0.2)',borderTop:'2.5px solid #6366f1',borderRadius:'50%'}}/>
                     <div style={{fontSize:14,fontWeight:600,color:'#94a3b8'}}>AI đang lên kế hoạch video...</div>
                   </div>
 
                   {/* Streaming thinking text */}
                   {aiStreamText && (
-                    <div style={{alignSelf:'stretch',background:'#050d1a',border:`1px solid ${activePreset.color}22`,borderRadius:12,padding:'16px 18px',position:'relative',overflow:'hidden'}}>
+                    <div style={{alignSelf:'stretch',background:'rgba(5,5,8,0.9)',border:'1px solid rgba(99,102,241,0.2)',borderRadius:12,padding:'16px 18px',position:'relative',overflow:'hidden'}}>
                       {/* Gradient shimmer border top */}
-                      <div style={{position:'absolute',top:0,left:0,right:0,height:2,background:`linear-gradient(90deg,transparent,${activePreset.color},transparent)`,opacity:0.6}}/>
-                      <div style={{fontSize:11,color:'#334155',fontWeight:700,marginBottom:10,textTransform:'uppercase',letterSpacing:'.08em'}}>💭 AI đang nghĩ...</div>
+                      <div style={{position:'absolute',top:0,left:0,right:0,height:2,background:'linear-gradient(90deg,transparent,#6366f1,#06b6d4,transparent)',opacity:0.7}}/>
+                      <div style={{fontSize:10,color:'rgba(99,102,241,0.7)',fontWeight:700,marginBottom:10,textTransform:'uppercase',letterSpacing:'.08em',fontFamily:'monospace'}}>💭 AI đang nghĩ...</div>
                       <div style={{fontSize:13,color:'#94a3b8',lineHeight:1.75,whiteSpace:'pre-wrap',wordBreak:'break-word',maxHeight:420,overflowY:'auto'}}>
                         {aiStreamText}
-                        <span className="pulse" style={{display:'inline-block',width:7,height:13,background:activePreset.color,borderRadius:1,marginLeft:2,verticalAlign:'middle'}}/>
+                        <span className="pulse" style={{display:'inline-block',width:7,height:13,background:'#6366f1',borderRadius:1,marginLeft:2,verticalAlign:'middle'}}/>
                       </div>
                     </div>
                   )}
@@ -1360,7 +1758,7 @@ export default function AIVideoRemixer() {
             </div>{/* end center column */}
 
             {/* RIGHT — Inspector / Log */}
-            <div style={{width:240,flexShrink:0,background:'#04070f',borderLeft:'1px solid #0d1728',display:'flex',flexDirection:'column',overflow:'hidden'}}>
+            <div style={{width:240,flexShrink:0,background:'#07070c',borderLeft:'1px solid rgba(99,102,241,0.12)',display:'flex',flexDirection:'column',overflow:'hidden'}}>
               {selectedSceneId && planData?.segments?.find(s=>s.id===selectedSceneId) ? (()=>{
                 const seg = planData.segments.find(s=>s.id===selectedSceneId);
                 const ss  = segmentStatus[seg.id] || {};
@@ -1426,23 +1824,29 @@ export default function AIVideoRemixer() {
           {/* Production running banner */}
           {isRunning && (
             <div style={{height:28,flexShrink:0,display:'flex',alignItems:'center',padding:'0 12px',gap:8,
-              background:'linear-gradient(90deg,#1e0a3c,#0c1e33)',borderBottom:'1px solid #3b1d8033'}}>
-              <div className="pulse" style={{width:6,height:6,borderRadius:'50%',background:'#a78bfa',flexShrink:0}}/>
-              <span style={{fontSize:10,color:'#a78bfa',fontWeight:700,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1}}>
+              background:'linear-gradient(90deg,rgba(49,7,90,0.7),rgba(12,30,51,0.8))',borderBottom:'1px solid rgba(99,102,241,0.2)'}}>
+              <div className="pulse" style={{width:6,height:6,borderRadius:'50%',background:'#818cf8',flexShrink:0}}/>
+              <span style={{fontSize:10,color:'#818cf8',fontWeight:700,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1}}>
                 {currentTool ? `⚙ ${RUNNING_LABELS[currentTool.name]||currentTool.name}${currentTool.args?.segment_id!=null?` #${currentTool.args.segment_id}`:''}…` : status}
               </span>
-              <button onClick={handleStop} style={{background:'#3b0f0f',border:'1px solid #7f1d1d44',borderRadius:4,padding:'2px 8px',color:'#f87171',cursor:'pointer',fontSize:9,fontWeight:700,flexShrink:0}}>■ Dừng</button>
+              <button onClick={handleStop} style={{background:'rgba(59,15,15,0.8)',border:'1px solid rgba(127,29,29,0.4)',borderRadius:4,padding:'2px 8px',color:'#f87171',cursor:'pointer',fontSize:9,fontWeight:700,flexShrink:0}}>■ Dừng</button>
             </div>
           )}
 
           {/* Editor top bar */}
-          <div style={{height:44,flexShrink:0,display:'flex',alignItems:'center',padding:'0 12px',gap:8,background:'#04070f',borderBottom:'1px solid #0d1728'}}>
+          <div style={{height:44,flexShrink:0,display:'flex',alignItems:'center',padding:'0 12px',gap:8,background:'#07070c',borderBottom:'1px solid rgba(99,102,241,0.15)'}}>
             <button onClick={handleBackToHome} style={{background:'transparent',border:'none',color:'#334155',cursor:'pointer',fontSize:18,padding:'0 4px',lineHeight:1}}>←</button>
             {!isRunning && <button onClick={()=>setAppMode('production')} title="Xem Production" style={{background:'transparent',border:'1px solid #1a2540',borderRadius:5,padding:'3px 8px',color:'#475569',cursor:'pointer',fontSize:11}}>⚙ Production</button>}
             <span style={{fontSize:13,fontWeight:700,color:'#94a3b8',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:200}}>{planData?.title||'Video Project'}</span>
             <div style={{flex:1}}/>
             <span style={{fontSize:11,color:'#334155'}}>{fmtDur(totalDuration)}</span>
             <span style={{fontSize:11,color:'#334155'}}>{ratio}</span>
+            {planData?.segments?.length > 0 && (
+              <button onClick={handleOpenPreview} disabled={isPreviewLoading}
+                style={{background:'#0c1020',border:'1px solid rgba(99,102,241,0.5)',borderRadius:6,padding:'4px 12px',color:isPreviewLoading?'#334155':'#a78bfa',cursor:isPreviewLoading?'default':'pointer',fontSize:12,fontWeight:600,display:'flex',alignItems:'center',gap:5}}>
+                {isPreviewLoading ? '⏳' : '👁'} {isPreviewLoading ? 'Đang mở...' : 'Preview'}
+              </button>
+            )}
             {renderPath && (
               <button onClick={handleOpenOutput}
                 style={{background:'#052e16',border:'1px solid #166534',borderRadius:6,padding:'4px 12px',color:'#4ade80',cursor:'pointer',fontSize:12,fontWeight:600}}>
@@ -1656,9 +2060,9 @@ export default function AIVideoRemixer() {
               )}
             </div>
 
-            {/* RIGHT — Inspector */}
+            {/* RIGHT — Scene Inspector */}
             <div style={{width:240,flexShrink:0,background:'#03060c',borderLeft:'1px solid #0d1728',display:'flex',flexDirection:'column',overflow:'hidden'}}>
-              <div style={{padding:'10px 14px',borderBottom:'1px solid #0d1728',fontSize:11,fontWeight:700,color:'#334155',textTransform:'uppercase',letterSpacing:'.07em'}}>
+              <div style={{padding:'8px 12px',borderBottom:'1px solid #0d1728',fontSize:10,fontWeight:700,color:'#334155',textTransform:'uppercase',letterSpacing:'.07em',flexShrink:0}}>
                 {selectedSceneId ? 'Scene Inspector' : 'Project Info'}
               </div>
 
@@ -1667,37 +2071,47 @@ export default function AIVideoRemixer() {
                 const ss  = segmentStatus[seg.id] || {};
                 const img = getSegmentAsset(seg.id);
                 return (
-                  <div style={{flex:1,overflowY:'auto',padding:'12px 14px',display:'flex',flexDirection:'column',gap:10}}>
-                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                      <span style={{fontSize:13,fontWeight:700,color:'#94a3b8'}}>{seg.id}</span>
-                      <button onClick={()=>setSelectedSceneId(null)} style={{background:'none',border:'none',color:'#334155',cursor:'pointer',fontSize:14,padding:0}}>✕</button>
+                  <div style={{flex:1,overflowY:'auto',display:'flex',flexDirection:'column',gap:0}}>
+                    {/* Preview */}
+                    <div style={{width:'100%',aspectRatio:'16/9',background:'#030609',flexShrink:0,position:'relative',overflow:'hidden'}}>
+                      {(img?.filePath||img?.path)
+                        ? (img?.type==='video'
+                            ? <video src={fileUrl(img)} preload="metadata" muted playsInline style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}}
+                                onLoadedMetadata={e=>{e.target.currentTime=0.001;}} onError={e=>e.target.style.display='none'}/>
+                            : <img src={fileUrl(img)} alt="" style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}}
+                                onError={e=>e.target.style.display='none'}/>)
+                        : <div style={{width:'100%',height:'100%',display:'flex',alignItems:'center',justifyContent:'center',fontSize:28,color:'#1e293b'}}>{VISUAL_ICONS[seg.visual_type]||'🎬'}</div>}
+                      <div style={{position:'absolute',bottom:0,left:0,right:0,background:'linear-gradient(transparent,#00000099)',padding:'12px 8px 5px',fontSize:9,color:'#94a3b8',fontWeight:600}}>
+                        Cảnh {seg.id} · {VISUAL_ICONS[seg.visual_type]||''} {seg.visual_type}
+                      </div>
                     </div>
-                    {img?.path && <img src={fileUrl(img.path)} alt="" style={{width:'100%',borderRadius:6,aspectRatio:'16/9',objectFit:'cover'}} onError={e=>e.target.style.display='none'}/>}
-                    <InspRow label="Visual type" value={`${VISUAL_ICONS[seg.visual_type]||''} ${seg.visual_type||'—'}`}/>
-                    <InspRow label="Duration"    value={`${seg.duration_sec||5}s`}/>
-                    <InspRow label="Visual"      value={ss.visual==='done'?'✅ Done':ss.visual==='running'?'⏳':'—'}/>
-                    <InspRow label="Voice"       value={ss.tts==='done'?'✅ Done':ss.tts==='running'?'⏳':'—'}/>
-                    {seg.narration && (
-                      <div>
-                        <div style={{fontSize:10,color:'#334155',marginBottom:4,textTransform:'uppercase',fontWeight:600}}>Narration</div>
-                        <div style={{fontSize:11,color:'#94a3b8',lineHeight:1.5,background:'#070b14',border:'1px solid #0d1728',borderRadius:6,padding:'6px 8px',maxHeight:90,overflowY:'auto'}}>{narrationText(seg.narration)}</div>
-                      </div>
-                    )}
-                    {seg.visual?.prompt && (
-                      <div>
-                        <div style={{fontSize:10,color:'#334155',marginBottom:4,textTransform:'uppercase',fontWeight:600}}>Visual Prompt</div>
-                        <div style={{fontSize:10,color:'#475569',lineHeight:1.4,background:'#070b14',border:'1px solid #0d1728',borderRadius:6,padding:'6px 8px',maxHeight:60,overflowY:'auto'}}>{seg.visual.prompt}</div>
-                      </div>
-                    )}
-                    <button onClick={()=>handleSeekToScene(seg.id)} style={{width:'100%',background:'#0c1e33',border:`1px solid ${activePreset.color}44`,borderRadius:8,padding:'7px',color:activePreset.color,cursor:'pointer',fontSize:12,fontWeight:600}}>
-                      ⏩ Seek to scene
-                    </button>
+                    <div style={{padding:'10px 12px',display:'flex',flexDirection:'column',gap:8}}>
+                      <InspRow label="Duration" value={`${seg.duration_sec||5}s`}/>
+                      <InspRow label="Visual"   value={ss.visual==='done'?'✅ Done':ss.visual==='running'?'⏳...':'—'}/>
+                      <InspRow label="Voice"    value={ss.tts==='done'?'✅ Done':ss.tts==='running'?'⏳...':'—'}/>
+                      {seg.narration && (
+                        <div>
+                          <div style={{fontSize:9,color:'#334155',marginBottom:4,textTransform:'uppercase',fontWeight:600,letterSpacing:'.05em'}}>Narration</div>
+                          <div style={{fontSize:11,color:'#94a3b8',lineHeight:1.5,background:'#070b14',border:'1px solid #0d1728',borderRadius:6,padding:'6px 8px',maxHeight:90,overflowY:'auto'}}>{narrationText(seg.narration)}</div>
+                        </div>
+                      )}
+                      <button onClick={()=>handleSeekToScene(seg.id)}
+                        style={{width:'100%',background:'#0c1020',border:`1px solid ${activePreset.color}33`,borderRadius:8,padding:'7px',color:activePreset.color,cursor:'pointer',fontSize:12,fontWeight:600}}>
+                        ⏩ Seek to scene
+                      </button>
+                      <button onClick={()=>{ setFxTargetSegId(seg.id); setShowFXCatalog(true); }}
+                        style={{width:'100%',background:'#0c1020',border:'1px solid rgba(99,102,241,0.35)',borderRadius:8,padding:'7px',color:'#a78bfa',cursor:'pointer',fontSize:12,fontWeight:600,marginTop:4,display:'flex',alignItems:'center',justifyContent:'center',gap:5}}>
+                        ✨ FX Catalog
+                        {(seg.motionEffect && seg.motionEffect !== 'none') && <span style={{fontSize:9,background:'rgba(99,102,241,0.25)',borderRadius:4,padding:'1px 5px',color:'#67e8f9'}}>{seg.motionEffect}</span>}
+                        {seg.atmosphereFX && <span style={{fontSize:9,background:'rgba(30,183,153,0.2)',borderRadius:4,padding:'1px 5px',color:'#34d399'}}>{seg.atmosphereFX}</span>}
+                      </button>
+                    </div>
                   </div>
                 );
               })() : (
-                <div style={{flex:1,overflowY:'auto',padding:'12px 14px',display:'flex',flexDirection:'column',gap:8}}>
+                <div style={{flex:1,overflowY:'auto',padding:'12px',display:'flex',flexDirection:'column',gap:8}}>
                   {planData && <>
-                    <InspRow label="Project" value={planData.title?.slice(0,30)||'—'}/>
+                    <InspRow label="Project" value={planData.title?.slice(0,28)||'—'}/>
                     <InspRow label="Cảnh"    value={planData.segments?.length||0}/>
                     <InspRow label="Thời lượng" value={fmtDur(totalDuration)}/>
                     <InspRow label="Assets"  value={liveAssets.length}/>
@@ -1718,55 +2132,133 @@ export default function AIVideoRemixer() {
                   )}
                   {planData?.seoData?.title && (
                     <div style={{marginTop:4,background:'#050c1e',borderRadius:7,padding:'8px 10px',border:'1px solid #0d1728'}}>
-                      <div style={{fontSize:9,color:'#a78bfa',fontWeight:700,marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>📊 SEO Metadata</div>
-                      <div style={{fontSize:10,color:'#e2e8f0',lineHeight:1.4,marginBottom:4,fontWeight:600}}>{planData.seoData.title}</div>
-                      {planData.seoData.hashtags && <div style={{fontSize:9,color:'#60a5fa',marginBottom:4}}>{planData.seoData.hashtags}</div>}
-                      {planData.seoData.tags?.length > 0 && (
-                        <div style={{display:'flex',flexWrap:'wrap',gap:3,marginTop:4}}>
-                          {planData.seoData.tags.slice(0,8).map((t,i)=>(
-                            <span key={i} style={{fontSize:8,background:'#0d1728',borderRadius:4,padding:'1px 5px',color:'#475569'}}>{t}</span>
-                          ))}
-                        </div>
-                      )}
+                      <div style={{fontSize:9,color:'#a78bfa',fontWeight:700,marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>📊 SEO</div>
+                      <div style={{fontSize:10,color:'#e2e8f0',lineHeight:1.4,fontWeight:600}}>{planData.seoData.title}</div>
+                      {planData.seoData.hashtags && <div style={{fontSize:9,color:'#60a5fa',marginTop:3}}>{planData.seoData.hashtags}</div>}
                     </div>
                   )}
-                  <div style={{marginTop:8,borderTop:'1px solid #0d1728',paddingTop:8,fontSize:10,color:'#1e3a5f'}}>
-                    Click vào scene để xem chi tiết
-                  </div>
+                  <div style={{marginTop:4,fontSize:10,color:'#1e3a5f'}}>Click scene để xem preview</div>
                 </div>
               )}
-
             </div>
 
           </div>
 
-          {/* ── BOTTOM: Scene strip + Timeline ── */}
-          <div style={{height:260,flexShrink:0,borderTop:'1px solid #0d1728',display:'flex',flexDirection:'column',background:'#04070f'}}>
-            {/* Scene strip */}
-            <div style={{height:82,flexShrink:0,borderBottom:'1px solid #0d1728',display:'flex',flexDirection:'column',overflow:'hidden'}}>
-              <div style={{height:20,flexShrink:0,display:'flex',alignItems:'center',padding:'0 10px',gap:6,borderBottom:'1px solid #0d1728'}}>
-                <span style={{fontSize:9,fontWeight:700,color:'#1e3a5f',textTransform:'uppercase',letterSpacing:'.08em'}}>Scenes</span>
-                <span style={{fontSize:9,color:'#1e293b',marginLeft:'auto'}}>{planData?.segments?.length||0} cảnh · {fmtDur(totalDuration)}</span>
+          {/* ── BOTTOM: Pacing Hub + Scene Cards + Timeline ── */}
+          <div style={{height:310,flexShrink:0,borderTop:'1px solid rgba(99,102,241,0.12)',display:'flex',flexDirection:'column',background:'#07070c'}}>
+
+            {/* Pacing Hub bar */}
+            <div style={{height:36,flexShrink:0,borderBottom:'1px solid #0d1728',display:'flex',alignItems:'center',padding:'0 10px',gap:5,overflowX:'auto',background:'#040810'}}>
+              <span style={{fontSize:8,fontWeight:800,color:'rgba(6,182,212,0.7)',textTransform:'uppercase',letterSpacing:'.08em',flexShrink:0}}>PACING HUB:</span>
+              {[['⚡⚡ Shorts (2.5-3.5s)','#f59e0b'],['🎬 Cinematic (5-7s)','#6366f1'],['📖 Doc (6-8s)','#06b6d4']].map(([label,color])=>(
+                <button key={label} style={{flexShrink:0,padding:'3px 9px',borderRadius:99,border:`1px solid ${color}44`,background:`${color}0d`,color,cursor:'pointer',fontSize:8,fontWeight:700,whiteSpace:'nowrap'}}>{label}</button>
+              ))}
+              <div style={{width:1,height:14,background:'#1a2540',flexShrink:0,margin:'0 3px'}}/>
+              {['🎙 Khớp Giọng Đọc','✂ Nói Hết Mới Chuyển','↩ L-Cut'].map(l=>(
+                <button key={l} style={{flexShrink:0,padding:'3px 7px',borderRadius:6,border:'1px solid #1a2540',background:'transparent',color:'#475569',cursor:'pointer',fontSize:8,whiteSpace:'nowrap'}}>{l}</button>
+              ))}
+              <div style={{flex:1}}/>
+              <button onClick={()=>{
+                const out=(planData?.segments||[]).map(s=>`Scene ${s.id} (${s.visual_type}|${s.duration_sec||5}s):\n${s.ai_video_prompt||s.visual_prompt||s.broll_query||''}`).join('\n\n');
+                try{navigator.clipboard?.writeText(out);}catch(_){}
+              }} style={{flexShrink:0,padding:'3px 9px',borderRadius:6,border:'1px solid #1a2540',background:'transparent',color:'#94a3b8',cursor:'pointer',fontSize:8,fontWeight:700,whiteSpace:'nowrap'}}>📋 Xuất All Prompt</button>
+            </div>
+
+            {/* Scene Cards Strip (reference-style) */}
+            <div style={{height:190,flexShrink:0,borderBottom:'1px solid #0d1728',display:'flex',flexDirection:'column',overflow:'hidden'}}>
+              <div style={{height:18,flexShrink:0,display:'flex',alignItems:'center',padding:'0 10px',gap:6,borderBottom:'1px solid #070b14'}}>
+                <span style={{fontSize:8,fontWeight:700,color:'#1e3a5f',textTransform:'uppercase',letterSpacing:'.08em'}}>TIMELINE</span>
+                <span style={{fontSize:8,color:'#1e293b',marginLeft:'auto'}}>{planData?.segments?.length||0} CẢNH · {fmtDur(totalDuration)}</span>
+                {isRunning && <div className="pulse" style={{width:5,height:5,borderRadius:'50%',background:activePreset.color}}/>}
               </div>
-              <div style={{flex:1,overflowX:'auto',overflowY:'hidden',display:'flex',alignItems:'center',gap:6,padding:'4px 10px',whiteSpace:'nowrap'}}>
-                {(planData?.segments||[]).map(seg=>{
+              <div style={{flex:1,overflowX:'auto',overflowY:'hidden',display:'flex',gap:5,padding:'5px 8px 5px',alignItems:'flex-start',whiteSpace:'nowrap'}}>
+                {(planData?.segments||[]).map((seg,idx)=>{
                   const img=getSegmentAsset(seg.id);
                   const active=selectedSceneId===seg.id;
+                  // Label chính xác theo loại visual thực tế
+                  const vtLabel = (() => {
+                    const vt = seg.visual_type;
+                    if (vt === 'text')           return { label: 'TEXT',        color: '#6366f1' };
+                    if (vt === 'talking_head')   return { label: 'A-ROLL',      color: '#6366f1' };
+                    if (vt === 'graphic' || vt === 'chart' || vt === 'motion_graphic')
+                                                 return { label: 'GRAPHIC',     color: '#f59e0b' };
+                    if (vt === 'illustration')   return { label: 'MINH HỌA',    color: '#f59e0b' };
+                    if (vt === 'ai_image')       return { label: 'ẢNH AI',      color: '#a78bfa' };
+                    // broll: phân biệt stock video vs ảnh AI dựa vào asset thực tế
+                    if (vt === 'broll') {
+                      if (img?.type === 'video') return { label: 'VIDEO STOCK', color: '#ec4899' };
+                      if (img?.filePath || img?.path) return { label: 'ẢNH AI', color: '#a78bfa' };
+                      // chưa có asset — dựa vào broll_media từ plan
+                      if (seg.broll_media === 'video') return { label: 'VIDEO STOCK', color: '#ec4899' };
+                      return { label: 'ẢNH AI', color: '#a78bfa' };
+                    }
+                    return { label: 'B-ROLL', color: '#f59e0b' };
+                  })();
+                  const isAroll = vtLabel.label === 'A-ROLL' || vtLabel.label === 'TEXT';
+                  const rollColor = vtLabel.color;
+                  const CAM={zoom_in:'Dolly In',zoom_out:'Zoom Out',slide_left:'Slide L',slide_right:'Slide R',slide_up:'Slide Up',cut:'Hard Cut',fade:'Fade',whip:'Whip Pan',glitch:'Glitch',blur:'Blur'};
+                  let cam=CAM[seg.transition_type]||seg.transition_type||'Auto';
+                  const vp=(seg.ai_video_prompt||seg.visual_prompt||'').toLowerCase();
+                  if(vp.includes('orbit'))cam='Orbit 360°';
+                  else if(vp.includes('drone')||vp.includes('aerial'))cam='Drone Aerial';
+                  else if(vp.includes('dolly'))cam='Dolly In';
+                  else if(vp.includes('close-up')||vp.includes('close up'))cam='Close-Up';
+                  const sfxA=liveAssets.find(a=>a.type==='sfx'&&String(a.segId)===String(seg.id));
+                  const sfxLbl=(sfxA?.label||manualSfxList?.find(s=>String(s.at_scene)===String(seg.id))?.sfx||'').toUpperCase().slice(0,9);
+                  const ss=segmentStatus[seg.id]||{};
                   return (
                     <div key={seg.id} onClick={()=>handleSeekToScene(seg.id)}
-                      style={{flexShrink:0,width:88,height:52,borderRadius:5,background:'#070b14',border:`1.5px solid ${active?activePreset.color:'#0d1728'}`,cursor:'pointer',overflow:'hidden',position:'relative',display:'inline-flex',alignItems:'center',justifyContent:'center'}}>
-                      {img?.path
-                        ? <img src={fileUrl(img.path)} alt="" style={{width:'100%',height:'100%',objectFit:'cover'}} onError={e=>e.target.style.display='none'}/>
-                        : <span style={{fontSize:14,opacity:.2}}>{VISUAL_ICONS[seg.visual_type]||'🎬'}</span>}
-                      <div style={{position:'absolute',bottom:0,left:0,right:0,background:'#00000088',padding:'2px 4px',fontSize:7,color:'#94a3b8',fontWeight:600}}>{seg.id}</div>
+                      style={{flexShrink:0,width:176,display:'inline-flex',flexDirection:'column',verticalAlign:'top',
+                        background:active?'#0c1a2e':'#070b14',
+                        border:`1.5px solid ${active?activePreset.color:'#0d1728'}`,
+                        borderRadius:8,overflow:'hidden',cursor:'pointer',transition:'border-color .15s'}}>
+                      {/* Card header */}
+                      <div style={{display:'flex',alignItems:'center',padding:'3px 6px',gap:4,background:'#050810',borderBottom:'1px solid #0a1020'}}>
+                        <span style={{fontSize:8,fontWeight:800,color:'#64748b'}}>#{idx+1}</span>
+                        <span style={{fontSize:7,fontWeight:800,background:`${rollColor}22`,color:rollColor,padding:'1px 5px',borderRadius:99,border:`1px solid ${rollColor}44`,flexShrink:0}}>{vtLabel.label}</span>
+                        <div style={{flex:1}}/>
+                        <button onClick={e=>{e.stopPropagation();const p=planData?.segments?.[idx-1];if(p)handleSeekToScene(p.id);}} style={{background:'none',border:'none',color:'#1e3a5f',cursor:'pointer',fontSize:10,padding:'0 1px',lineHeight:1}}>←</button>
+                        <button onClick={e=>{e.stopPropagation();const n=planData?.segments?.[idx+1];if(n)handleSeekToScene(n.id);}} style={{background:'none',border:'none',color:'#1e3a5f',cursor:'pointer',fontSize:10,padding:'0 1px',lineHeight:1}}>→</button>
+                      </div>
+                      {/* Thumbnail */}
+                      <div style={{width:'100%',aspectRatio:'16/9',background:'#030609',position:'relative',flexShrink:0,overflow:'hidden'}}>
+                        {(img?.filePath||img?.path)
+                          ? (img?.type==='video'
+                              ? <video src={fileUrl(img)} preload="metadata" muted playsInline style={{width:'100%',height:'100%',objectFit:'cover'}} onLoadedMetadata={e=>{e.target.currentTime=0.001;}} onError={e=>e.target.style.display='none'}/>
+                              : <img src={fileUrl(img)} alt="" style={{width:'100%',height:'100%',objectFit:'cover'}} onError={e=>e.target.style.display='none'}/>)
+                          : <div style={{width:'100%',height:'100%',display:'flex',alignItems:'center',justifyContent:'center',fontSize:16,color:'#1e293b'}}>{VISUAL_ICONS[seg.visual_type]||'🎬'}</div>}
+                        <div style={{position:'absolute',top:3,right:3,background:'#00000099',borderRadius:3,padding:'1px 4px',fontSize:7,color:'#06b6d4',fontWeight:800}}>{seg.duration_sec||5}s</div>
+                        {ss.visual==='running'&&<div style={{position:'absolute',inset:0,display:'flex',alignItems:'center',justifyContent:'center',background:'#00000066'}}><div className="spin" style={{width:16,height:16,border:'2px solid #ffffff22',borderTop:`2px solid ${activePreset.color}`,borderRadius:'50%'}}/></div>}
+                      </div>
+                      {/* Badges */}
+                      <div style={{display:'flex',gap:2,padding:'3px 6px',overflow:'hidden'}}>
+                        <span style={{fontSize:7,fontWeight:700,padding:'1px 4px',borderRadius:3,background:'rgba(6,182,212,0.1)',border:'1px solid rgba(6,182,212,0.2)',color:'#06b6d4',flexShrink:0}}>⏱{seg.duration_sec||5}s</span>
+                        <span style={{fontSize:7,padding:'1px 4px',borderRadius:3,background:'#070b14',border:'1px solid #0d1728',color:'#475569',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1}}>{cam}</span>
+                        {sfxLbl&&<span style={{fontSize:7,fontWeight:700,padding:'1px 4px',borderRadius:3,background:'rgba(99,102,241,0.1)',border:'1px solid rgba(99,102,241,0.2)',color:'#a78bfa',flexShrink:0,overflow:'hidden',maxWidth:48}}>{sfxLbl}</span>}
+                      </div>
+                      {/* Info */}
+                      <div style={{padding:'1px 6px 5px',flex:1}}>
+                        <div style={{fontSize:9,fontWeight:700,color:'#c7d2fe',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',marginBottom:1}}>
+                          {seg.text_heading||(narrationText(seg.narration)||'').split(/[.!?]/)[0]?.slice(0,24)||`Cảnh ${seg.id}`}
+                        </div>
+                        <div style={{fontSize:8,color:'#334155',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',marginBottom:2}}>
+                          {(narrationText(seg.narration)||'').slice(0,30)}
+                        </div>
+                        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+                          <span style={{fontSize:7,color:'#1e3a5f'}}>{Math.round((seg.duration_sec||5)*30)} f</span>
+                          <span style={{fontSize:8,color:ss.visual==='done'?'#4ade80':ss.visual==='running'?activePreset.color:'#1e3a5f'}}>
+                            {ss.visual==='done'?'✓ Done':ss.visual==='running'?'● Gen...':'○'}
+                          </span>
+                        </div>
+                      </div>
                     </div>
                   );
                 })}
-                {(planData?.segments||[]).length===0 && <div style={{color:'#1e293b',fontSize:11,padding:'0 8px'}}>Không có scene</div>}
+                {(planData?.segments||[]).length===0&&<div style={{color:'#1e293b',fontSize:11,padding:'24px 8px',display:'inline-block'}}>Không có scene</div>}
               </div>
             </div>
 
-            {/* Timeline */}
+            {/* Timeline tracks */}
             <div style={{flex:1,overflow:'hidden'}}>
               <EditorTimeline computedClips={computedClips} liveAssets={liveAssets} segmentStatus={segmentStatus}
                 selectedSceneId={selectedSceneId} onSelectScene={handleSeekToScene}
@@ -1777,6 +2269,14 @@ export default function AIVideoRemixer() {
 
         </div>
       )}
+
+      {/* FX Catalog Modal */}
+      <FXCatalogModal
+        isOpen={showFXCatalog}
+        onClose={()=>{ setShowFXCatalog(false); setFxTargetSegId(null); }}
+        segment={planData?.segments?.find(s=>s.id===fxTargetSegId) || null}
+        onApplyEffect={handleApplyFX}
+      />
     </div>
   );
 }
@@ -1787,9 +2287,11 @@ export default function AIVideoRemixer() {
 function LabeledSelect({ label, value, onChange, options }) {
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:5 }}>
-      <span style={{ fontSize:11, color:'#475569', fontWeight:600, letterSpacing:'0.04em' }}>{label}</span>
+      <span style={{ fontSize:10, color:'#475569', fontWeight:700, letterSpacing:'0.05em', textTransform:'uppercase', fontFamily:'monospace' }}>{label}</span>
       <select value={value} onChange={e=>onChange(e.target.value)}
-        style={{ background:'#0a1020', border:'1px solid #1a2540', borderRadius:8, padding:'7px 10px', color:'#cbd5e1', fontSize:12, cursor:'pointer' }}>
+        style={{ background:'#050508', border:'1px solid rgba(30,41,59,0.9)', borderRadius:9, padding:'8px 10px', color:'#cbd5e1', fontSize:12, cursor:'pointer', outline:'none', transition:'border-color .15s' }}
+        onFocus={e=>e.target.style.borderColor='rgba(99,102,241,0.5)'}
+        onBlur={e=>e.target.style.borderColor='rgba(30,41,59,0.9)'}>
         {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
       </select>
     </div>

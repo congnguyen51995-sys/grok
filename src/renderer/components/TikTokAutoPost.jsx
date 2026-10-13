@@ -82,7 +82,7 @@ export default function TikTokAutoPost() {
   const [reupCaptionTpl, setReupCaptionTpl] = useState(() => localStorage.getItem('tiktok_reup_caption') || '');
   const [reupVidStatus,  setReupVidStatus]  = useState({});
   const [reupVidLog,     setReupVidLog]     = useState({});
-  const [reupSchedTime,  setReupSchedTime]  = useState(() => localStorage.getItem('tiktok_reup_sched') || '');
+  const [reupSchedTimes, setReupSchedTimes] = useState(() => { try { return JSON.parse(localStorage.getItem('tiktok_reup_sched_times')) || []; } catch { return []; } });
   const [reupSchedOn,    setReupSchedOn]    = useState(false);
   const reupSchedRef  = useRef(null);
   const lastReupFired = useRef({});
@@ -260,23 +260,24 @@ export default function TikTokAutoPost() {
       clearInterval(reupSchedRef.current); reupSchedRef.current = null;
       setReupSchedOn(false); addLog('⏹ [Reup] Tắt lịch tự động'); return;
     }
-    if (!reupSchedTime) { addLog('❌ [Reup] Chưa đặt giờ đăng'); return; }
+    if (!reupSchedTimes.length) { addLog('❌ [Reup] Chưa đặt giờ đăng'); return; }
     setReupSchedOn(true);
-    addLog(`✅ [Reup] Lịch đang chạy — sẽ đăng lần lượt từng video lúc ${reupSchedTime}`);
-    let videoQueue = [...reupVideosRef.current];
+    addLog(`✅ [Reup] Lịch đang chạy — đăng lúc: ${reupSchedTimes.join(', ')}`);
     reupSchedRef.current = setInterval(() => {
       const now = new Date();
       const hhmm = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
       const dateKey = now.toDateString();
-      if (hhmm !== reupSchedTime) return;
-      // Find next unposted video
-      const next = videoQueue.find(v => reupVidStatus[v.id] !== 'done' && lastReupFired.current[v.id] !== dateKey);
-      if (!next) { addLog('✅ [Reup] Đã đăng hết tất cả video trong lịch'); clearInterval(reupSchedRef.current); reupSchedRef.current = null; setReupSchedOn(false); return; }
-      lastReupFired.current[next.id] = dateKey;
+      if (!reupSchedTimes.includes(hhmm)) return;
+      // Find next video not yet posted at this specific time slot today
+      const next = reupVideosRef.current.find(v =>
+        reupVidStatus[v.id] !== 'done' && lastReupFired.current[`${v.id}-${hhmm}`] !== dateKey
+      );
+      if (!next) return;
+      lastReupFired.current[`${next.id}-${hhmm}`] = dateKey;
       addLog(`⏰ ${hhmm} — [Reup] Đăng: ${next.name}`);
       postReupVideo(next);
     }, 15000);
-  }, [reupSchedTime, postReupVideo, addLog]);
+  }, [reupSchedTimes, postReupVideo, addLog]);
 
   // Reload products when switching account
   useEffect(() => {
@@ -850,16 +851,39 @@ export default function TikTokAutoPost() {
                   placeholder="Template caption... dùng {title} cho tên video, {ep} cho số tập"
                   className="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-white placeholder-slate-600 outline-none focus:border-pink-600"/>
               </div>
-              {/* Row 3: schedule + action buttons */}
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-slate-500 shrink-0">⏰ Đăng lúc:</span>
-                <input type="time" value={reupSchedTime}
-                  onChange={e => { setReupSchedTime(e.target.value); localStorage.setItem('tiktok_reup_sched', e.target.value); }}
-                  className="bg-slate-800 border border-slate-700 rounded px-2 py-0.5 text-xs text-white outline-none cursor-pointer"/>
+              {/* Row 3: schedule time slots */}
+              <div className="flex items-start gap-2">
+                <span className="text-xs text-slate-500 shrink-0 mt-1">⏰ Đăng lúc:</span>
+                <div className="flex flex-wrap gap-1 flex-1">
+                  {reupSchedTimes.map((t, i) => (
+                    <div key={i} className="flex items-center gap-1 bg-slate-800 border border-slate-700 rounded px-1.5 py-0.5">
+                      <input type="time" value={t}
+                        onChange={e => {
+                          const updated = reupSchedTimes.map((v, j) => j === i ? e.target.value : v);
+                          setReupSchedTimes(updated);
+                          localStorage.setItem('tiktok_reup_sched_times', JSON.stringify(updated));
+                        }}
+                        className="bg-transparent text-xs text-white outline-none cursor-pointer w-[72px]"/>
+                      <button onClick={() => {
+                        const updated = reupSchedTimes.filter((_, j) => j !== i);
+                        setReupSchedTimes(updated);
+                        localStorage.setItem('tiktok_reup_sched_times', JSON.stringify(updated));
+                      }} className="text-slate-500 hover:text-red-400 text-xs leading-none">×</button>
+                    </div>
+                  ))}
+                  <button onClick={() => {
+                    const updated = [...reupSchedTimes, '08:00'];
+                    setReupSchedTimes(updated);
+                    localStorage.setItem('tiktok_reup_sched_times', JSON.stringify(updated));
+                  }} className="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded text-xs text-slate-300">+ Thêm giờ</button>
+                </div>
                 <button onClick={toggleReupSchedule} disabled={!reupAccountId || !reupVideos.length}
-                  className={`px-2 py-1 rounded text-xs font-bold text-white disabled:opacity-40 transition-colors ${reupSchedOn ? 'bg-red-700 hover:bg-red-600' : 'bg-amber-700 hover:bg-amber-600'}`}>
+                  className={`px-2 py-1 rounded text-xs font-bold text-white disabled:opacity-40 transition-colors shrink-0 ${reupSchedOn ? 'bg-red-700 hover:bg-red-600' : 'bg-amber-700 hover:bg-amber-600'}`}>
                   {reupSchedOn ? '⏹ Tắt lịch' : '⏰ Bật lịch'}
                 </button>
+              </div>
+              {/* Row 4: video count + post all */}
+              <div className="flex items-center gap-2">
                 <div className="flex-1"/>
                 <span className="text-xs text-slate-500">{reupVideos.length} video</span>
                 <button onClick={postAllReup} disabled={!reupAccountId || !reupVideos.length}

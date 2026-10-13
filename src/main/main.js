@@ -3811,6 +3811,13 @@ except Exception as e:
     const crypto = require('crypto');
     const https  = require('https');
 
+    // Giới hạn 3 request CapCut TTS cùng lúc — tránh rate-limit khi 5 video chạy song song
+    let _ccRunning = 0;
+    const _CC_MAX  = 3;
+    const _ccWait  = [];
+    const _ccAcquire = () => new Promise(res => { if (_ccRunning < _CC_MAX) { _ccRunning++; res(); } else _ccWait.push(res); });
+    const _ccRelease = () => { if (_ccWait.length) { _ccWait.shift()(); } else _ccRunning--; };
+
     const BASE  = 'https://editor-api-sg.capcutapi.com';
     const DEV   = {
       aid: '359289', app_name: 'CapCut', appvr: '8.7.0',
@@ -3943,6 +3950,10 @@ mwIDAQAB
     }
 
     async function generateSpeech(text, voice, resourceId) {
+      await _ccAcquire();
+      try { return await _generateSpeech(text, voice, resourceId); } finally { _ccRelease(); }
+    }
+    async function _generateSpeech(text, voice, resourceId) {
       const babi = {
         feature_entrance: 'editor', feature_entrance_detail: 'editor-feature-text_to_speech',
         feature_key: 'text_to_speech', scenario: 'video_editor',

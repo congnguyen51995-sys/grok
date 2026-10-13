@@ -29,6 +29,7 @@ function saveRows(list) {
     product: r.product, caption: r.caption || '',
     productDisplayName: r.productDisplayName || '',
     scheduledTime: r.scheduledTime || '',
+    noProduct: r.noProduct || false,
   }))));
 }
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
@@ -73,6 +74,21 @@ export default function TikTokAutoPost() {
   // Global log panel
   const [globalLogs,  setGlobalLogs]  = useState([]);
   const [logExpanded, setLogExpanded] = useState(true);
+
+  // ── Phim Reup state ─────────────────────────────────────────────────────────
+  const [reupFolder,     setReupFolder]     = useState(() => localStorage.getItem('tiktok_reup_folder') || '');
+  const [reupVideos,     setReupVideos]     = useState(() => { try { return JSON.parse(localStorage.getItem('tiktok_reup_videos')) || []; } catch { return []; } });
+  const [reupAccountId,  setReupAccountId]  = useState(() => localStorage.getItem('tiktok_reup_account') || '');
+  const [reupCaptionTpl, setReupCaptionTpl] = useState(() => localStorage.getItem('tiktok_reup_caption') || '');
+  const [reupVidStatus,  setReupVidStatus]  = useState({});
+  const [reupVidLog,     setReupVidLog]     = useState({});
+  const [reupSchedTime,  setReupSchedTime]  = useState(() => localStorage.getItem('tiktok_reup_sched') || '');
+  const [reupSchedOn,    setReupSchedOn]    = useState(false);
+  const reupSchedRef  = useRef(null);
+  const lastReupFired = useRef({});
+  const reupVideosRef = useRef([]);
+  useEffect(() => { reupVideosRef.current = reupVideos; }, [reupVideos]);
+  useEffect(() => () => { if (reupSchedRef.current) clearInterval(reupSchedRef.current); }, []);
   const logEndRef = useRef(null);
 
   const addLog = useCallback((msg, profileId = '') => {
@@ -132,7 +148,7 @@ export default function TikTokAutoPost() {
   // ── Row functions ──────────────────────────────────────────────────────────
   const addRow = () => {
     const rowId = genId();
-    const updated = [...rows, { rowId, accountId: '', videoPath: '', product: null, caption: '' }];
+    const updated = [...rows, { rowId, accountId: '', videoPath: '', product: null, caption: '', noProduct: false }];
     setRows(updated); saveRows(updated); setFocusedRowId(rowId);
   };
 
@@ -187,6 +203,80 @@ export default function TikTokAutoPost() {
     const ready = rows.filter(r => r.videoPath && r.accountId && rowStatus[r.rowId] !== 'posting');
     await Promise.all(ready.map(r => postRow(r)));
   };
+
+  // ── Reup (Phim) functions ─────────────────────────────────────────────────
+  const loadReupFolder = async () => {
+    const folder = await api?.selectFolder?.();
+    if (!folder) return;
+    setReupFolder(folder);
+    localStorage.setItem('tiktok_reup_folder', folder);
+    const res = await api?.listFiles?.(folder);
+    if (res?.success) {
+      const vids = res.files
+        .filter(f => /\.(mp4|mov|avi|mkv)$/i.test(f))
+        .sort()
+        .map((f, i) => ({
+          id: genId(),
+          path: f,
+          name: f.replace(/^.*[/\\]/, '').replace(/\.[^.]+$/, ''),
+          ep: i + 1,
+        }));
+      setReupVideos(vids);
+      setReupVidStatus({});
+      setReupVidLog({});
+      localStorage.setItem('tiktok_reup_videos', JSON.stringify(vids));
+      addLog(`📂 Đã tải ${vids.length} video từ "${folder.split(/[/\\]/).pop()}"`);
+    }
+  };
+
+  const postReupVideo = useCallback(async (vid) => {
+    if (!reupAccountId) return;
+    const accName = accounts.find(a => a.id === reupAccountId)?.name || reupAccountId;
+    setReupVidStatus(p => ({ ...p, [vid.id]: 'posting' }));
+    setReupVidLog(p => ({ ...p, [vid.id]: '⏳ Đang upload...' }));
+    addLog(`▶ [Reup] "${vid.name}" → kênh "${accName}"`, reupAccountId);
+    const caption = (reupCaptionTpl || '')
+      .replace(/\{title\}/g, vid.name)
+      .replace(/\{ep\}/g, String(vid.ep || ''));
+    const r = await api?.tiktokPostVideo?.({
+      videoPath: vid.path,
+      caption,
+      product: null,
+      profileId: reupAccountId,
+    }).catch(e => ({ ok: false, error: e.message }));
+    const msg = r?.ok ? '✅ Đã đăng!' : `❌ ${r?.error || 'Lỗi'}`;
+    setReupVidStatus(p => ({ ...p, [vid.id]: r?.ok ? 'done' : 'error' }));
+    setReupVidLog(p => ({ ...p, [vid.id]: msg }));
+    addLog(`[Reup] ${vid.name}: ${msg}`, reupAccountId);
+  }, [reupAccountId, reupCaptionTpl, accounts, addLog]);
+
+  const postAllReup = async () => {
+    const pending = reupVideosRef.current.filter(v => reupVidStatus[v.id] !== 'posting');
+    for (const v of pending) { await postReupVideo(v); }
+  };
+
+  const toggleReupSchedule = useCallback(() => {
+    if (reupSchedRef.current) {
+      clearInterval(reupSchedRef.current); reupSchedRef.current = null;
+      setReupSchedOn(false); addLog('⏹ [Reup] Tắt lịch tự động'); return;
+    }
+    if (!reupSchedTime) { addLog('❌ [Reup] Chưa đặt giờ đăng'); return; }
+    setReupSchedOn(true);
+    addLog(`✅ [Reup] Lịch đang chạy — sẽ đăng lần lượt từng video lúc ${reupSchedTime}`);
+    let videoQueue = [...reupVideosRef.current];
+    reupSchedRef.current = setInterval(() => {
+      const now = new Date();
+      const hhmm = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+      const dateKey = now.toDateString();
+      if (hhmm !== reupSchedTime) return;
+      // Find next unposted video
+      const next = videoQueue.find(v => reupVidStatus[v.id] !== 'done' && lastReupFired.current[v.id] !== dateKey);
+      if (!next) { addLog('✅ [Reup] Đã đăng hết tất cả video trong lịch'); clearInterval(reupSchedRef.current); reupSchedRef.current = null; setReupSchedOn(false); return; }
+      lastReupFired.current[next.id] = dateKey;
+      addLog(`⏰ ${hhmm} — [Reup] Đăng: ${next.name}`);
+      postReupVideo(next);
+    }, 15000);
+  }, [reupSchedTime, postReupVideo, addLog]);
 
   // Reload products when switching account
   useEffect(() => {
@@ -266,7 +356,8 @@ export default function TikTokAutoPost() {
   const focusedAccName = accounts.find(a => a.id === focusedRow?.accountId)?.name;
 
   const TABS = [
-    { id: 'plan',     label: '🗂 Kế hoạch' },
+    { id: 'plan',     label: '🗂 Affiliate' },
+    { id: 'reup',     label: '📽 Phim Reup' },
     { id: 'accounts', label: `👤 Kênh (${accounts.length})` },
     { id: 'auto',     label: '⏰ Tự động' },
     { id: 'guide',    label: '📖 Hướng dẫn' },
@@ -280,7 +371,7 @@ export default function TikTokAutoPost() {
           style={{ background: 'linear-gradient(135deg,#010101,#fe2c55)' }}>🎵</div>
         <div>
           <div className="font-bold text-sm">TikTok Auto Post</div>
-          <div className="text-xs text-slate-400">{accounts.length} kênh · mỗi kênh 1 video + 1 sản phẩm affiliate riêng</div>
+          <div className="text-xs text-slate-400">{accounts.length} kênh · Affiliate (sản phẩm) hoặc Phim Reup (không affiliate)</div>
         </div>
         <button onClick={() => accounts.forEach(acc => checkOne(acc.id))}
           className="ml-auto px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-xs flex items-center gap-1">
@@ -381,8 +472,19 @@ export default function TikTokAutoPost() {
                           </button>
                         </div>
 
+                        {/* Toggle affiliate */}
+                        <div className="flex items-center gap-2 mb-2" onClick={e => e.stopPropagation()}>
+                          <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                            <input type="checkbox" checked={!row.noProduct}
+                              onChange={e => updateRow(row.rowId, { noProduct: !e.target.checked, product: e.target.checked ? row.product : null })}
+                              className="accent-pink-500 w-3 h-3 cursor-pointer"/>
+                            <span className="text-xs text-slate-400">Gắn sản phẩm Affiliate</span>
+                          </label>
+                          {row.noProduct && <span className="text-xs text-slate-600 italic">• Đăng không affiliate</span>}
+                        </div>
+
                         {/* Assigned product chip */}
-                        <div className="mb-2 min-h-[26px] flex items-center">
+                        <div className={`mb-2 min-h-[26px] flex items-center ${row.noProduct ? 'hidden' : ''}`}>
                           {row.product ? (
                             <div className="flex items-center gap-1.5 bg-emerald-900/25 border border-emerald-700/40 rounded-md px-2 py-1 flex-1 min-w-0">
                               {row.product.img
@@ -401,8 +503,8 @@ export default function TikTokAutoPost() {
                           )}
                         </div>
 
-                        {/* Product display name (only when product is assigned) */}
-                        {row.product && (
+                        {/* Product display name (only when product is assigned and affiliate on) */}
+                        {row.product && !row.noProduct && (
                           <div className="mb-2">
                             <div className="flex items-center gap-1 mb-0.5">
                               <span className="text-xs text-slate-500">Tên trên video</span>
@@ -715,6 +817,96 @@ export default function TikTokAutoPost() {
                 </div>
               </div>
 
+            </div>
+          </div>
+        )}
+
+        {/* ═══════════════════ PHIM REUP ═══════════════════ */}
+        {activeTab === 'reup' && (
+          <div className="flex flex-col h-full">
+            {/* Controls bar */}
+            <div className="flex-shrink-0 border-b border-slate-800 px-3 py-2 bg-slate-950 space-y-2">
+              {/* Row 1: folder + account */}
+              <div className="flex items-center gap-2">
+                <button onClick={loadReupFolder}
+                  className="px-2 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs flex items-center gap-1 shrink-0">
+                  <FolderOpen size={12}/> Chọn thư mục
+                </button>
+                <div className="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-slate-400 truncate min-w-0">
+                  {reupFolder ? reupFolder : <span className="text-slate-600">Chưa chọn thư mục...</span>}
+                </div>
+                <select value={reupAccountId}
+                  onChange={e => { setReupAccountId(e.target.value); localStorage.setItem('tiktok_reup_account', e.target.value); }}
+                  className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-white shrink-0 cursor-pointer">
+                  <option value="">-- Chọn kênh --</option>
+                  {accounts.map(a => <option key={a.id} value={a.id}>{a.name}{statuses[a.id] === 'ok' ? ' ✓' : ''}</option>)}
+                </select>
+              </div>
+              {/* Row 2: caption template */}
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-500 shrink-0">Caption:</span>
+                <input value={reupCaptionTpl}
+                  onChange={e => { setReupCaptionTpl(e.target.value); localStorage.setItem('tiktok_reup_caption', e.target.value); }}
+                  placeholder="Template caption... dùng {title} cho tên video, {ep} cho số tập"
+                  className="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-white placeholder-slate-600 outline-none focus:border-pink-600"/>
+              </div>
+              {/* Row 3: schedule + action buttons */}
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-500 shrink-0">⏰ Đăng lúc:</span>
+                <input type="time" value={reupSchedTime}
+                  onChange={e => { setReupSchedTime(e.target.value); localStorage.setItem('tiktok_reup_sched', e.target.value); }}
+                  className="bg-slate-800 border border-slate-700 rounded px-2 py-0.5 text-xs text-white outline-none cursor-pointer"/>
+                <button onClick={toggleReupSchedule} disabled={!reupAccountId || !reupVideos.length}
+                  className={`px-2 py-1 rounded text-xs font-bold text-white disabled:opacity-40 transition-colors ${reupSchedOn ? 'bg-red-700 hover:bg-red-600' : 'bg-amber-700 hover:bg-amber-600'}`}>
+                  {reupSchedOn ? '⏹ Tắt lịch' : '⏰ Bật lịch'}
+                </button>
+                <div className="flex-1"/>
+                <span className="text-xs text-slate-500">{reupVideos.length} video</span>
+                <button onClick={postAllReup} disabled={!reupAccountId || !reupVideos.length}
+                  className="px-3 py-1 bg-pink-700 hover:bg-pink-600 disabled:opacity-40 rounded text-xs font-bold text-white">
+                  ▶ Đăng tất cả
+                </button>
+              </div>
+            </div>
+
+            {/* Video list */}
+            <div className="flex-1 overflow-y-auto min-h-0">
+              {reupVideos.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full text-slate-600 gap-3">
+                  <div className="text-5xl">🎬</div>
+                  <div className="text-sm">Chưa có video nào</div>
+                  <div className="text-xs text-center px-8 leading-relaxed">
+                    Click <strong className="text-slate-400">Chọn thư mục</strong> để load danh sách video phim reup.<br/>
+                    Hỗ trợ: mp4, mov, avi, mkv
+                  </div>
+                </div>
+              ) : (
+                reupVideos.map((vid, idx) => {
+                  const st  = reupVidStatus[vid.id];
+                  const log = reupVidLog[vid.id] || '';
+                  return (
+                    <div key={vid.id} className="flex items-center gap-2 px-3 py-2 border-b border-slate-800 hover:bg-slate-900/40">
+                      <span className="text-xs text-slate-600 font-mono w-6 text-right shrink-0">{idx + 1}</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-xs text-white truncate font-medium">{vid.name}</div>
+                        {log && (
+                          <div className={`text-xs mt-0.5 truncate ${log.startsWith('✅') ? 'text-green-400' : log.startsWith('❌') ? 'text-red-400' : 'text-slate-500'}`}>
+                            {log}
+                          </div>
+                        )}
+                      </div>
+                      <button onClick={() => postReupVideo(vid)}
+                        disabled={!reupAccountId || st === 'posting'}
+                        className={`px-2.5 py-1 rounded text-xs font-bold text-white shrink-0 disabled:opacity-40 transition-colors
+                          ${st === 'done' ? 'bg-green-800' : st === 'error' ? 'bg-red-800 hover:bg-red-700' : 'bg-pink-800 hover:bg-pink-700'}`}>
+                        {st === 'posting'
+                          ? <Loader2 size={10} className="animate-spin"/>
+                          : st === 'done' ? '✅' : st === 'error' ? '🔁' : '📤'}
+                      </button>
+                    </div>
+                  );
+                })
+              )}
             </div>
           </div>
         )}

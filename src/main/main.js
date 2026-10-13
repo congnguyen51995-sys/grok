@@ -4073,9 +4073,16 @@ mwIDAQAB
 
     const adjustTempo = (inp, out, tempo) => new Promise((res, rej) => {
       const filters = [];
-      let t = Math.min(tempo, 4.0);
-      while (t > 2.0) { filters.push('atempo=2.0'); t /= 2.0; }
-      if (t > 1.0) filters.push(`atempo=${t.toFixed(4)}`);
+      let t = Math.max(Math.min(tempo, 4.0), 0.25);
+      if (t < 1.0) {
+        // Slow down: atempo min is 0.5, chain if needed
+        while (t < 0.5) { filters.push('atempo=0.5'); t /= 0.5; }
+        filters.push(`atempo=${t.toFixed(4)}`);
+      } else {
+        // Speed up
+        while (t > 2.0) { filters.push('atempo=2.0'); t /= 2.0; }
+        if (t > 1.0) filters.push(`atempo=${t.toFixed(4)}`);
+      }
       const af = filters.length ? filters.join(',') : 'anull';
       execFile(ffmpegBin, ['-y', '-i', inp, '-af', af, '-ar', '44100', '-ac', '1', out], { timeout: 60000 },
         err => err ? rej(err) : res());
@@ -4115,9 +4122,16 @@ mwIDAQAB
           let finalWav = tmpWav;
           try {
             const dur = await getAudioDur(tmpWav);
-            if (dur > segDur * 1.12) {
+            const rawTempo = dur / segDur;
+            // Clamp to audible range: slow down max 0.75x, speed up max 2.5x
+            // Outside that range leave as-is (segment too long/short to scale sensibly)
+            const tempoMin = 0.75, tempoMax = 2.5;
+            if (rawTempo > tempoMax || rawTempo < tempoMin) {
+              // Don't adjust — too extreme, let it play naturally
+            } else if (Math.abs(rawTempo - 1.0) > 0.03) {
+              // >3% diff → scale to fill the slot exactly
               const adjWav = path.join(tmpDir, `s${i}_adj.wav`);
-              await adjustTempo(tmpWav, adjWav, dur / segDur);
+              await adjustTempo(tmpWav, adjWav, rawTempo);
               try { fs.unlinkSync(tmpWav); } catch {}
               finalWav = adjWav;
             }

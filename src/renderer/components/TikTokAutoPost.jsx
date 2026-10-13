@@ -214,7 +214,7 @@ export default function TikTokAutoPost() {
     if (res?.success) {
       const vids = res.files
         .filter(f => /\.(mp4|mov|avi|mkv)$/i.test(f))
-        .sort()
+        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
         .map((f, i) => ({
           id: genId(),
           path: f,

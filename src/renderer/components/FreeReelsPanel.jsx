@@ -60,6 +60,26 @@ function validateSubtitles(segs, addLog) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const GEMINI_MODELS = ['gemini-3.5-flash', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite'];
+
+// Tab name mapping (English/Chinese → Vietnamese)
+const TAB_NAME_VI = {
+  'For You':'Cho Bạn','Recommended':'Đề Xuất','Romance':'Tình Cảm','Love':'Tình Yêu',
+  'Action':'Hành Động','Drama':'Chính Kịch','Comedy':'Hài Hước','New':'Mới Nhất',
+  'Hot':'Nổi Bật','Trending':'Xu Hướng','Thriller':'Hồi Hộp','Fantasy':'Huyền Ảo',
+  'Historical':'Cổ Trang','Suspense':'Ly Kỳ','Crime':'Tội Phạm','Horror':'Kinh Dị',
+  'Family':'Gia Đình','Youth':'Tuổi Trẻ','Business':'Doanh Nhân','Revenge':'Báo Thù',
+  'Sweet':'Ngọt Ngào','CEO':'Tổng Tài','Campus':'Học Đường',
+  '为你':'Cho Bạn','推荐':'Đề Xuất','爱情':'Tình Cảm','都市':'Đô Thị',
+  '古装':'Cổ Trang','悬疑':'Huyền Bí','喜剧':'Hài Hước','动作':'Hành Động',
+  '最新':'Mới Nhất','热门':'Nổi Bật','甜宠':'Ngọt Sủng','霸总':'Bá Chủ',
+  '校园':'Học Đường','家庭':'Gia Đình','青春':'Tuổi Trẻ','犯罪':'Tội Phạm',
+};
+const viTabName = (name) => TAB_NAME_VI[name?.trim()] || name;
+
+// Cache drama title translations in localStorage
+const TITLE_CACHE_KEY = 'fr_title_vi_cache';
+const loadTitleCache = () => { try { return JSON.parse(localStorage.getItem(TITLE_CACHE_KEY) || '{}'); } catch { return {}; } };
+const saveTitleCache = (cache) => { try { localStorage.setItem(TITLE_CACHE_KEY, JSON.stringify(cache)); } catch {} };
 const GEMINI_TTS_VOICES = ['Charon', 'Kore', 'Puck', 'Aoede', 'Fenrir'];
 
 const CAPCUT_VI_VOICES = [
@@ -269,6 +289,44 @@ export default function FreeReelsPanel() {
     });
   };
 
+  // Title translation cache (drama id → Vietnamese title)
+  const [titleCache, setTitleCache] = useState(() => loadTitleCache());
+
+  // Batch-translate drama titles via Gemini for titles not yet in cache
+  const translateDramaTitles = async (list) => {
+    const geminiKeys = (() => { try { return JSON.parse(localStorage.getItem('fluxy_gemini_api_keys') || '[]'); } catch { return []; } })();
+    if (!geminiKeys.length) return;
+    const cache = loadTitleCache();
+    const needTrans = list.filter(d => d.id && !cache[d.id]);
+    if (!needTrans.length) return;
+    // Build prompt: id|title pairs, one per line
+    const lines = needTrans.map(d => `${d.id}|${d.title}`).join('\n');
+    const prompt = `Dịch các tên phim ngắn sau sang tiếng Việt (tự nhiên, không dịch nghĩa đen cứng nhắc).
+Trả về đúng định dạng: id|tên tiếng Việt — mỗi dòng 1 phim, không giải thích thêm.
+${lines}`;
+    try {
+      const gKey = geminiKeys[0];
+      const model = localStorage.getItem('fr_gemModel') || GEMINI_MODELS[0];
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${gKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 1024 } }),
+      });
+      const j = await r.json();
+      const txt = j?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const updated = { ...cache };
+      txt.split('\n').forEach(line => {
+        const sep = line.indexOf('|');
+        if (sep < 1) return;
+        const id = line.slice(0, sep).trim();
+        const vi = line.slice(sep + 1).trim();
+        if (id && vi) updated[id] = vi;
+      });
+      saveTitleCache(updated);
+      setTitleCache({ ...updated });
+    } catch {}
+  };
+
   // Browse state
   const [dramas,      setDramas]      = useState([]);
   const [apiTabs,     setApiTabs]     = useState([]);       // from tab/list
@@ -452,6 +510,7 @@ export default function FreeReelsPanel() {
       const items = extractDramaList(r?.data);
       setDramas(items);
       if (!items.length) setBrowseError('Không có dữ liệu từ API — xem raw response bên dưới');
+      translateDramaTitles(items);
     } catch (e) {
       setBrowseError(e.message);
     } finally {
@@ -481,6 +540,7 @@ export default function FreeReelsPanel() {
         const ids = new Set(prev.map(d => d.id));
         return [...prev, ...normalized.filter(d => !ids.has(d.id))];
       });
+      translateDramaTitles(normalized);
       addLog(`📄 Tải thêm: +${normalized.length} phim (tổng ${dramas.length + normalized.length})`);
     } catch (e) {
       addLog('❌ Tải thêm thất bại: ' + e.message);
@@ -553,6 +613,7 @@ export default function FreeReelsPanel() {
       const items = extractDramaList(r?.data);
       setDramas(items);
       if (!items.length) setBrowseError('Không tìm thấy kết quả');
+      translateDramaTitles(items);
     } catch (e) {
       setBrowseError(e.message);
     } finally {
@@ -1816,7 +1877,7 @@ ${flaggedList}`;
                   {apiTabs.length > 0 ? apiTabs.map(t => (
                     <button key={t.tab_key} onClick={() => switchApiTab(t)}
                       className={`flex-shrink-0 px-3 py-1.5 rounded-lg text-[11px] font-bold transition ${activeTabKey === t.tab_key ? 'bg-rose-700 text-white' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}`}>
-                      {t.name}
+                      {viTabName(t.name)}
                     </button>
                   )) : (
                     <button onClick={() => loadHome()}
@@ -1865,7 +1926,7 @@ ${flaggedList}`;
                   <>
                     <div className="grid grid-cols-4 gap-1.5">
                       {dramas.map((d, i) => (
-                        <DramaCard key={d.id || i} drama={d} onSelect={selectDrama}
+                        <DramaCard key={d.id || i} drama={{ ...d, title: titleCache[d.id] || d.title }} onSelect={selectDrama}
                           isDone={doneDramas.has(d.id)}
                           onToggleDone={toggleDoneDrama}
                           onQueueEp1={(drama) => {
@@ -1913,7 +1974,7 @@ ${flaggedList}`;
                         <img src={selectedDrama.cover} alt="" className="w-10 h-14 object-cover rounded flex-shrink-0" referrerPolicy="no-referrer" />
                       )}
                       <div className="flex-1 min-w-0">
-                        <div className="text-[11px] font-bold text-white line-clamp-2">{selectedDrama.title}</div>
+                        <div className="text-[11px] font-bold text-white line-clamp-2">{titleCache[selectedDrama.id] || selectedDrama.title}</div>
                         <div className="text-[9px] text-slate-500 mt-0.5">{selectedDrama.episode_count} tập</div>
                       </div>
                       <div className="flex flex-col gap-1 flex-shrink-0">

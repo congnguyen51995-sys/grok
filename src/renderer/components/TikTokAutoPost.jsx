@@ -229,12 +229,13 @@ export default function TikTokAutoPost() {
     }
   };
 
-  const postReupVideo = useCallback(async (vid) => {
+  const postReupVideo = useCallback(async (vid, scheduledAt = null) => {
     if (!reupAccountId) return;
     const accName = accounts.find(a => a.id === reupAccountId)?.name || reupAccountId;
     setReupVidStatus(p => ({ ...p, [vid.id]: 'posting' }));
-    setReupVidLog(p => ({ ...p, [vid.id]: '⏳ Đang upload...' }));
-    addLog(`▶ [Reup] "${vid.name}" → kênh "${accName}"`, reupAccountId);
+    const schedLabel = scheduledAt ? ` (lên lịch ${new Date(scheduledAt).toLocaleString('vi-VN', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })})` : '';
+    setReupVidLog(p => ({ ...p, [vid.id]: `⏳ Đang upload${schedLabel}...` }));
+    addLog(`▶ [Reup] "${vid.name}" → kênh "${accName}"${schedLabel}`, reupAccountId);
     const caption = (reupCaptionTpl || '')
       .replace(/\{title\}/g, vid.name)
       .replace(/\{ep\}/g, String(vid.ep || ''));
@@ -243,8 +244,9 @@ export default function TikTokAutoPost() {
       caption,
       product: null,
       profileId: reupAccountId,
+      scheduledAt: scheduledAt || undefined,
     }).catch(e => ({ ok: false, error: e.message }));
-    const msg = r?.ok ? '✅ Đã đăng!' : `❌ ${r?.error || 'Lỗi'}`;
+    const msg = r?.ok ? (scheduledAt ? '⏰ Đã lên lịch!' : '✅ Đã đăng!') : `❌ ${r?.error || 'Lỗi'}`;
     setReupVidStatus(p => ({ ...p, [vid.id]: r?.ok ? 'done' : 'error' }));
     setReupVidLog(p => ({ ...p, [vid.id]: msg }));
     addLog(`[Reup] ${vid.name}: ${msg}`, reupAccountId);
@@ -253,6 +255,37 @@ export default function TikTokAutoPost() {
   const postAllReup = async () => {
     const pending = reupVideosRef.current.filter(v => reupVidStatus[v.id] !== 'posting');
     for (const v of pending) { await postReupVideo(v); }
+  };
+
+  // Upload all + set TikTok native schedule
+  const postAllReupWithSchedule = async () => {
+    if (!reupSchedTimes.length) { addLog('❌ [Reup] Chưa đặt giờ đăng'); return; }
+    const vids = reupVideosRef.current.filter(v => reupVidStatus[v.id] !== 'done');
+    if (!vids.length) { addLog('⚠️ [Reup] Không có video nào cần đăng'); return; }
+    // Sort time slots
+    const slots = [...reupSchedTimes].sort();
+    // Start from next available slot (or tomorrow first slot if all today's slots passed)
+    const now = new Date();
+    const todayHHMM = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+    // Calculate ISO timestamp for each video
+    const schedTimes = vids.map((_, idx) => {
+      const slotIdx = idx % slots.length;
+      const dayOffset = Math.floor(idx / slots.length);
+      const [hh, mmStr] = slots[slotIdx].split(':');
+      const d = new Date(now);
+      d.setDate(d.getDate() + dayOffset);
+      d.setHours(parseInt(hh), parseInt(mmStr), 0, 0);
+      // If today's slot already passed, push to next day
+      if (dayOffset === 0 && slots[slotIdx] <= todayHHMM) {
+        d.setDate(d.getDate() + Math.ceil(slots.length / slots.length));
+      }
+      return d.toISOString();
+    });
+    addLog(`📅 [Reup] Lên lịch ${vids.length} video — từ ${new Date(schedTimes[0]).toLocaleString('vi-VN')} đến ${new Date(schedTimes[schedTimes.length-1]).toLocaleString('vi-VN')}`);
+    for (let i = 0; i < vids.length; i++) {
+      await postReupVideo(vids[i], schedTimes[i]);
+    }
+    addLog('✅ [Reup] Hoàn tất upload + lên lịch trên TikTok!');
   };
 
   const toggleReupSchedule = useCallback(() => {
@@ -882,11 +915,17 @@ export default function TikTokAutoPost() {
                   {reupSchedOn ? '⏹ Tắt lịch' : '⏰ Bật lịch'}
                 </button>
               </div>
-              {/* Row 4: video count + post all */}
+              {/* Row 4: video count + action buttons */}
               <div className="flex items-center gap-2">
                 <div className="flex-1"/>
                 <span className="text-xs text-slate-500">{reupVideos.length} video</span>
+                <button onClick={postAllReupWithSchedule} disabled={!reupAccountId || !reupVideos.length || !reupSchedTimes.length}
+                  title="Upload tất cả + đặt lịch trực tiếp trên TikTok (không cần giữ app)"
+                  className="px-3 py-1 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-40 rounded text-xs font-bold text-white">
+                  📅 Upload + Lên lịch
+                </button>
                 <button onClick={postAllReup} disabled={!reupAccountId || !reupVideos.length}
+                  title="Đăng ngay lập tức (không lên lịch)"
                   className="px-3 py-1 bg-pink-700 hover:bg-pink-600 disabled:opacity-40 rounded text-xs font-bold text-white">
                   ▶ Đăng tất cả
                 </button>

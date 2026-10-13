@@ -12146,12 +12146,12 @@ ipcMain.handle('tiktok:check-login', async (_e, { profileId } = {}) => {
   } catch (e) { return { ok: false, loggedIn: false, error: e.message }; }
 });
 
-ipcMain.handle('tiktok:post-video', async (_e, { videoPath, caption, product, profileId }) => {
+ipcMain.handle('tiktok:post-video', async (_e, { videoPath, caption, product, profileId, scheduledAt }) => {
   try {
     const { postToTikTok } = require('./services/tiktok-playwright');
     const onLog      = (msg) => mainWindow?.webContents?.send('tiktok:log', { profileId, msg });
     const onProgress = (pct) => mainWindow?.webContents?.send('tiktok:progress', { profileId, pct });
-    return await postToTikTok({ videoPath, caption, product, profileDir: ttProfileDir(profileId), headless: true, onLog, onProgress });
+    return await postToTikTok({ videoPath, caption, product, scheduledAt, profileDir: ttProfileDir(profileId), headless: true, onLog, onProgress });
   } catch (e) { return { ok: false, error: e.message }; }
 });
 

@@ -728,7 +728,7 @@ async function tagProduct(page, product, onLog) {
  * If product is given (object with id + title) → auto-tag in upload editor.
  * headless=true runs hidden.
  */
-async function postToTikTok({ videoPath, caption, profileDir, product, productName, headless = true, onLog, onProgress }) {
+async function postToTikTok({ videoPath, caption, profileDir, product, productName, scheduledAt, headless = true, onLog, onProgress }) {
   // Support both `product` (object) and legacy `productName` (string)
   const prod = product || (productName ? { id: '', title: productName } : null);
 
@@ -883,6 +883,84 @@ async function postToTikTok({ videoPath, caption, profileDir, product, productNa
         onLog?.('  ⚠️ Không tìm thấy nút quyền riêng tư — giữ nguyên mặc định');
       }
     } catch (e) { onLog?.(`  ⚠️ Privacy: ${e.message}`); }
+
+    // Schedule if scheduledAt provided (ISO string)
+    if (scheduledAt) {
+      const schedDate = new Date(scheduledAt);
+      const hh = String(schedDate.getHours()).padStart(2, '0');
+      const mm = String(schedDate.getMinutes()).padStart(2, '0');
+      const yyyy = schedDate.getFullYear();
+      const mo   = String(schedDate.getMonth() + 1).padStart(2, '0');
+      const dd   = String(schedDate.getDate()).padStart(2, '0');
+      onLog?.(`⏰ Đặt lịch: ${dd}/${mo}/${yyyy} ${hh}:${mm}`);
+      try {
+        // Click "Lên lịch" radio
+        await page.evaluate(() => {
+          const labels = [...document.querySelectorAll('label, span, div')];
+          const lbl = labels.find(el => {
+            const t = (el.textContent || '').trim();
+            return t === 'Lên lịch' || t === 'Schedule' || t === 'Scheduled';
+          });
+          if (lbl) { lbl.click(); return; }
+          // fallback: find radio with sibling text
+          const radios = [...document.querySelectorAll('input[type="radio"]')];
+          if (radios[1]) radios[1].click();
+        });
+        await sleep(800);
+
+        // Fill time (HH:MM)
+        const timeSet = await page.evaluate((hhmm) => {
+          const inputs = [...document.querySelectorAll('input[type="time"], input[placeholder*=":"]')];
+          if (inputs.length) {
+            const inp = inputs[0];
+            inp.value = hhmm;
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+          }
+          return false;
+        }, `${hh}:${mm}`);
+        if (!timeSet) {
+          // TikTok may use a custom time picker — try clicking the displayed time box and typing
+          try {
+            const timeBox = await page.$('[class*="time"], [class*="Time"]');
+            if (timeBox) {
+              await timeBox.click();
+              await sleep(400);
+              await page.keyboard.selectAll?.();
+              await page.keyboard.type(`${hh}${mm}`);
+            }
+          } catch {}
+        }
+        await sleep(400);
+
+        // Fill date (YYYY-MM-DD)
+        const dateSet = await page.evaluate((ymd) => {
+          const inputs = [...document.querySelectorAll('input[type="date"], input[placeholder*="-"]')];
+          if (inputs.length) {
+            const inp = inputs[0];
+            inp.value = ymd;
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+          }
+          return false;
+        }, `${yyyy}-${mo}-${dd}`);
+        if (!dateSet) {
+          // TikTok may use a custom date picker — click the date display and type
+          try {
+            const dateBox = await page.$('[class*="date"], [class*="Date"]');
+            if (dateBox) {
+              await dateBox.click();
+              await sleep(400);
+              await page.keyboard.type(`${dd}/${mo}/${yyyy}`);
+            }
+          } catch {}
+        }
+        await sleep(600);
+        onLog?.('✅ Đã chọn lên lịch');
+      } catch (e) { onLog?.(`⚠️ Lên lịch: ${e.message}`); }
+    }
 
     // Scroll all the way to bottom where "Đăng" button lives
     onLog?.('⏳ Cuộn xuống nút Đăng...');

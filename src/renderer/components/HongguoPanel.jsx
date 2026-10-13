@@ -701,10 +701,11 @@ function DetailView({ seriesId, onBack }) {
 
     if (uploadRes?.ok) {
       const fullScript = segments.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
-      const isFirstEp  = !charContextSaved.trim();
-      const charSection = isFirstEp
-        ? `\nSau khi xem video, điền phần NHÂN VẬT bên dưới rồi mới dịch.`
-        : `\n=== QUY TẮC XƯNG HÔ TỪ TẬP 1 ===\n${charContextSaved}\n=== HẾT QUY TẮC ===`;
+      const hasContext = !!charContextSaved.trim();
+      // Luôn yêu cầu phân tích nhân vật — pass context cũ làm base, Gemini bổ sung nhân vật MỚI
+      const charSection = hasContext
+        ? `\n=== QUY TẮC XƯNG HÔ ĐÃ TÍCH LŨY ===\n${charContextSaved}\n=== HẾT QUY TẮC ===\n\nNếu tập này có NHÂN VẬT MỚI chưa có trong quy tắc trên, hãy bổ sung vào phần NHÂN VẬT. Giữ nguyên nhân vật cũ.`
+        : `\nXem video, phân tích nhân vật và điền phần NHÂN VẬT bên dưới.`;
 
       const videoPrompt = `Bạn là chuyên gia dịch phim ngắn Trung Quốc sang tiếng Việt.
 Hãy XEM video (hình ảnh + âm thanh) để biết nhân vật nào đang nói câu nào, rồi thực hiện 3 nhiệm vụ.
@@ -713,8 +714,12 @@ ${charSection}
 TOÀN BỘ THOẠI GỐC (${segments.length} dòng):
 ${fullScript}
 
-=== NHIỆM VỤ 1: PHÂN TÍCH NHÂN VẬT ===
-${isFirstEp ? `THỂ LOẠI: ...\nNHÂN VẬT:\n- [Tên]: [giới tính] | [vai vế] | [giọng]\nBẢNG XƯNG HÔ:\n- [A] → [B]: xưng "[từ]", gọi "[từ]"` : '(Đã có từ tập 1, giữ nguyên)'}
+=== NHIỆM VỤ 1: NHÂN VẬT (giữ cũ + bổ sung mới) ===
+THỂ LOẠI: ...
+NHÂN VẬT:
+- [Tên]: [giới tính] | [vai vế]
+BẢNG XƯNG HÔ:
+- [A] → [B]: xưng "[từ]", gọi "[từ]"
 
 === NHIỆM VỤ 2: MỐC THỜI GIAN ===
 Mỗi câu bắt đầu tại giây thứ mấy? Định dạng: "N → giây"
@@ -727,7 +732,7 @@ NGHIÊM CẤM đổi xưng hô. Không bỏ sót dòng.
 
 Trả về ĐÚNG FORMAT (không thêm markdown):
 === NHÂN VẬT ===
-[phân tích nhân vật]
+[phân tích nhân vật — đầy đủ cả cũ lẫn mới]
 === HẾT NHÂN VẬT ===
 
 === THỜI GIAN BẮT ĐẦU ===
@@ -743,7 +748,8 @@ Trả về ĐÚNG FORMAT (không thêm markdown):
       const videoResp = await callGeminiWithVideo(uploadRes.uri, uploadRes.mimeType, videoPrompt, 16384);
       if (videoResp) {
         const charMatch = videoResp.match(/=== NHÂN VẬT ===([\s\S]*?)=== HẾT NHÂN VẬT ===/);
-        if (charMatch && isFirstEp) { charContext = charMatch[1].trim(); setCharContextSaved(charContext); }
+        // Luôn cập nhật context (merge cũ + mới từ tập này)
+        if (charMatch) { charContext = charMatch[1].trim(); setCharContextSaved(charContext); }
         const transMatch = videoResp.match(/=== BẢN DỊCH ===([\s\S]*?)=== HẾT DỊCH ===/);
         const transText  = transMatch?.[1] || videoResp;
         const lineMap    = new Map();
@@ -774,11 +780,14 @@ Trả về ĐÚNG FORMAT (không thêm markdown):
 
     // Fallback dịch batch text-only nếu video thất bại hoặc thiếu dòng
     if (viSegments.length < segments.length * 0.7) {
-      if (!charContext) {
+      // Luôn phân tích nhân vật tập này để merge với context cũ
+      {
         const fullScript2 = segments.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
-        const analyzePrompt = `Đọc kịch bản phim ngắn Trung Quốc, tạo quy tắc xưng hô tiếng Việt.\nKỊCH BẢN:\n${fullScript2}\n\nTrả về:\nTHỂ LOẠI: ...\nNHÂN VẬT:\n- [Tên]: [giới tính] | [vai vế]\nBẢNG XƯNG HÔ:\n- [A] → [B]: xưng "[từ]", gọi "[từ]"`;
-        charContext = await callGemini(analyzePrompt, 1024) || 'Dịch tự nhiên, nhất quán xưng hô.';
-        setCharContextSaved(charContext);
+        const baseCtx = charContext ? `\n\nQUY TẮC CŨ:\n${charContext}\nBổ sung nhân vật mới nếu có.` : '';
+        const analyzePrompt = `Đọc kịch bản phim ngắn Trung Quốc, tạo quy tắc xưng hô tiếng Việt (giữ nhân vật cũ, thêm mới nếu có).${baseCtx}\nKỊCH BẢN:\n${fullScript2}\n\nTrả về:\nTHỂ LOẠI: ...\nNHÂN VẬT:\n- [Tên]: [giới tính] | [vai vế]\nBẢNG XƯNG HÔ:\n- [A] → [B]: xưng "[từ]", gọi "[từ]"`;
+        const analyzed = await callGemini(analyzePrompt, 1024);
+        if (analyzed) { charContext = analyzed; setCharContextSaved(analyzed); }
+        if (!charContext) charContext = 'Dịch tự nhiên, nhất quán xưng hô.';
       }
       viSegments = [];
       const BATCH = 60;

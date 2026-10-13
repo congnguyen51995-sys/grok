@@ -314,6 +314,7 @@ export default function FreeReelsPanel() {
   // ───────────────────────
   const [geminiModel, setGeminiModel] = useState(() => localStorage.getItem('fr_gemModel') || GEMINI_MODELS[0]);
   const [srcLang,        setSrcLang]        = useState('auto');
+  const [whisperEngine,  setWhisperEngine]  = useState(() => localStorage.getItem('fr_whisperEngine') || 'auto');
   const [charContextSaved, setCharContextSaved] = useState(() => localStorage.getItem('fr_charContext') || '');
 
   const keyIdxRef      = useRef(0);
@@ -734,29 +735,18 @@ export default function FreeReelsPanel() {
         }
       }
 
-      // ② Transcribe bằng local faster-whisper (timestamp chính xác)
-      setStep(id, 'transcribing', 'Nhận dạng audio (local Whisper)...');
-      let segments = [];
-      let localWhisperOk = false; // true → bỏ qua Gemini timing (tránh overlap)
+      // ② Transcribe — engine: 'local' | 'groq' | 'auto' (local trước, groq fallback)
       const durRes   = await api.getVideoDuration?.({ path: videoToTranscribe }).catch(() => null);
       const videoDur = durRes?.duration || 0;
-      addLog(`📹 Thời lượng: ${videoDur || '?'}s — bắt đầu nhận dạng local Whisper...`);
+      const langOpt  = srcLang === 'auto' ? undefined : srcLang;
 
-      const wRes = await api.whisperLocalTranscribe?.({
-        filePath: videoToTranscribe,
-        language: srcLang === 'auto' ? undefined : srcLang,
-        modelSize: 'small',
-      }).catch(e => ({ ok: false, error: e.message }));
-
-      if (!wRes?.ok || !wRes.segments?.length) {
-        // Fallback Groq nếu local thất bại
-        addLog(`⚠ Local Whisper thất bại (${wRes?.error || '?'}) — fallback Groq...`);
+      const runGroqWhisper = async (label) => {
         const groqKeys = loadGroqKeysForWhisper();
-        if (!groqKeys.length) { setStep(id, 'error', 'Local Whisper lỗi & chưa có Groq key'); return; }
+        if (!groqKeys.length) { setStep(id, 'error', `${label}: chưa có Groq API key`); return null; }
         let keyIdx = keyIdxRef.current;
         const CHUNK = videoDur > 0 && videoDur <= 780 ? Math.ceil(videoDur) + 1 : 55;
         const loopMax = videoDur > 0 ? videoDur : 300;
-        let fallbackSegs = [];
+        let segs = [];
         for (let startSec = 0; startSec < loopMax; startSec += CHUNK) {
           const durSec = Math.min(CHUNK, loopMax - startSec);
           if (durSec < 1) break;
@@ -764,21 +754,57 @@ export default function FreeReelsPanel() {
           for (let attempt = 0; attempt < groqKeys.length; attempt++) {
             const apiKey = groqKeys[(keyIdx + attempt) % groqKeys.length];
             chunkRes = await api.groqWhisperChunk?.({
-              filePath: videoToTranscribe, startSec, durationSec: durSec, apiKey,
-              language: srcLang === 'auto' ? undefined : srcLang,
+              filePath: videoToTranscribe, startSec, durationSec: durSec, apiKey, language: langOpt,
             }).catch(e => ({ ok: false, error: e.message }));
             if (chunkRes?.ok) { keyIdx = (keyIdx + attempt) % groqKeys.length; break; }
           }
-          if (chunkRes?.ok && chunkRes.segments?.length) fallbackSegs = [...fallbackSegs, ...chunkRes.segments];
+          if (chunkRes?.ok && chunkRes.segments?.length) segs = [...segs, ...chunkRes.segments];
         }
         keyIdxRef.current = keyIdx;
-        if (!fallbackSegs.length) { setStep(id, 'error', 'Transcribe thất bại cả local lẫn Groq'); return; }
-        segments = fallbackSegs;
-        addLog(`✅ Transcribe (Groq fallback): ${segments.length} đoạn`);
-      } else {
-        addLog(`✅ Local Whisper: ${wRes.segments.length} đoạn (ngôn ngữ: ${wRes.language || '?'})`);
+        return segs.length ? segs : null;
+      };
+
+      let segments = [];
+      let localWhisperOk = false;
+
+      if (whisperEngine === 'groq') {
+        setStep(id, 'transcribing', 'Nhận dạng audio (Groq Whisper)...');
+        addLog(`📹 Thời lượng: ${videoDur || '?'}s — Groq Whisper...`);
+        const segs = await runGroqWhisper('Groq Whisper');
+        if (!segs) { setStep(id, 'error', 'Groq Whisper thất bại'); return; }
+        segments = segs;
+        addLog(`✅ Groq Whisper: ${segments.length} đoạn`);
+      } else if (whisperEngine === 'local') {
+        setStep(id, 'transcribing', 'Nhận dạng audio (Local Whisper)...');
+        addLog(`📹 Thời lượng: ${videoDur || '?'}s — Local Whisper...`);
+        const wRes = await api.whisperLocalTranscribe?.({
+          filePath: videoToTranscribe, language: langOpt, modelSize: 'small',
+        }).catch(e => ({ ok: false, error: e.message }));
+        if (!wRes?.ok || !wRes.segments?.length) {
+          setStep(id, 'error', `Local Whisper thất bại: ${wRes?.error || '?'}`); return;
+        }
         segments = wRes.segments;
-        localWhisperOk = true; // timestamp Whisper đã chuẩn, không cần Gemini timing
+        localWhisperOk = true;
+        addLog(`✅ Local Whisper: ${segments.length} đoạn (${wRes.language || '?'})`);
+      } else {
+        // auto: thử local trước, fallback Groq
+        setStep(id, 'transcribing', 'Nhận dạng audio (Local Whisper)...');
+        addLog(`📹 Thời lượng: ${videoDur || '?'}s — Local Whisper (auto)...`);
+        const wRes = await api.whisperLocalTranscribe?.({
+          filePath: videoToTranscribe, language: langOpt, modelSize: 'small',
+        }).catch(e => ({ ok: false, error: e.message }));
+        if (wRes?.ok && wRes.segments?.length) {
+          segments = wRes.segments;
+          localWhisperOk = true;
+          addLog(`✅ Local Whisper: ${segments.length} đoạn (${wRes.language || '?'})`);
+        } else {
+          addLog(`⚠ Local Whisper thất bại (${wRes?.error || '?'}) — fallback Groq...`);
+          setStep(id, 'transcribing', 'Nhận dạng audio (Groq fallback)...');
+          const segs = await runGroqWhisper('Groq fallback');
+          if (!segs) { setStep(id, 'error', 'Transcribe thất bại cả local lẫn Groq'); return; }
+          segments = segs;
+          addLog(`✅ Transcribe (Groq fallback): ${segments.length} đoạn`);
+        }
       }
 
       // ③ Translate SRT segment-by-segment với Gemini
@@ -1494,6 +1520,17 @@ ${flaggedList}`;
               <option value="ko">Tiếng Hàn</option>
               <option value="ja">Tiếng Nhật</option>
               <option value="th">Tiếng Thái</option>
+            </select>
+          </div>
+
+          <div>
+            <div className="text-slate-400 font-bold mb-1 uppercase tracking-wide text-[9px]">Whisper Engine (lấy SRT)</div>
+            <select value={whisperEngine}
+              onChange={e => { setWhisperEngine(e.target.value); localStorage.setItem('fr_whisperEngine', e.target.value); }}
+              className="w-full px-2 py-1.5 bg-slate-800 border border-slate-700 rounded text-slate-200 text-[11px]">
+              <option value="auto">Auto (Local → Groq fallback)</option>
+              <option value="local">Local Whisper (faster-whisper)</option>
+              <option value="groq">Groq Whisper (API)</option>
             </select>
           </div>
 

@@ -849,27 +849,26 @@ export default function FreeReelsPanel() {
       if (uploadRes?.ok) {
         addLog(`📹 Gemini nhận video — đang phân tích + dịch ${segments.length} dòng...`);
         const fullScript = segments.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
-        const isFirstEp  = !charContextSaved.trim();
+        const hasContext = !!charContextSaved.trim();
+        // Luôn yêu cầu phân tích nhân vật — pass context cũ làm base, bổ sung nhân vật mới
+        const charSection = hasContext
+          ? `\n=== QUY TẮC XƯNG HÔ ĐÃ TÍCH LŨY ===\n${charContextSaved}\n=== HẾT QUY TẮC ===\nNếu tập này có NHÂN VẬT MỚI chưa có trong quy tắc trên, hãy bổ sung vào phần NHÂN VẬT. Giữ nguyên nhân vật cũ.`
+          : `\nXem video, phân tích nhân vật và điền phần NHÂN VẬT bên dưới.`;
 
-        const charSection = isFirstEp
-          ? `\nSau khi xem video, hãy điền phần NHÂN VẬT bên dưới rồi mới dịch.`
-          : `\n=== QUY TẮC XƯNG HÔ ĐÃ THIẾT LẬP TỪ TẬP 1 ===\n${charContextSaved}\n=== HẾT QUY TẮC — GIỮ NGUYÊN XƯNG HÔ NÀY ===`;
-
-        const videoPrompt = `Bạn là chuyên gia dịch phim ngắn Trung Quốc sang tiếng Việt.
-Hãy XEM video này (hình ảnh + âm thanh) để biết nhân vật nào đang nói câu nào, rồi thực hiện 2 nhiệm vụ dưới đây.
+        const videoPrompt = `Bạn là chuyên gia dịch phim ngắn sang tiếng Việt (Á Đông hoặc phương Tây đều được).
+Hãy XEM video này (hình ảnh + âm thanh) để biết nhân vật nào đang nói câu nào, rồi thực hiện 3 nhiệm vụ dưới đây.
 ${charSection}
 
 TOÀN BỘ THOẠI GỐC (${segments.length} dòng):
 ${fullScript}
 
-=== NHIỆM VỤ 1: PHÂN TÍCH NHÂN VẬT ===
-${isFirstEp ? `(Điền thông tin nhân vật dựa trên video)
-THỂ LOẠI: [hiện đại / cổ trang / ...]
+=== NHIỆM VỤ 1: PHÂN TÍCH NHÂN VẬT (giữ cũ + bổ sung mới) ===
+THỂ LOẠI: [hiện đại / cổ trang / phương Tây / ...]
 NHÂN VẬT:
 - [Tên/cách gọi]: [giới tính] | [vai vế] | [giọng điệu]
 BẢNG XƯNG HÔ:
 - [A] → [B]: xưng "[từ A tự xưng]", gọi "[từ A dùng cho B]"
-LƯU Ý ĐẶC BIỆT: [ai dùng mày/tao, ai thay đổi giọng khi tức, ...]` : `(Đã có quy tắc từ tập 1, giữ nguyên)`}
+LƯU Ý: [phim phương Tây dùng tôi/bạn hoặc tên riêng nếu không có hệ xưng hô Á Đông]
 
 === NHIỆM VỤ 2: XÁC NHẬN MỐC THỜI GIAN TỪNG DÒNG ===
 Xem video (hình + âm thanh), cho biết mỗi câu thoại trong danh sách BẮT ĐẦU được nói tại GIÂY THỨ MẤY trong video.
@@ -944,10 +943,10 @@ Trả về ĐÚNG FORMAT (không thêm markdown, không giải thích):
         if (videoResp) {
           // Parse nhân vật
           const charMatch = videoResp.match(/=== NHÂN VẬT ===([\s\S]*?)=== HẾT NHÂN VẬT ===/);
-          if (charMatch && isFirstEp) {
+          if (charMatch) {
             charContext = charMatch[1].trim();
             setCharContextSaved(charContext);
-            addLog('✅ Phân tích nhân vật xong & lưu để dùng cho các tập tiếp theo');
+            addLog('✅ Cập nhật nhân vật tích lũy (giữ cũ + bổ sung mới)');
           }
           // Parse bản dịch — dùng số thứ tự làm anchor
           const transMatch = videoResp.match(/=== BẢN DỊCH ===([\s\S]*?)=== HẾT DỊCH ===/);
@@ -1000,7 +999,7 @@ Trả về ĐÚNG FORMAT (không thêm markdown, không giải thích):
         if (!charContext) {
           addLog('🔍 Gemini phân tích nhân vật từ script...');
           const fullScript = segments.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
-          const analyzePrompt = `Đọc kịch bản phim ngắn Trung Quốc và tạo bộ quy tắc xưng hô tiếng Việt.\nKỊCH BẢN:\n${fullScript}\n\nTrả về (không giải thích thêm):\nTHỂ LOẠI: ...\nNHÂN VẬT:\n- [Tên]: [giới tính] | [vai vế] | [giọng]\nBẢNG XƯNG HÔ:\n- [A] → [B]: xưng "[từ]", gọi "[từ]"\nLƯU Ý: ...`;
+          const analyzePrompt = `Đọc kịch bản phim ngắn và tạo bộ quy tắc xưng hô tiếng Việt (phim Á Đông hoặc phương Tây đều được).\nKỊCH BẢN:\n${fullScript}\n\nTrả về (không giải thích thêm):\nTHỂ LOẠI: ...\nNHÂN VẬT:\n- [Tên]: [giới tính] | [vai vế] | [giọng]\nBẢNG XƯNG HÔ:\n- [A] → [B]: xưng "[từ]", gọi "[từ]"\nLƯU Ý: [phim phương Tây dùng tôi/bạn hoặc tên riêng nếu không có hệ xưng hô Á Đông]`;
           charContext = await callGemini(analyzePrompt, 1024);
           if (!charContext) {
             charContext = 'Dịch tự nhiên, nhất quán xưng hô trong suốt phim.';
@@ -1095,7 +1094,7 @@ Trả về ĐÚNG FORMAT (không thêm markdown, không giải thích):
           addLog(`🔍 Gemini fix ${needsFix.size} dòng sub bị lặp...`);
           const flaggedIdx = [...needsFix].sort((a, b) => a - b);
           const flaggedList = flaggedIdx.map(i => `${i + 1}. ${viSegments[i].text}`).join('\n');
-          const fixPrompt = `Sửa các dòng phụ đề tiếng Việt bị lỗi sau (dịch từ phim ngắn Trung Quốc).
+          const fixPrompt = `Sửa các dòng phụ đề tiếng Việt bị lỗi sau (dịch từ phim ngắn).
 Lỗi cần sửa: lặp từ/cụm trong 1 dòng, hoặc 2 dòng liền nhau giống hệt nhau.
 Cách sửa: xóa phần lặp thừa, hoặc diễn đạt lại câu 2 cho tự nhiên hơn.
 Giữ nguyên số thứ tự gốc. Chỉ trả các dòng đã sửa, không giải thích:

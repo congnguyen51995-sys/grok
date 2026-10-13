@@ -7264,6 +7264,8 @@ ipcMain.handle('video:recreate', async (event, { videoPath, outputFolder, zoomPc
         p.on('error', reject);
     });
 
+    let tempDir = null; // declared outside try so catch block can clean it up
+
     try {
         // ── Bước 0: Get video info ─────────────────────────────────────────────
         sendLog('📊 Đang phân tích video...', 'info', 0);
@@ -7381,7 +7383,7 @@ ipcMain.handle('video:recreate', async (event, { videoPath, outputFolder, zoomPc
         // fps= filter phải decode toàn bộ video → rất chậm với video dài/4K/60fps
         // Thay bằng N lần -ss seek song song → nhảy thẳng đến keyframe, không cần decode toàn video
         sendLog('🖼 Trích xuất khung hình để phát hiện logo...', 'info', 1);
-        const tempDir = path.join(outputFolder, `_rc_tmp_${Date.now()}`);
+        tempDir = path.join(outputFolder, `_rc_tmp_${Date.now()}`);
         fs.mkdirSync(tempDir, { recursive: true });
 
         // 15 frames: 5 intro (đầu video) + 5 middle + 5 outro (cuối video)
@@ -8262,7 +8264,7 @@ ipcMain.handle('video:recreate', async (event, { videoPath, outputFolder, zoomPc
                 if (fs.existsSync(longP)) fs.unlinkSync(longP);
             } catch(_) {}
         };
-        try { if (typeof tempDir !== 'undefined') fs.rmSync(`\\\\?\\${tempDir}`, { recursive: true, force: true }); } catch(_) {}
+        try { if (tempDir) fs.rmSync(`\\\\?\\${tempDir}`, { recursive: true, force: true }); } catch(_) {}
         if (typeof fcScriptPath !== 'undefined') delLong(fcScriptPath);
         if (typeof concatPath !== 'undefined') delLong(concatPath);
         // Xóa file _tmp.mp4 trung gian nếu còn sót
@@ -8288,7 +8290,7 @@ ipcMain.handle('video:recreate', async (event, { videoPath, outputFolder, zoomPc
                 if (!outStat || outStat.size === 0) delLong(outputPath);
             } catch(_) {}
         }
-        try { if (typeof tempDir !== 'undefined') fs.rmSync(`\\\\?\\${tempDir}`, { recursive: true, force: true }); } catch(_) {}
+        try { if (tempDir) fs.rmSync(`\\\\?\\${tempDir}`, { recursive: true, force: true }); } catch(_) {}
         return { ok: false, error: e.message };
     }
 });

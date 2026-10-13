@@ -731,7 +731,7 @@ export default function FreeReelsPanel() {
           videoForMix       = videoToTranscribe;
           addLog('✅ Tái tạo xong — nhận dạng audio từ video đã cắt');
         } else {
-          addLog('⚠ Tái tạo thất bại — dùng video gốc');
+          addLog(`⚠ Tái tạo thất bại — dùng video gốc${rcEarlyRes?.error ? ': ' + rcEarlyRes.error : ''}`);
         }
       }
 

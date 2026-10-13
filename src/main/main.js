@@ -37,9 +37,40 @@ function detectGPU() {
 }
 // Chạy detection ngay lúc khởi động
 detectGPU();
+
+// ── ffmpeg encoder auto-detect — cache dùng chung toàn bộ handlers ────────────
+let _ffEncCache = null; // { type:'nvenc'|'amf'|'qsv'|'cpu', args:[...] }
+async function detectFfmpegEncoder() {
+  if (_ffEncCache) return _ffEncCache;
+  const ffm = (() => { try { return require('ffmpeg-static'); } catch { return 'ffmpeg'; } })();
+  const { spawn: _sp } = require('child_process');
+  const test = (codec, extra) => new Promise(res => {
+    const p = _sp(ffm, ['-y','-f','lavfi','-i','color=c=black:s=64x64:d=0.1',...extra,'-vcodec',codec,'-f','null','-'], { stdio:'pipe' });
+    p.on('close', c => res(c === 0));
+    p.on('error', () => res(false));
+  });
+  if      (await test('h264_nvenc', ['-preset','p4','-rc','constqp','-qp','20'])) {
+    _ffEncCache = { type:'nvenc', args:['-c:v','h264_nvenc','-preset','p4','-rc','constqp','-qp','20'] };
+    console.log('[ffEnc] ✅ NVIDIA NVENC');
+  } else if (await test('h264_amf', ['-quality','balanced','-rc','cqp','-qp_i','20','-qp_p','22'])) {
+    _ffEncCache = { type:'amf',   args:['-c:v','h264_amf','-quality','balanced','-rc','cqp','-qp_i','20','-qp_p','22'] };
+    console.log('[ffEnc] ✅ AMD AMF');
+  } else if (await test('h264_qsv', ['-preset','fast','-global_quality','20'])) {
+    _ffEncCache = { type:'qsv',   args:['-c:v','h264_qsv','-preset','fast','-global_quality','20'] };
+    console.log('[ffEnc] ✅ Intel QSV');
+  } else {
+    _ffEncCache = { type:'cpu',   args:['-c:v','libx264','-preset','fast','-crf','20'] };
+    console.log('[ffEnc] ⚪ CPU libx264 (không phát hiện GPU tương thích)');
+  }
+  return _ffEncCache;
+}
+// Probe ngay lúc khởi động để sẵn sàng
+detectFfmpegEncoder();
+
 const { checkForUpdates, registerUpdaterHandlers } = require('./updater');
 const { registerDownloaderHandlers }               = require('./services/video-downloader');
 const { registerGroqWhisperHandlers }              = require('./services/groq-whisper');
+const { registerWhisperLocalHandlers }             = require('./services/whisper-local');
 
 app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 app.commandLine.appendSwitch('disable-infobars');
@@ -1838,6 +1869,7 @@ app.whenReady().then(async () => {
     const mainWin = BrowserWindow.getAllWindows()[0];
     registerDownloaderHandlers(mainWin);
     registerGroqWhisperHandlers();
+    registerWhisperLocalHandlers();
     // Auto-check update sau 5s để app ổn định trước
     setTimeout(() => checkForUpdates(mainWin), 5000);
     // Auto-start tất cả TTS server đã cài sau 4s (để renderer load xong)
@@ -2013,14 +2045,17 @@ async function detectGpuType() {
   function runPython(args, env = {}, _pyExeOverride) {
     return new Promise((resolve, reject) => {
       const { execFile } = require('child_process');
-      execFile(_pyExeOverride || PYTHON_EXE(), args, {
-        env: { ...process.env, HF_HOME: MODEL_CACHE(), TRANSFORMERS_OFFLINE: '0', ...env },
-        timeout: 0,
-        maxBuffer: 10 * 1024 * 1024,
-      }, (err, stdout, stderr) => {
-        if (err) return reject(new Error(stderr || err.message));
-        resolve(stdout.trim());
-      });
+      const pyExe = _pyExeOverride || PYTHON_EXE();
+      // Try offline first (if model already cached) → avoids HF auth issues
+      // Fall back to online if offline fails (first-time download)
+      const tryRun = (offline) => new Promise((res, rej) =>
+        execFile(pyExe, args, {
+          env: { ...process.env, HF_HOME: MODEL_CACHE(), TRANSFORMERS_OFFLINE: offline ? '1' : '0', HF_HUB_DISABLE_IMPLICIT_TOKEN: '1', ...env },
+          timeout: 0,
+          maxBuffer: 10 * 1024 * 1024,
+        }, (err, stdout, stderr) => err ? rej(new Error(stderr || err.message)) : res(stdout.trim()))
+      );
+      tryRun(true).then(resolve).catch(() => tryRun(false).then(resolve).catch(reject));
     });
   }
 
@@ -2679,6 +2714,8 @@ print('OK')
     const log = (msg) => { if (!sender.isDestroyed()) sender.send('vieneu-log', msg); };
     try {
       writeSynthScripts();
+      // Sanitize voiceId: "Label — desc,VoiceName" → "VoiceName"
+      if (voiceId && voiceId.includes(',')) voiceId = voiceId.split(',').pop().trim();
       const dir = path.dirname(outputPath);
       fs.mkdirSync(dir, { recursive: true });
       let modelId = MODEL_IDS.q4;
@@ -2756,6 +2793,8 @@ print('OK')
   ipcMain.handle('vieneu:synthesize-srt', async (event, { segments, voiceId, refAudio, refText, outputPath }) => {
     try {
       writeSynthScripts();
+      // Sanitize voiceId: "Label — desc,VoiceName" → "VoiceName"
+      if (voiceId && voiceId.includes(',')) voiceId = voiceId.split(',').pop().trim();
       // Normalize 8.3 short path cho refAudio
       if (refAudio) { try { refAudio = fs.realpathSync.native(refAudio); } catch (_) {} }
 
@@ -2785,9 +2824,9 @@ print('OK')
       const segFiles = [];
       for (let i = 0; i < segments.length; i++) {
         const seg     = segments[i];
-        // Renderer gửi startMs/endMs (milliseconds)
-        const startMs = seg.startMs ?? seg.start ?? 0;
-        const endMs   = seg.endMs   ?? seg.end   ?? startMs;
+        // Renderer gửi startMs/speechStartMs (milliseconds) — dùng speechStartMs như CapCut
+        const startMs = seg.speechStartMs ?? seg.startMs ?? Math.round((seg.speechStart ?? seg.start ?? 0) * 1000);
+        const endMs   = seg.endMs ?? Math.round((seg.end ?? 0) * 1000);
         const segDurSec = Math.max(0.1, (endMs - startMs) / 1000);
         const text    = (seg.text || '').trim();
         const segPath = path.join(tmpDir, `seg_${String(i).padStart(4,'0')}.wav`);
@@ -3766,6 +3805,349 @@ except Exception as e:
 }
 // ── END KOKORO TTS ────────────────────────────────────────────────────────────
 
+// ── CAPCUT TTS (pure Node.js, no Python) ─────────────────────────────────────
+{
+  const _cc = (() => {
+    const crypto = require('crypto');
+    const https  = require('https');
+
+    const BASE  = 'https://editor-api-sg.capcutapi.com';
+    const DEV   = {
+      aid: '359289', app_name: 'CapCut', appvr: '8.7.0',
+      version_name: '8.7.0', version_code: '8.7.0',
+      channel: 'capcutpc_google', device_platform: 'mac',
+      device_type: 'MacBookPro17,4', device_brand: 'MacBookPro17,4',
+      os_version: '15.7.4',
+      device_id: '76471456455646328721', iid: '76471456455646328721',
+      region: 'VN', loc: 'VN', lan: 'vi-VN', pf: '3',
+      tdid: '76471456455646328721',
+    };
+    const PEM = `-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmTd34Lw4b7IuldSXh/zY
+CMla+ITdGG5TeWz6ad+OySd4r+IrY45AoqrYUxhQ2dl+7z+i7r/5vEa8rr39BYfB
+8AGMQLmZA8HmgpWBsqrn/V6daUALkKnkLb70Fn32CJigIuGXAYqxUdGuI340aC+0
+v5Es3puJsHyzf01/AelE4Cdc6bZhQrASJLBh8R3BQToYClmDVSDUQk28o8sl/guA
+Z4n303Vj+6Siv1HayPCdV6kpVVnMBAG4+umUbwGmn132N3fgpzLarFF3XyWmS1zh
+D/J07iM/rP8GDO9IskHNHd2phrO0G6KzrcFAnTBHjVv+hCBEfzN/no3FNA9AuC36
+mwIDAQAB
+-----END PUBLIC KEY-----`;
+
+    const md5   = s => crypto.createHash('md5').update(s, 'utf8').digest('hex');
+    const rsaB64 = s => crypto.publicEncrypt(
+      { key: PEM, padding: crypto.constants.RSA_PKCS1_PADDING },
+      Buffer.from(s, 'utf8')
+    ).toString('base64');
+    const esc   = t => t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                        .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+    const uuid  = () => crypto.randomUUID();
+
+    function payloadSign(ssml, extraInfo) {
+      const base = `appid:${DEV.aid}&did:${DEV.device_id}&creditDisable:false&ssml:${md5(ssml)}`;
+      return rsaB64(extraInfo != null ? `${base}&extraInfo:${extraInfo}` : base);
+    }
+
+    function signHeader(fullUrl, deviceTime) {
+      const p = fullUrl.split('?')[0].slice(-7);
+      return md5(`9e2c|${p}|3|${DEV.appvr}|${deviceTime}|${DEV.tdid}|11ac`);
+    }
+
+    function commonQuery(babi) {
+      return new URLSearchParams({
+        app_name: DEV.app_name, device_type: DEV.device_type, os_version: DEV.os_version,
+        channel: DEV.channel, version_name: DEV.version_name, device_brand: DEV.device_brand,
+        device_id: DEV.device_id, iid: DEV.iid, version_code: DEV.version_code,
+        device_platform: DEV.device_platform, aid: DEV.aid, region: DEV.region,
+        babi_param: JSON.stringify(babi),
+      }).toString();
+    }
+
+    function baseHeaders(body, withAppId) {
+      const now = String(Math.floor(Date.now() / 1000));
+      const h = {
+        'content-type': 'application/json',
+        'appvr': DEV.appvr, 'ch': DEV.channel, 'device-time': now,
+        'lan': DEV.lan, 'loc': DEV.loc, 'pf': DEV.pf,
+        'sign-ver': '1', 'tdid': DEV.tdid,
+        'x-ss-stub': md5(body),
+        'x-ss-dp': DEV.aid, 'x-khronos': now,
+        'x-tt-trace-id': `00-${crypto.randomBytes(16).toString('hex')}-${crypto.randomBytes(8).toString('hex')}-01`,
+        'user-agent': 'Cronet/TTNetVersion:1d7cc3b1 2025-07-16 QuicVersion:52c2b40d 2025-04-03',
+        'accept-encoding': 'gzip, deflate',
+        'store-country-code': 'vn', 'store-country-code-src': 'did',
+        'is-dispatch-us-ttp': '0', 'is-app-region-us-ttp': '0',
+      };
+      if (withAppId) { h['app-sdk-version'] = DEV.appvr; h['appid'] = DEV.aid; }
+      return h;
+    }
+
+    function httpsPost(url, headers, body) {
+      return new Promise((resolve, reject) => {
+        const zlib  = require('zlib');
+        const u     = new URL(url);
+        const buf   = Buffer.from(body, 'utf8');
+        const req   = https.request({
+          hostname: u.hostname, path: u.pathname + u.search,
+          method: 'POST', headers: { ...headers, 'content-length': buf.length },
+        }, res => {
+          const enc    = (res.headers['content-encoding'] || '').toLowerCase();
+          let   stream = res;
+          if (enc === 'gzip')    stream = res.pipe(zlib.createGunzip());
+          else if (enc === 'br') stream = res.pipe(zlib.createBrotliDecompress());
+          const chunks = [];
+          stream.on('data', d => chunks.push(d));
+          stream.on('end', () => {
+            const raw = Buffer.concat(chunks).toString('utf8');
+            try { resolve(JSON.parse(raw)); }
+            catch { reject(new Error('Parse: ' + raw.slice(0, 300))); }
+          });
+          stream.on('error', reject);
+        });
+        req.on('error', reject);
+        req.setTimeout(30000, () => { req.destroy(); reject(new Error('timeout 30s')); });
+        req.write(buf); req.end();
+      });
+    }
+
+    function httpsGet(url) {
+      return new Promise((resolve, reject) => {
+        https.get(url, res => {
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            return resolve(httpsGet(res.headers.location));
+          }
+          const chunks = [];
+          res.on('data', d => chunks.push(d));
+          res.on('end', () => resolve(Buffer.concat(chunks)));
+          res.on('error', reject);
+        }).on('error', reject).setTimeout(60000, function() { this.destroy(); reject(new Error('download timeout')); });
+      });
+    }
+
+    function findAudioUrl(res) {
+      const tasks = (res?.data?.tasks) || [];
+      if (!tasks.length) return null;
+      const t0 = tasks[0];
+      // payload là JSON string chứa audio_subtitles[0].speech_url
+      if (t0.payload) {
+        try {
+          const p = JSON.parse(t0.payload);
+          const url = p?.audio_subtitles?.[0]?.speech_url;
+          if (url) return url;
+          // fallback trong payload
+          const raw = JSON.stringify(p);
+          const m = raw.match(/https?:\/\/[^"\\]+\.mp3[^"\\]*/);
+          if (m) return m[0];
+        } catch {}
+      }
+      const tr = t0?.task_result || {};
+      return tr?.audio?.url || tr?.audio_url || tr?.url || t0?.url || null;
+    }
+
+    async function generateSpeech(text, voice, resourceId) {
+      const babi = {
+        feature_entrance: 'editor', feature_entrance_detail: 'editor-feature-text_to_speech',
+        feature_key: 'text_to_speech', scenario: 'video_editor',
+      };
+      const ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">\n    <voice name="${voice}" mock_tone_info="" platform="sami" resource_id="${resourceId}" emotion="" emotion_scale="0" style="" role="" moyin_emotion="" is_clone_tone="false" need_subtitle_timestamp="false">\n        <prosody rate="1.0">${esc(text)}</prosody>\n    </voice>\n</speak>`;
+      const extraInfo = JSON.stringify({ benefit_info: {} });
+      const sign      = payloadSign(ssml, extraInfo);
+
+      const createBody = JSON.stringify({
+        bind_id: uuid(), can_queue: true, enter_from: 'text_to_speech',
+        tasks: [{
+          context: uuid(),
+          payload: JSON.stringify({
+            audio_format: 'mp3', babi_param: JSON.stringify(babi),
+            credit_disable: false, extra_info: extraInfo,
+            need_merge_voice: false, need_subtitle_timestamp: false,
+            scene: 'text_to_speech', ssml, sign,
+          }),
+          req_key: 'sami_text_to_speech', task_version: 'v3',
+        }],
+      });
+
+      const createUrl = `${BASE}/lv/v1/common_task/new?${commonQuery(babi)}`;
+      const cH = baseHeaders(createBody, true);
+      cH['sign'] = signHeader(createUrl, cH['device-time']);
+
+      const cRes = await httpsPost(createUrl, cH, createBody);
+      console.log('[CapCut TTS] create response:', JSON.stringify(cRes).slice(0, 600));
+      const cTasks = cRes?.data?.tasks || [];
+      if (!cTasks.length) throw new Error('No task returned: ' + JSON.stringify(cRes).slice(0, 300));
+      const { id: taskId, token, bind_id: cBindId } = cTasks[0];
+
+      // Poll
+      const queryQs = new URLSearchParams({
+        app_name: DEV.app_name, device_type: DEV.device_type, os_version: DEV.os_version,
+        channel: DEV.channel, version_name: DEV.version_name, device_brand: DEV.device_brand,
+        device_id: DEV.device_id, iid: DEV.iid, version_code: DEV.version_code,
+        device_platform: DEV.device_platform, aid: DEV.aid,
+      }).toString();
+      const queryUrl  = `${BASE}/lv/v1/common_task/query?${queryQs}`;
+      const queryBody = JSON.stringify({
+        tasks: [{ bind_id: cBindId || '', id: taskId, req_key: 'sami_text_to_speech', task_version: 'v3', token }],
+      });
+
+      for (let i = 0; i < 40; i++) {
+        await new Promise(r => setTimeout(r, 1500));
+        const qH = baseHeaders(queryBody, true);
+        qH['sign'] = signHeader(queryUrl, qH['device-time']);
+        const qRes   = await httpsPost(queryUrl, qH, queryBody);
+        if (i < 3) console.log('[CapCut TTS] poll[' + i + ']:', JSON.stringify(qRes).slice(0, 600));
+        const qTasks = qRes?.data?.tasks || [];
+        if (qTasks.length) {
+          const t0 = qTasks[0];
+          const st = t0.status;
+          if (st === 'success' || st === 'completed' || st === 'succeed') {
+            const url = findAudioUrl(qRes);
+            if (url) return url;
+            // Thử tìm URL trực tiếp trong task object
+            const raw = JSON.stringify(qRes);
+            const m = raw.match(/https?:\/\/[^"]+\.mp3[^"]*/);
+            if (m) return m[0].replace(/\\u002F/g, '/');
+            throw new Error('Success but no audio URL: ' + raw.slice(0, 600));
+          }
+          if (st === 'failed' || st === 'error') throw new Error('Task failed: ' + JSON.stringify(qRes).slice(0, 300));
+        }
+      }
+      throw new Error('TTS timeout after 60s');
+    }
+
+    return { generateSpeech, httpsGet };
+  })();
+
+  ipcMain.handle('capcut:tts', async (_event, { text, voice = 'BV074_streaming', resourceId = '7102355709945188865', outputPath }) => {
+    try {
+      if (!text?.trim()) return { success: false, error: 'Không có text' };
+      if (!outputPath)   return { success: false, error: 'outputPath bắt buộc' };
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+
+      const audioUrl = await _cc.generateSpeech(text, voice, resourceId);
+      console.log('[CapCut TTS] audio URL:', audioUrl.slice(0, 80));
+
+      const mp3Buf = await _cc.httpsGet(audioUrl);
+      const tmpMp3 = outputPath + '.tmp_cc.mp3';
+      fs.writeFileSync(tmpMp3, mp3Buf);
+
+      const ffmpegBin = (() => { try { return require('ffmpeg-static'); } catch { return 'ffmpeg'; } })();
+      const { execFile } = require('child_process');
+      await new Promise((resolve, reject) => {
+        execFile(ffmpegBin, ['-y', '-i', tmpMp3, '-ar', '44100', '-ac', '1', outputPath],
+          { timeout: 60000 }, err => {
+            try { fs.unlinkSync(tmpMp3); } catch {}
+            err ? reject(err) : resolve();
+          });
+      });
+
+      return { success: true, path: outputPath };
+    } catch (e) {
+      console.warn('[CapCut TTS]', e.message);
+      return { success: false, error: e.message };
+    }
+  });
+
+  // SRT mode: segment-by-segment với timestamp, assemble bằng adelay+amix
+  ipcMain.handle('capcut:tts-srt', async (_event, { segments, voice = 'BV074_streaming', resourceId = '7102355709945188865', outputPath }) => {
+    const os = require('os');
+    const { execFile } = require('child_process');
+    const ffmpegBin = (() => { try { return require('ffmpeg-static'); } catch { return 'ffmpeg'; } })();
+    const tmpDir = path.join(os.tmpdir(), 'cc_srt_' + Date.now());
+    const segFiles = [];
+
+    const getAudioDur = (fp) => new Promise((res, rej) => {
+      execFile(ffmpegBin, ['-i', fp, '-f', 'null', '-'], { timeout: 10000 }, (_e, _o, se) => {
+        const m = (se || '').match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
+        m ? res(+m[1]*3600 + +m[2]*60 + parseFloat(m[3])) : rej(new Error('no duration'));
+      });
+    });
+
+    const adjustTempo = (inp, out, tempo) => new Promise((res, rej) => {
+      const filters = [];
+      let t = Math.min(tempo, 4.0);
+      while (t > 2.0) { filters.push('atempo=2.0'); t /= 2.0; }
+      if (t > 1.0) filters.push(`atempo=${t.toFixed(4)}`);
+      const af = filters.length ? filters.join(',') : 'anull';
+      execFile(ffmpegBin, ['-y', '-i', inp, '-af', af, '-ar', '44100', '-ac', '1', out], { timeout: 60000 },
+        err => err ? rej(err) : res());
+    });
+
+    try {
+      if (!segments?.length) return { success: false, error: 'Không có segments' };
+      if (!outputPath) return { success: false, error: 'outputPath bắt buộc' };
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+      fs.mkdirSync(tmpDir, { recursive: true });
+
+      // Xử lý segment song song — 4 segment cùng lúc (giảm từ 6 để tránh rate-limit khi chạy nhiều tập)
+      const CONCUR = 4;
+      const allSegs = segments.map((seg, i) => ({ seg, i })).filter(({ seg }) => (seg.text || '').trim());
+      const results = new Array(segments.length).fill(null);
+
+      for (let batch = 0; batch < allSegs.length; batch += CONCUR) {
+        const chunk = allSegs.slice(batch, batch + CONCUR);
+        await Promise.all(chunk.map(async ({ seg, i }) => {
+          const text  = (seg.text || '').trim();
+          const windowStartMs = seg.startMs ?? Math.round((seg.start ?? 0) * 1000);
+          const startMs = seg.speechStartMs ?? windowStartMs;
+          const endMs   = seg.endMs ?? Math.round((seg.end ?? 0) * 1000);
+          const segDur  = Math.max((endMs - startMs) / 1000, 0.1);
+
+          const tmpMp3 = path.join(tmpDir, `s${i}.mp3`);
+          const tmpWav = path.join(tmpDir, `s${i}.wav`);
+
+          const audioUrl = await _cc.generateSpeech(text, voice, resourceId);
+          const mp3Buf   = await _cc.httpsGet(audioUrl);
+          fs.writeFileSync(tmpMp3, mp3Buf);
+
+          await new Promise((res, rej) => execFile(ffmpegBin,
+            ['-y', '-i', tmpMp3, '-ar', '44100', '-ac', '1', tmpWav],
+            { timeout: 60000 }, err => { try { fs.unlinkSync(tmpMp3); } catch {} err ? rej(err) : res(); }));
+
+          let finalWav = tmpWav;
+          try {
+            const dur = await getAudioDur(tmpWav);
+            if (dur > segDur * 1.12) {
+              const adjWav = path.join(tmpDir, `s${i}_adj.wav`);
+              await adjustTempo(tmpWav, adjWav, dur / segDur);
+              try { fs.unlinkSync(tmpWav); } catch {}
+              finalWav = adjWav;
+            }
+          } catch {}
+
+          results[i] = { file: finalWav, startMs };
+          console.log(`[CapCut SRT] seg ${i+1}/${segments.length} ok, delay=${startMs}ms`);
+        }));
+        console.log(`[CapCut SRT] batch ${Math.floor(batch/CONCUR)+1}/${Math.ceil(allSegs.length/CONCUR)} xong`);
+      }
+
+      // Giữ đúng thứ tự segment
+      for (const r of results) { if (r) segFiles.push(r); }
+
+      if (!segFiles.length) return { success: false, error: 'Không có segment nào có text' };
+
+      // Assemble: adelay mỗi segment theo startMs rồi amix
+      const inputs  = segFiles.flatMap(s => ['-i', s.file]);
+      const filters = segFiles.map((s, i) => `[${i}]adelay=${s.startMs}|${s.startMs}[a${i}]`).join(';');
+      const mix     = segFiles.map((_, i) => `[a${i}]`).join('');
+      const fc      = `${filters};${mix}amix=inputs=${segFiles.length}:normalize=0:duration=longest[out]`;
+
+      await new Promise((res, rej) => execFile(ffmpegBin,
+        ['-y', ...inputs, '-filter_complex', fc, '-map', '[out]', '-ar', '44100', '-ac', '1', outputPath],
+        { timeout: 600000 }, err => {
+          for (const s of segFiles) { try { fs.unlinkSync(s.file); } catch {} }
+          try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
+          err ? rej(err) : res();
+        }));
+
+      return { success: true, path: outputPath };
+    } catch (e) {
+      for (const s of segFiles) { try { fs.unlinkSync(s.file); } catch {} }
+      try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
+      console.warn('[CapCut TTS SRT]', e.message);
+      return { success: false, error: e.message };
+    }
+  });
+}
+// ── END CAPCUT TTS ────────────────────────────────────────────────────────────
+
 // ── CHATTERBOX TTS ────────────────────────────────────────────────────────────
 {
   const { spawn, execFile } = require('child_process');
@@ -4184,6 +4566,125 @@ function gmQuotaGetStatus(allKeys) {
     return { total, exhausted: exhaustedCount, available: total - exhaustedCount,
              charsUsed: totalCharsUsed, charsRemaining, totalCapacity, minutesRemaining };
 }
+
+// ── FreeReels: upload video → Gemini Files API để phân tích nhân vật & dịch ─────
+ipcMain.handle('freereels:upload-video-for-translation', async (event, { filePath, apiKeys }) => {
+  const os_   = require('os');
+  const path_ = require('path');
+  const spawn_ = require('child_process').spawn;
+  const ffm = (() => { try { return require('ffmpeg-static'); } catch { return 'ffmpeg'; } })();
+
+  const keys = (Array.isArray(apiKeys) ? apiKeys : [apiKeys]).map(k => (k||'').trim()).filter(Boolean);
+  if (!keys.length) return { ok: false, error: 'Không có Gemini API key' };
+
+  let tmpCompressed = null;
+  const log = (msg) => { try { event.sender.send('freereels:upload-progress', msg); } catch (_) {} };
+
+  try {
+    if (!fs.existsSync(filePath)) return { ok: false, error: 'File không tồn tại: ' + filePath };
+
+    // Nén xuống 360p để upload nhanh (chỉ cần đủ nhận mặt nhân vật)
+    tmpCompressed = path_.join(os_.tmpdir(), `fr_upload_${Date.now()}.mp4`);
+    const enc = await detectFfmpegEncoder();
+    // GPU quality param: nvenc/amf/qsv dùng qp/quality cao hơn cho nén upload (tốc độ > chất lượng)
+    const encUpload = enc.type === 'nvenc' ? ['-c:v','h264_nvenc','-preset','p1','-rc','constqp','-qp','28']
+                    : enc.type === 'amf'   ? ['-c:v','h264_amf','-quality','speed','-rc','cqp','-qp_i','28','-qp_p','30']
+                    : enc.type === 'qsv'   ? ['-c:v','h264_qsv','-preset','veryfast','-global_quality','28']
+                    :                        ['-c:v','libx264','-crf','30','-preset','veryfast'];
+    log(`🗜 Nén video để upload Gemini (${enc.type.toUpperCase()})...`);
+    await new Promise((res, rej) => {
+      const proc = spawn_(ffm, [
+        '-y', '-i', filePath,
+        '-vf', 'scale=-2:360',
+        ...encUpload,
+        '-c:a', 'aac', '-b:a', '64k',
+        tmpCompressed,
+      ], { stdio: 'pipe' });
+      proc.on('close', code => code === 0 ? res() : rej(new Error(`ffmpeg nén lỗi ${code}`)));
+      proc.on('error', rej);
+    });
+
+    const uploadPath = tmpCompressed;
+    const uploadSize = fs.statSync(uploadPath).size;
+    log(`📤 Upload ${(uploadSize/1024/1024).toFixed(1)}MB lên Gemini...`);
+    const fileBuffer = fs.readFileSync(uploadPath);
+
+    // Xoay key: thử từng key cho bước init + poll
+    let uploadUrl   = null;
+    let activeKey   = null;
+    for (let ki = 0; ki < keys.length; ki++) {
+      const key = keys[ki];
+      try {
+        const initRes = await fetch(
+          `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${key}`,
+          {
+            method: 'POST',
+            headers: {
+              'X-Goog-Upload-Protocol':              'resumable',
+              'X-Goog-Upload-Command':               'start',
+              'X-Goog-Upload-Header-Content-Length':  String(uploadSize),
+              'X-Goog-Upload-Header-Content-Type':    'video/mp4',
+              'Content-Type':                         'application/json',
+            },
+            body: JSON.stringify({ file: { display_name: path_.basename(filePath) } }),
+          }
+        );
+        if (initRes.ok) {
+          uploadUrl = initRes.headers.get('x-goog-upload-url');
+          activeKey = key;
+          break;
+        }
+        const errText = await initRes.text().catch(() => '');
+        log(`⚠ Key ...${key.slice(-6)} lỗi ${initRes.status} — thử key tiếp...`);
+      } catch (e) {
+        log(`⚠ Key ...${key.slice(-6)} lỗi: ${e.message} — thử key tiếp...`);
+      }
+    }
+    if (!uploadUrl || !activeKey) return { ok: false, error: 'Tất cả keys đều lỗi khi init upload' };
+
+    // Upload bytes (dùng upload URL, không cần key)
+    const upRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Length':         String(uploadSize),
+        'X-Goog-Upload-Offset':   '0',
+        'X-Goog-Upload-Command':  'upload, finalize',
+      },
+      body: fileBuffer,
+    });
+    if (!upRes.ok) return { ok: false, error: `Upload bytes lỗi ${upRes.status}` };
+    let fileInfo = (await upRes.json()).file;
+
+    // Poll ACTIVE — nếu key hiện tại quota thì xoay key khác
+    log('⏳ Gemini đang xử lý video...');
+    let tries = 0;
+    let keyIdx = keys.indexOf(activeKey);
+    while (fileInfo?.state === 'PROCESSING' && tries < 40) {
+      await new Promise(r => setTimeout(r, 3000));
+      let pollOk = false;
+      for (let ki = 0; ki < keys.length; ki++) {
+        const pollKey = keys[(keyIdx + ki) % keys.length];
+        try {
+          const poll = await fetch(`https://generativelanguage.googleapis.com/v1beta/${fileInfo.name}?key=${pollKey}`);
+          if (poll.ok) { fileInfo = await poll.json(); keyIdx = (keyIdx + ki) % keys.length; pollOk = true; break; }
+        } catch (_) {}
+      }
+      if (!pollOk) break;
+      tries++;
+    }
+    if (fileInfo?.state !== 'ACTIVE') {
+      return { ok: false, error: `Gemini video state: ${fileInfo?.state || 'unknown'}` };
+    }
+
+    log(`✅ Upload xong — sẵn sàng phân tích`);
+    return { ok: true, uri: fileInfo.uri, mimeType: 'video/mp4', usedKey: activeKey };
+
+  } catch (e) {
+    return { ok: false, error: e.message };
+  } finally {
+    if (tmpCompressed) try { fs.unlinkSync(tmpCompressed); } catch (_) {}
+  }
+});
 
 ipcMain.handle('gemini:quota-status', (_, { apiKeys }) => {
     const keys = Array.isArray(apiKeys) ? apiKeys : [];
@@ -5034,11 +5535,14 @@ ipcMain.handle('video:mixAudio', async (event, { videoPath, audioPath, outputPat
             ];
         } else {
             args = [
-                '-y', '-i', videoPath, '-i', audioPath,
+                '-y',
+                '-fflags', '+genpts',         // fix PTS lỗi từ CDN-streamed VFR video
+                '-i', videoPath, '-i', audioPath,
                 '-filter_complex',
                 `[0:a]volume=${videoVol}[orig];[1:a]volume=${audioVol}[dub];[orig][dub]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=level_in=1:level_out=1:limit=0.95:attack=5:release=50:asc=1[aout]`,
                 '-map', '0:v:0', '-map', '[aout]',
                 '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+                '-avoid_negative_ts', 'make_zero',
                 outputPath
             ];
         }
@@ -5471,15 +5975,64 @@ ipcMain.handle('video:read-folder', async (event, folderPath) => {
 });
 
 // Cắt video thành nhiều phần
-ipcMain.handle('video:cut', async (event, { inputPath, segmentTime, outputFolder }) => {
+ipcMain.handle('video:cut', async (event, { inputPath, segmentTime, outputFolder, trimHead = 0, trimTail = 0, cropRatio = null, cropX = 50 }) => {
     try {
         if (!fs.existsSync(outputFolder)) fs.mkdirSync(outputFolder, { recursive: true });
         const baseName = path.basename(inputPath, path.extname(inputPath));
         sendVideoLog(`Bắt đầu cắt: ${path.basename(inputPath)} → mỗi ${segmentTime}s`);
+
+        const needReencode = !!(cropRatio || trimHead > 0 || trimTail > 0);
+
+        // Probe duration nếu cần cắt đuôi
+        let totalDur = 0;
+        if (trimTail > 0) {
+            try {
+                const out = require('child_process').execSync(
+                    `"${ffprobePath}" -v quiet -print_format json -show_format "${inputPath}"`,
+                    { timeout: 10000 }
+                ).toString();
+                totalDur = parseFloat(JSON.parse(out)?.format?.duration || '0');
+                sendVideoLog(`📏 Duration: ${totalDur.toFixed(1)}s`);
+            } catch (_) {}
+        }
+
         return new Promise((resolve) => {
             const outputPattern = path.join(outputFolder, `${baseName}_%03d.mp4`);
-            const args = ['-y', '-i', inputPath, '-c', 'copy', '-map', '0',
-                '-f', 'segment', '-segment_time', segmentTime.toString(), '-reset_timestamps', '1', outputPattern];
+            const args = ['-y'];
+
+            // Seek trước -i (fast seek)
+            if (trimHead > 0) args.push('-ss', String(trimHead));
+            args.push('-i', inputPath);
+
+            // Giới hạn thời gian đầu ra
+            if (trimTail > 0 && totalDur > 0) {
+                const effDur = Math.max(1, totalDur - (trimHead || 0) - trimTail);
+                args.push('-t', String(effDur.toFixed(3)));
+                sendVideoLog(`⏱ Hiệu lực: ${effDur.toFixed(1)}s (bỏ đầu ${trimHead}s, bỏ đuôi ${trimTail}s)`);
+            }
+
+            if (needReencode) {
+                // Build vf filter
+                const vfParts = [];
+                if (cropRatio === '1:1') {
+                    // cropX 0=trái…50=giữa…100=phải: offset = (iw-ih) * cropX/100
+                    const xExpr = `(iw-ih)*${(cropX/100).toFixed(4)}`;
+                    vfParts.push(`crop=ih:ih:${xExpr}:0,scale=1080:1080`);
+                    sendVideoLog(`🔲 Crop 1:1 (1080×1080), vị trí ${cropX}%`);
+                } else if (cropRatio === '9:16') {
+                    // cropW = ih*9/16; offset = (iw - cropW) * cropX/100
+                    const xExpr = `(iw-ih*9/16)*${(cropX/100).toFixed(4)}`;
+                    vfParts.push(`crop=ih*9/16:ih:${xExpr}:0,scale=1080:1920`);
+                    sendVideoLog(`📱 Crop 9:16 (1080×1920), vị trí ${cropX}%`);
+                }
+                if (vfParts.length > 0) args.push('-vf', vfParts.join(','));
+                args.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-c:a', 'copy');
+            } else {
+                args.push('-c', 'copy', '-map', '0');
+            }
+
+            args.push('-f', 'segment', '-segment_time', segmentTime.toString(), '-reset_timestamps', '1', outputPattern);
+
             const proc = spawn(ffmpegPath, args);
             proc.stderr.on('data', d => { const t = d.toString().match(/time=[\d:.]+/)?.[0]; if (t) sendVideoLog(`Đang cắt: ${t}`); });
             proc.on('close', (code) => {
@@ -6336,6 +6889,342 @@ ipcMain.handle('watermark:detect-only', async (event, { folder }) => {
     });
 });
 
+// ── Ghép nhiều tập thành 1 file ──────────────────────────────────────────────
+ipcMain.handle('video:merge-episodes', async (_event, { paths, outputPath }) => {
+  const os = require('os');
+  const ffmpegBin = (() => { try { return require('ffmpeg-static'); } catch { return 'ffmpeg'; } })();
+  const listPath  = path.join(os.tmpdir(), `merge_${Date.now()}.txt`);
+  const listContent = paths.map(p => `file '${p.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n');
+  try {
+    fs.writeFileSync(listPath, listContent, 'utf8');
+    await new Promise((resolve, reject) => {
+      const { execFile } = require('child_process');
+      execFile(ffmpegBin, [
+        '-y', '-f', 'concat', '-safe', '0', '-i', listPath,
+        '-c', 'copy', outputPath,
+      ], { timeout: 10 * 60 * 1000 }, (err) => err ? reject(err) : resolve());
+    });
+    return { ok: true, outputPath };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  } finally {
+    try { fs.unlinkSync(listPath); } catch {}
+  }
+});
+
+// ── Thêm overlay: logo, tên kênh, phụ đề ASS ────────────────────────────────
+ipcMain.handle('video:add-overlay', async (_event, { inputPath, outputPath, logo, channel, sub, cutSegs }) => {
+  const _ffmpeg  = (() => { try { return require('ffmpeg-static'); } catch { return 'ffmpeg'; } })();
+  const _ffprobe = (() => { try { return require('ffprobe-static').path; } catch { return _ffmpeg?.replace(/ffmpeg(\.exe)?$/, 'ffprobe$1') || 'ffprobe'; } })();
+  const { execFile: _execFile } = require('child_process');
+  const _os   = require('os');
+  const _path = require('path');
+  const _fs   = require('fs');
+
+  const execP = (bin, args, opts = {}) => new Promise((res, rej) => {
+    _execFile(bin, args, { timeout: 600000, maxBuffer: 10 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
+      if (err) {
+        // Bỏ banner ffmpeg, lấy tất cả dòng lỗi thật (sau banner ~15 dòng)
+        const lines = (stderr || '').split('\n').filter(l => l.trim());
+        const bannerEnd = lines.findIndex((l, i) => i > 3 && !l.startsWith('  ') && !l.match(/^lib(av|sw|post)/));
+        err._stderr = (bannerEnd >= 0 ? lines.slice(bannerEnd) : lines.slice(-20)).join('\n') || err.message;
+        rej(err);
+      } else res(stdout);
+    });
+  });
+
+  const ffEsc  = (p) => p.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+  // ffPath: dùng cho file path trong filter option — single-quote bảo vệ space, không cần escape colon
+  const ffPath = (p) => `'${p.replace(/\\/g, '/').replace(/'/g, "\\'")}'`;
+  // ffFontPath: dùng riêng cho fontfile= trong drawtext — escape drive-letter colon (C: → C\:)
+  const ffFontPath = (p) => p.replace(/\\/g, '/').replace(/^([A-Za-z]):/, '$1\\:').replace(/'/g, "\\'");
+
+  const getDims = async (fp) => {
+    try {
+      const out = await execP(_ffprobe, ['-v','quiet','-print_format','json','-show_streams', fp]);
+      const vs = JSON.parse(out).streams?.find(s => s.codec_type === 'video');
+      return { w: vs?.width || 1080, h: vs?.height || 1920 };
+    } catch { return { w: 1080, h: 1920 }; }
+  };
+
+  // SRT timestamp → ms
+  const srtMs = (t) => {
+    if (!t) return 0;
+    const [hms, ms = '0'] = t.trim().split(',');
+    const [h = 0, m = 0, s = 0] = hms.split(':').map(Number);
+    return h * 3600000 + m * 60000 + s * 1000 + parseInt(ms);
+  };
+  // ms → ASS time string h:mm:ss.cc
+  const msToAss = (ms) => {
+    const h  = Math.floor(ms / 3600000); ms %= 3600000;
+    const m  = Math.floor(ms / 60000);   ms %= 60000;
+    const s  = Math.floor(ms / 1000);    ms %= 1000;
+    return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(Math.floor(ms / 10)).padStart(2,'0')}`;
+  };
+
+  // Build & write ASS subtitle file from SRT with word-wrap and custom style
+  const srtToAss = (srtPath, opts = {}) => {
+    const { w = 1080, h = 1920, fontSize = 22, color = '#ffffff', bgOpacity = 60, marginV = 200, maxWords = 6 } = opts;
+    const hexToAss = (hex) => {
+      const hx = (hex || '#ffffff').replace('#', '').padStart(6, '0').toUpperCase();
+      return `&H00${hx.slice(4,6)}${hx.slice(2,4)}${hx.slice(0,2)}`;
+    };
+    const bgA = Math.round((1 - Math.min(100, Math.max(0, bgOpacity)) / 100) * 255).toString(16).padStart(2,'0').toUpperCase();
+    const borderStyle = bgOpacity > 10 ? 3 : 1;
+    const outline     = bgOpacity > 10 ? 0 : 3;
+
+    const header = [
+      '[Script Info]',
+      'ScriptType: v4.00+',
+      `PlayResX: ${w}`,
+      `PlayResY: ${h}`,
+      'WrapStyle: 0',
+      '',
+      '[V4+ Styles]',
+      'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+      `Style: Default,Arial,${fontSize},${hexToAss(color)},&H000000FF,&H00000000,&H${bgA}000000,0,0,0,0,100,100,0,0,${borderStyle},${outline},1,2,10,10,${marginV},1`,
+      '',
+      '[Events]',
+      'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+    ].join('\n');
+
+    const content = _fs.readFileSync(srtPath, 'utf8');
+    const blocks  = content.split(/\n\r?\n/).map(b => b.trim()).filter(Boolean);
+    const events  = [];
+
+    for (const block of blocks) {
+      const lines    = block.split(/\r?\n/);
+      const timeLine = lines.find(l => l.includes(' --> '));
+      if (!timeLine) continue;
+      const text = lines.filter(l => !l.match(/^\d+$/) && !l.includes(' --> ')).join(' ').trim();
+      if (!text) continue;
+      const [stStr, etStr] = timeLine.split(' --> ').map(s => s.trim());
+      const stMs = srtMs(stStr), etMs = srtMs(etStr);
+      const words  = text.split(/\s+/).filter(Boolean);
+      const chunks = [];
+      for (let i = 0; i < words.length; i += maxWords) chunks.push(words.slice(i, i + maxWords).join(' '));
+      const dur = Math.max(100, Math.floor((etMs - stMs) / chunks.length));
+      chunks.forEach((chunk, ci) => {
+        const cs = stMs + ci * dur;
+        const ce = ci === chunks.length - 1 ? etMs : cs + dur;
+        events.push(`Dialogue: 0,${msToAss(cs)},${msToAss(ce)},Default,,0,0,0,,${chunk}`);
+      });
+    }
+
+    const tmpPath = _path.join(_os.tmpdir(), `ov_${Date.now()}.ass`);
+    _fs.writeFileSync(tmpPath, header + '\n' + events.join('\n') + '\n', 'utf8');
+    return tmpPath;
+  };
+
+  // Ánh xạ SRT timestamps sang timeline mới sau random cut
+  // segs: [{s, e, dur}, ...] — các đoạn giữ lại từ video gốc (theo giây)
+  const adjustSrtByCuts = (srtPath, segs) => {
+    if (!segs || segs.length === 0) return srtPath;
+    const mapMs = (tMs) => {
+      const t = tMs / 1000;
+      let acc = 0;
+      for (let i = 0; i < segs.length; i++) {
+        if (t < segs[i].s)  return Math.round(acc * 1000); // trong gap trước seg này → snap đầu seg
+        if (t <= segs[i].e) return Math.round((acc + (t - segs[i].s)) * 1000); // trong seg
+        acc += segs[i].dur;
+      }
+      return Math.round(acc * 1000); // sau tất cả segs
+    };
+    const parseSrtTs = (ts) => {
+      const [hms, ms2 = '0'] = ts.trim().split(',');
+      const [h = 0, m = 0, s = 0] = hms.split(':').map(Number);
+      return h * 3600000 + m * 60000 + s * 1000 + parseInt(ms2);
+    };
+    const fmtSrtTs = (ms) => {
+      const H = Math.floor(ms / 3600000); let r = ms % 3600000;
+      const M = Math.floor(r / 60000);    r %= 60000;
+      const S = Math.floor(r / 1000);     r %= 1000;
+      return `${String(H).padStart(2,'0')}:${String(M).padStart(2,'0')}:${String(S).padStart(2,'0')},${String(r).padStart(3,'0')}`;
+    };
+    const content  = _fs.readFileSync(srtPath, 'utf8');
+    const adjusted = content.replace(
+      /(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})/g,
+      (_, start, end) => `${fmtSrtTs(mapMs(parseSrtTs(start)))} --> ${fmtSrtTs(mapMs(parseSrtTs(end)))}`
+    );
+    const adjPath = _path.join(_os.tmpdir(), `srt_adj_${Date.now()}.srt`);
+    _fs.writeFileSync(adjPath, adjusted, 'utf8');
+    return adjPath;
+  };
+
+  // SRT → cues cho drawtext (không cần libass)
+  const parseSrtCues = (srtPath, maxWords = 6) => {
+    const content = _fs.readFileSync(srtPath, 'utf8');
+    const blocks  = content.split(/\n\r?\n/).map(b => b.trim()).filter(Boolean);
+    const cues    = [];
+    for (const block of blocks) {
+      const lines    = block.split(/\r?\n/);
+      const timeLine = lines.find(l => l.includes(' --> '));
+      if (!timeLine) continue;
+      const text = lines.filter(l => !l.match(/^\d+$/) && !l.includes(' --> ')).join(' ').trim();
+      if (!text) continue;
+      const [stStr, etStr] = timeLine.split(' --> ').map(s => s.trim());
+      const stMs = srtMs(stStr), etMs = srtMs(etStr);
+      const words  = text.split(/\s+/).filter(Boolean);
+      const chunks = [];
+      for (let i = 0; i < words.length; i += maxWords) chunks.push(words.slice(i, i + maxWords).join(' '));
+      const dur = Math.max(100, Math.floor((etMs - stMs) / chunks.length));
+      chunks.forEach((chunk, ci) => {
+        const cs = (stMs + ci * dur) / 1000;
+        const ce = (ci === chunks.length - 1 ? etMs : stMs + (ci + 1) * dur) / 1000;
+        cues.push({ text: chunk, start: cs, end: ce });
+      });
+    }
+    return cues;
+  };
+
+  let tempAssPath = null;
+  let tempChanTxtPath = null;
+  const subCueTmpFiles = [];
+  try {
+    const hasLogo    = !!(logo    && logo.path    && _fs.existsSync(logo.path));
+    const hasChannel = !!(channel && channel.text && channel.text.trim());
+    const hasSub     = !!(sub     && sub.srtPath  && _fs.existsSync(sub.srtPath));
+
+    if (!hasLogo && !hasChannel && !hasSub) {
+      _fs.copyFileSync(inputPath, outputPath);
+      return { ok: true, path: outputPath };
+    }
+
+    const dims = (hasLogo || hasSub) ? await getDims(inputPath) : { w: 1080, h: 1920 };
+
+    const filters   = [];
+    const inputArgs = ['-fflags', '+genpts', '-i', inputPath];
+    let   vStream   = '0:v';
+    let   inputIdx  = 1;
+
+    // Logo overlay — scale dùng pixel thật (main_w không valid trong scale filter riêng)
+    if (hasLogo) {
+      inputArgs.push('-i', logo.path);
+      const logoW = Math.max(10, Math.round(dims.w * (logo.w || 15) / 100));
+      const X = `(main_w*${((logo.x || 5)  / 100).toFixed(4)}-w/2)`;
+      const Y = `(main_h*${((logo.y || 5)  / 100).toFixed(4)}-h/2)`;
+      const A = ((logo.opacity || 80) / 100).toFixed(2);
+      filters.push(`[${inputIdx}:v]scale=${logoW}:-1,format=rgba,colorchannelmixer=aa=${A}[lg]`);
+      filters.push(`[${vStream}][lg]overlay=x=${X}:y=${Y}[vl]`);
+      vStream = 'vl'; inputIdx++;
+    }
+
+    // Channel name — dùng ass= filter (libass), hỗ trợ tiếng Việt + \pos(x,y) định vị chính xác
+    if (hasChannel) {
+      try {
+        const chSize  = channel.size || 28;
+        const hexToAssClr = (hex) => {
+          const h = (hex || '#ffffff').replace('#','').padStart(6,'0').toUpperCase();
+          return `&H00${h.slice(4,6)}${h.slice(2,4)}${h.slice(0,2)}&`;
+        };
+        const chClr = hexToAssClr(channel.color);
+        // Vị trí: PlayRes 1080×1920 theo tỉ lệ channel.x/y (%)
+        const posX = Math.round((channel.x || 50) / 100 * 1080);
+        const posY = Math.round((channel.y ||  5) / 100 * 1920);
+        const chanAssContent = [
+          '[Script Info]', 'ScriptType: v4.00+', 'PlayResX: 1080', 'PlayResY: 1920', '',
+          '[V4+ Styles]',
+          'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+          `Style: Default,Arial,${chSize},${chClr},&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,5,10,10,10,1`,
+          '', '[Events]',
+          'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+          `Dialogue: 0,0:00:00.00,9:59:00.00,Default,,0,0,0,,{\\pos(${posX},${posY})}${(channel.text || '').trim()}`,
+        ].join('\n');
+        const chanAssFile = `chanass_${Date.now()}.ass`;
+        const chanAssPath = `C:\\Windows\\Temp\\${chanAssFile}`;
+        _fs.writeFileSync(chanAssPath, chanAssContent, 'utf8');
+        subCueTmpFiles.push(chanAssPath);
+        filters.push(`[${vStream}]ass=${chanAssFile}[vc]`);
+        vStream = 'vc';
+      } catch (chErr) {
+        console.warn('[video:add-overlay] Channel name ASS failed:', chErr.message);
+      }
+    }
+
+    // Subtitles: SRT → ASS → ass= filter trong filter_complex (libass, tiếng Việt đầy đủ dấu)
+    if (hasSub) {
+      try {
+        const marginV = Math.round((1 - (sub.y || 85) / 100) * 600) + 20;
+        // Nếu có cutSegs (sau random cut), điều chỉnh timestamps SRT trước khi burn
+        const effectiveSrtPath = cutSegs ? adjustSrtByCuts(sub.srtPath, cutSegs) : sub.srtPath;
+        if (cutSegs) console.log(`[video:add-overlay] adjustSrtByCuts: ${cutSegs.length} segs applied`);
+        // Tạo ASS file với style (srtToAss ghi vào os.tmpdir() — có thể có khoảng trắng)
+        const assFromSrtToAss = srtToAss(effectiveSrtPath, {
+          fontSize: sub.size || 22,
+          color:    sub.color || '#ffffff',
+          bgOpacity: sub.bgOpacity ?? 60,
+          marginV,
+          maxWords: sub.maxWords || 6,
+        });
+        // Copy ASS sang C:\Windows\Temp\ (path sạch, không khoảng trắng/tiếng Việt)
+        const assCleanPath = `C:\\Windows\\Temp\\ov_${Date.now()}.ass`;
+        _fs.copyFileSync(assFromSrtToAss, assCleanPath);
+        tempAssPath = assCleanPath;  // dọn trong finally
+        try { _fs.unlinkSync(assFromSrtToAss); } catch {}
+
+        // Dùng basename (relative path) — ffmpeg cwd=C:\Windows\Temp nên tìm được file
+        const assBaseName = _path.basename(assCleanPath);
+        const outLabel = `vsub`;
+        filters.push(`[${vStream}]ass=${assBaseName}[${outLabel}]`);
+        vStream = outLabel;
+        console.log(`[video:add-overlay] Subtitle: ass= filter (libass)`);
+      } catch (subErr) {
+        console.warn('[video:add-overlay] Subtitle failed, skipping:', subErr.message);
+      }
+    }
+
+    // If no filters were built at all (e.g. hasChannel/hasSub but all failed), just copy
+    if (!filters.length) {
+      _fs.copyFileSync(inputPath, outputPath);
+      return { ok: true, path: outputPath };
+    }
+
+    // execFile không dùng shell → truyền filter_complex inline (không cần script file)
+    const cpuEncArgs = ['-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-r', '30', '-vsync', 'cfr'];
+    const enc = await detectFfmpegEncoder();
+
+    // cwd=C:\Windows\Temp cho phép dùng relative path trong ass= và textfile= (tránh drive-letter issue)
+    const ffCwd = 'C:\\Windows\\Temp';
+    const tryRun = async (filterList, outStream) => {
+      const fc2 = filterList.join(';');
+      const mkArgs = (encArgs) => [
+        '-y', ...inputArgs,
+        '-filter_complex', fc2,
+        '-map', `[${outStream}]`, '-map', '0:a:0?',
+        ...encArgs,
+        '-c:a', 'copy', '-movflags', '+faststart',
+        outputPath,
+      ];
+      const runOpts = { timeout: 10 * 60 * 1000, ...(ffCwd ? { cwd: ffCwd } : {}) };
+      const cfrArgs = ['-r', '30', '-vsync', 'cfr']; // normalize VFR → CFR, tránh frame stutter
+      if (enc.type !== 'cpu') {
+        try { return await execP(_ffmpeg, mkArgs([...enc.args, ...cfrArgs]), runOpts); }
+        catch (_gpuErr) { console.warn('[video:add-overlay] GPU failed, retrying CPU:', _gpuErr.message); }
+      }
+      return execP(_ffmpeg, mkArgs(cpuEncArgs), runOpts);
+    };
+
+    // Chạy overlay — drawtext không cần libass nên không cần fallback sub
+    try {
+      await tryRun(filters, vStream);
+    } catch (fullErr) {
+      throw fullErr;
+    }
+    return { ok: true, path: outputPath };
+
+  } catch (e) {
+    const raw = e._stderr || e.message || 'unknown';
+    // lấy đầu + cuối để thấy lỗi thật (không chỉ filter string)
+    const detail = raw.length > 3000 ? raw.slice(0, 1500) + '\n...\n' + raw.slice(-500) : raw;
+    console.error('[video:add-overlay]', detail);
+    return { ok: false, error: detail };
+  } finally {
+    if (tempAssPath)     try { _fs.unlinkSync(tempAssPath);     } catch {}
+    if (tempChanTxtPath) try { _fs.unlinkSync(tempChanTxtPath); } catch {}
+    for (const f of subCueTmpFiles) try { _fs.unlinkSync(f); } catch {}
+  }
+});
+
 // ── Tái tạo video: xóa logo + cắt đoạn + ghép + lọc 4K ─────────────────────
 ipcMain.handle('video:recreate', async (event, { videoPath, outputFolder, zoomPct = 5, apply4K = true, channelName = '', wmOpacity = 20, wmCycle = 60, varSpeed = false, varSpeedLevel = 'medium', pitchShift = 0, stereoFlip = false, bgNoise = false, bgNoiseLevel = 3, bgNoiseFile = '', bgNoiseColor = 'pink', audioVolume = 100, kenBurns = 'none', randomCut = true, hFlip = false, grainNoise = false, grainLevel = 5, randomMeta = true, gpuMode = 'auto', colorShift = false, colorShiftLevel = 'medium', randomPosCrop = false, randomFps = false, slightRotate = false, hueRotate = false, audioEQ = false, subRemove = false, subHeight = 10, subWidth = 100, subHOffset = 0, subPosition = 'bottom', subStyle = 'blur', vignette = false, videoPad = false, audioCompress = false, audioReverb = false, audioChorus = false, brightnessJitter = false, colorChannelShift = false, temporalBlend = false, perspectiveWarp = false, audioDither = false, rvcEnabled = false, rvcModelPath = '', rvcIndexPath = '', rvcPitch = 0, rvcF0Method = 'pm', targetDurEnabled = false, targetDurMinutes = 0, outputResolution = 'source', trimStart = 0, trimEnd = 0, preDetectedLogoRegions = null, preDetectedImgW = null, preDetectedImgH = null, outputFileName = '' }) => {
     const sendLog = (msg, type = 'info', stepNum) => {
@@ -6688,16 +7577,52 @@ ipcMain.handle('video:recreate', async (event, { videoPath, outputFolder, zoomPc
             const MAX_SEGS = 50;
             const minSegLen = duration < 60 ? 3 : Math.max(8, duration / MAX_SEGS * 0.8);
             const maxSegExtra = duration < 60 ? 3 : Math.max(7, duration / MAX_SEGS * 0.4);
+
+            // Probe keyframe timestamps → snap cut points vào I-frame gần nhất
+            // Tránh B-frame decode issue gây freeze frame tại segment boundary
+            let keyframeTimes = [];
+            try {
+                const kfOut = await new Promise((res) => {
+                    const p = spawn(ffprobePath, [
+                        '-v', 'quiet', '-select_streams', 'v:0',
+                        '-show_entries', 'packet=pts_time,flags',
+                        '-of', 'csv=p=0', videoPath,
+                    ], { windowsHide: true });
+                    let o = '';
+                    p.stdout.on('data', d => o += d);
+                    p.on('close', () => res(o));
+                    p.on('error', () => res(''));
+                });
+                keyframeTimes = kfOut.trim().split('\n')
+                    .filter(l => l.includes(',K'))
+                    .map(l => parseFloat(l.split(',')[0]))
+                    .filter(t => !isNaN(t) && t >= 0)
+                    .sort((a, b) => a - b);
+                if (keyframeTimes.length > 0)
+                    sendLog(`🔑 ${keyframeTimes.length} keyframes — snap cut vào I-frame, tránh freeze`, 'info', 3);
+            } catch(_) {}
+            const snapToKF = (t) => {
+                if (!keyframeTimes.length) return t;
+                let best = keyframeTimes[0], bestDist = Math.abs(t - keyframeTimes[0]);
+                for (const kf of keyframeTimes) {
+                    if (kf > t + 2) break; // sorted, no need to continue
+                    const d = Math.abs(t - kf);
+                    if (d < bestDist) { best = kf; bestDist = d; }
+                }
+                return best;
+            };
+
             let tc = 0;
             while (tc < duration - 2) {
                 const segLen = minSegLen + Math.random() * maxSegExtra;
                 const cutFrames = 2 + Math.floor(Math.random() * 4);
                 const cutLen = cutFrames * frameDur;
-                const sFrame = Math.round((trimOffset + tc) * srcFpsNum);
-                const eRaw   = Math.min(trimOffset + tc + segLen - cutLen, trimOffset + duration - 0.1);
-                const eFrame = Math.round(eRaw * srcFpsNum);
-                const s   = parseFloat((sFrame / srcFpsNum).toFixed(6));
-                const e   = parseFloat((eFrame / srcFpsNum).toFixed(6));
+                const sRaw = trimOffset + tc;
+                const eRaw = Math.min(trimOffset + tc + segLen - cutLen, trimOffset + duration - 0.1);
+                const s = snapToKF(sRaw);
+                const e = snapToKF(eRaw);
+                const sFrame = Math.round(s * srcFpsNum);
+                const eFrame = Math.round(e * srcFpsNum);
                 const dur = parseFloat(((eFrame - sFrame) / srcFpsNum).toFixed(6));
                 if (e - s > 1) segs.push({ s, e, sFrame, eFrame, dur });
                 if (segs.length >= MAX_SEGS) break;
@@ -7318,7 +8243,7 @@ ipcMain.handle('video:recreate', async (event, { videoPath, outputFolder, zoomPc
         // Xóa file _tmp.mp4 trung gian nếu còn sót
         if (typeof outputPath !== 'undefined') delLong(outputPath.replace(/\.mp4$/, '_tmp.mp4'));
 
-        return { ok: true, path: outputPath, logoRegions, detectedImgW, detectedImgH };
+        return { ok: true, path: outputPath, logoRegions, detectedImgW, detectedImgH, segs };
     } catch(e) {
         sendLog(`❌ Lỗi: ${e.message}\n${e.stack?.split('\n').slice(0,3).join(' | ')}`, 'error');
         const delLong = (p) => {
@@ -7725,6 +8650,442 @@ ipcMain.handle('bilibili:channelVideos', async (_e, { mid, page = 1 }) => {
         if (win && !win.isDestroyed()) win.close();
         return { error: e.message };
     }
+});
+
+ipcMain.handle('bilibili:trending', async (_e, { category = 'popular', page = 1 }) => {
+    const https = require('https');
+    // category: 'popular' | 'ranking' | rid number string (动画=1,游戏=4,生活=160,娱乐=5,科技=188)
+    let apiUrl;
+    if (category === 'popular') {
+        apiUrl = `https://api.bilibili.com/x/web-interface/popular?pn=${page}&ps=20`;
+    } else if (category === 'ranking') {
+        apiUrl = `https://api.bilibili.com/x/web-interface/ranking/v2?rid=0&type=all`;
+    } else {
+        apiUrl = `https://api.bilibili.com/x/web-interface/ranking/region?rid=${category}&day=7`;
+    }
+    return new Promise((resolve) => {
+        const req = https.get(apiUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                'Referer': 'https://www.bilibili.com/',
+                'Accept-Language': 'zh-CN,zh;q=0.9',
+                'Accept': 'application/json, text/plain, */*',
+            }
+        }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    const json = JSON.parse(data);
+                    if (json.code !== 0) { resolve({ error: json.message || '获取失败' }); return; }
+                    const list = (json.data?.list || json.data?.archives || []);
+                    const items = list.map((v, i) => ({
+                        bvid: v.bvid,
+                        url: 'https://www.bilibili.com/video/' + v.bvid,
+                        title: v.title,
+                        thumbnail: (v.pic || '').replace(/^http:/, 'https:'),
+                        duration: v.duration,
+                        author: v.owner?.name || v.author || '',
+                        mid: String(v.owner?.mid || ''),
+                        play: v.stat?.view || v.play || 0,
+                        like: v.stat?.like || v.video_review || 0,
+                        rank: i + 1,
+                        tname: v.tname || '',
+                    }));
+                    resolve({ items, hasMore: category === 'popular' && items.length >= 20 });
+                } catch (e) {
+                    resolve({ error: e.message });
+                }
+            });
+        });
+        req.on('error', e => resolve({ error: e.message }));
+        req.setTimeout(10000, () => { req.destroy(); resolve({ error: 'Timeout kết nối Bilibili' }); });
+    });
+});
+
+// ─── FREEREELS API ────────────────────────────────────────────────────────────
+const FR_API_BASE   = 'https://apiv2.free-reels.com/frv2-api';
+const FR_APP_SECRET = '8IAcbWyCsVhYv82S2eofRqK1DF3nNDAv';
+const FR_CRYPT_KEY  = '2r36789f45q01ae5'; // AES-CBC key from web bundle
+let _frAuth = null; // { auth_key, auth_secret, device_id, expires }
+
+function _frAesKeyBuf(keyStr) {
+    const b = Buffer.from(keyStr, 'utf8');
+    if (b.length < 16) { const p = Buffer.alloc(16); b.copy(p); return p; }
+    return b.slice(0, 16);
+}
+function _frDecrypt(b64, hint) {
+    const crypto = require('crypto');
+
+    // Try one AES-CBC decrypt attempt — no alignment pre-check, let OpenSSL handle it
+    const _tryAes = (raw, keyBuf, mode) => {
+        try {
+            if (raw.length < 32) return null;
+            const iv  = raw.slice(0, 16);
+            const ct  = raw.slice(16);
+            const dec = crypto.createDecipheriv(mode, keyBuf, iv);
+            const out = Buffer.concat([dec.update(ct), dec.final()]).toString('utf8');
+            // Must look like JSON
+            const first = out.trimStart()[0];
+            if (first === '{' || first === '[') return out.trimStart();
+            return null;
+        } catch { return null; }
+    };
+
+    const makeKey = (s, len) => { const b = Buffer.alloc(len); Buffer.from(s, 'utf8').copy(b); return b; };
+    const candidates = [
+        [makeKey(FR_CRYPT_KEY,   16), 'aes-128-cbc'],
+        [makeKey(FR_APP_SECRET,  16), 'aes-128-cbc'],
+        [makeKey(FR_APP_SECRET,  32), 'aes-256-cbc'],
+        [makeKey(FR_CRYPT_KEY,   32), 'aes-256-cbc'],
+    ];
+
+    // Thêm derived keys nếu có hint (series_id) — một số drama dùng HMAC/MD5(secret, id) làm key
+    if (hint) {
+        try {
+            const hmac256  = crypto.createHmac('sha256', FR_APP_SECRET).update(hint).digest();
+            const md5_1    = crypto.createHash('md5').update(FR_APP_SECRET + hint).digest();
+            const md5_2    = crypto.createHash('md5').update(hint + FR_APP_SECRET).digest();
+            const sha256_1 = crypto.createHash('sha256').update(FR_APP_SECRET + hint).digest();
+            const sha256_2 = crypto.createHash('sha256').update(hint + FR_APP_SECRET).digest();
+            candidates.push(
+                [hmac256,              'aes-256-cbc'],
+                [hmac256.slice(0,16),  'aes-128-cbc'],
+                [md5_1,                'aes-128-cbc'],
+                [md5_2,                'aes-128-cbc'],
+                [sha256_1,             'aes-256-cbc'],
+                [sha256_2,             'aes-256-cbc'],
+                [sha256_1.slice(0,16), 'aes-128-cbc'],
+            );
+        } catch {}
+    }
+
+    // Server đôi khi strip base64 padding — thử thêm '=' để căn chỉnh đúng
+    const clean = b64.replace(/[^A-Za-z0-9+/=]/g, '');
+    const stripped = clean.replace(/=+$/, '');
+    const b64Variants = [
+        clean,
+        stripped + (stripped.length % 4 === 3 ? '='  : ''),
+        stripped + (stripped.length % 4 === 2 ? '==' : ''),
+    ].filter((v, i, a) => v && a.indexOf(v) === i);
+
+    for (const b64str of b64Variants) {
+        let raw;
+        try { raw = Buffer.from(b64str, 'base64'); } catch { continue; }
+        for (const [keyBuf, mode] of candidates) {
+            const r = _tryAes(raw, keyBuf, mode);
+            if (r) { console.log('[FR decrypt] OK mode=%s keyLen=%d hint=%s len=%d', mode, keyBuf.length, hint, r.length); return r; }
+        }
+    }
+    console.warn('[FR decrypt] ALL methods failed, b64 chars:', b64?.length, 'hint:', hint);
+    return null;
+}
+function _frEncrypt(text) {
+    try {
+        const crypto = require('crypto');
+        const iv     = crypto.randomBytes(16);
+        const key    = _frAesKeyBuf(FR_CRYPT_KEY);
+        const enc    = crypto.createCipheriv('aes-128-cbc', key, iv);
+        const ct     = Buffer.concat([enc.update(Buffer.from(text, 'utf8')), enc.final()]);
+        return Buffer.concat([iv, ct]).toString('base64');
+    } catch { return text; }
+}
+
+function _frMakeAuthHeader(authKey, authSecret) {
+    const crypto = require('crypto');
+    const sig = crypto.createHash('md5').update(`${FR_APP_SECRET}&${authSecret}`).digest('hex');
+    return `oauth_signature=${sig},oauth_token=${authKey},ts=${Date.now()}`;
+}
+
+function _frBaseHeaders(auth) {
+    return {
+        'app-name':    'com.freereels.app',
+        'app-version': '2.4.91',
+        'device':      'android',
+        'device-id':   auth.device_id,
+        'device-hash': auth.device_id,
+        'authorization': _frMakeAuthHeader(auth.auth_key, auth.auth_secret),
+    };
+}
+
+function _frRequest(method, path, body, extraHeaders) {
+    return new Promise((resolve, reject) => {
+        const https = require('https');
+        const url   = new URL(FR_API_BASE + path);
+
+        // Send POST body as plain JSON (server accepts both plain and encrypted)
+        // Only the auth/login endpoint exists as plain, content endpoints return encrypted responses
+        const data = body ? JSON.stringify(body) : null;
+
+        const opts = {
+            hostname: url.hostname,
+            port: 443,
+            path: url.pathname + url.search,
+            method,
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'User-Agent': 'okhttp/4.9.0',
+                ...(extraHeaders || {}),
+                ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {}),
+            },
+        };
+        const req = https.request(opts, res => {
+            let raw = '';
+            res.on('data', c => raw += c);
+            res.on('end', () => {
+                const trimmed = raw.trim();
+                // Try direct JSON parse first (home/feed endpoints return plain JSON)
+                try { return resolve(JSON.parse(trimmed)); } catch {}
+                // Extract series_id/key from URL path as decryption hint
+                const hintMatch = path.match(/(?:series_id|drama_key|key)=([A-Za-z0-9_-]+)/);
+                const hint = hintMatch ? hintMatch[1] : null;
+                // Try AES-CBC decrypt (drama info endpoints return encrypted base64)
+                const decrypted = _frDecrypt(trimmed, hint);
+                if (decrypted) {
+                    try { return resolve(JSON.parse(decrypted)); } catch {}
+                }
+                // Plain text (e.g. "404 page not found")
+                resolve({ code: 0, raw: trimmed });
+            });
+        });
+        req.on('error', e => reject(e));
+        req.setTimeout(15000, () => { req.destroy(); reject(new Error('FR API timeout')); });
+        if (data) req.write(data);
+        req.end();
+    });
+}
+
+async function _frEnsureAuth() {
+    if (_frAuth && Date.now() < _frAuth.expires) return _frAuth;
+    const crypto   = require('crypto');
+    const deviceId = 'fluxy_' + crypto.randomBytes(8).toString('hex');
+    const loginHdr = {
+        'app-name':    'com.freereels.app',
+        'app-version': '2.4.91',
+        'device':      'android',
+        'device-id':   deviceId,
+        'device-hash': deviceId,
+    };
+    const resp = await _frRequest('POST', '/anonymous/login', { device_id: deviceId }, loginHdr);
+    if (!resp?.data?.auth_key) throw new Error('FR login failed: ' + JSON.stringify(resp));
+    _frAuth = { ...resp.data, device_id: deviceId, expires: Date.now() + 20 * 3600 * 1000 };
+    return _frAuth;
+}
+
+ipcMain.handle('freereels:auth', async () => {
+    try {
+        const auth = await _frEnsureAuth();
+        return { success: true, userId: auth.user_id };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('freereels:home', async (_e, { tabId = '' } = {}) => {
+    try {
+        const auth = await _frEnsureAuth();
+        const hdrs = _frBaseHeaders(auth);
+        // Step 1: get tab list
+        const tabResp = await _frRequest('GET', '/homepage/v2/tab/list', null, hdrs);
+        const tabs = tabResp?.data?.list || tabResp?.data?.tabs || [];
+        const firstTab = tabId ? tabs.find(t => t.tab_key === tabId) : (tabs[0] || {});
+        // Step 2: get module list — requires tab_key + position_index + first (discovered from web app source)
+        const qs = firstTab.tab_key
+            ? `?tab_key=${firstTab.tab_key}&position_index=${firstTab.position_index ?? ''}&first=`
+            : '';
+        const moduleResp = await _frRequest('GET', `/homepage/v2/tab/index${qs}`, null, hdrs);
+        return { success: true, data: moduleResp, tabs };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('freereels:content-list', async (_e, { tabId = '', next = '' } = {}) => {
+    try {
+        const auth = await _frEnsureAuth();
+        const hdrs = _frBaseHeaders(auth);
+        const qs = [tabId && `tab_id=${tabId}`, next && `next=${encodeURIComponent(next)}`].filter(Boolean).join('&');
+        const data = await _frRequest('GET', `/homepage/v2/tab/index${qs ? '?' + qs : ''}`, null, hdrs);
+        return { success: true, data };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('freereels:search', async (_e, { keyword = '', page = 1 } = {}) => {
+    try {
+        const auth = await _frEnsureAuth();
+        const qs = `?keyword=${encodeURIComponent(keyword)}&page=${page}`;
+        // Try h5 search endpoint first
+        const data = await _frRequest('GET', `/search/drama${qs}`, null, _frBaseHeaders(auth));
+        return { success: true, data };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('freereels:drama-info', async (_e, { dramaId, rawId } = {}) => {
+    try {
+        const auth = await _frEnsureAuth();
+        const hdrs = _frBaseHeaders(auth);
+
+        // Build endpoints: try both the key and a separate numeric rawId if provided
+        const ids = [dramaId, rawId].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i);
+        const endpoints = ids.flatMap(id => [
+            `/drama/info_v2?series_id=${id}`,
+            `/drama/info_v2?drama_key=${id}`,
+            `/drama/info_v2?key=${id}`,
+            `/drama/info_v2/${id}`,
+            `/drama/v2/info?series_id=${id}`,
+            `/drama/v2/info?key=${id}`,
+            `/v2/drama/info?series_id=${id}`,
+            `/drama/info?series_id=${id}`,
+            `/drama/info?key=${id}`,
+            `/drama/info?drama_key=${id}`,
+            `/drama/info/${id}`,
+            `/drama/episode/list?series_id=${id}`,
+            `/drama/episode/list?drama_key=${id}`,
+            `/drama/episode/list?key=${id}`,
+            `/drama/episode_list?series_id=${id}`,
+            `/drama/episode_list?key=${id}`,
+        ]);
+
+        const results = {};
+        for (const ep of endpoints) {
+            if (results[ep]) continue; // skip duplicates
+            try {
+                const d = await _frRequest('GET', ep, null, hdrs);
+                // Store raw preview so callers can see what the API actually returned
+                results[ep] = {
+                    code: d?.code,
+                    msg: d?.message || d?.msg,
+                    hasData: !!d?.data,
+                    raw: d?.raw ? String(d.raw).slice(0, 200) : undefined,
+                    rawLen: d?.raw ? String(d.raw).length : undefined,
+                };
+                if (d?.raw) {
+                    console.log('[FR drama-info]', ep, '→ raw len:', String(d.raw).length);
+                    // Server trả về data lớn (>10KB) mà decrypt thất bại — thử parse trực tiếp như JSON
+                    if (String(d.raw).length > 10000) {
+                        try {
+                            const parsed = JSON.parse(d.raw);
+                            if (parsed?.data || parsed?.episode_list || parsed?.episodes) {
+                                console.log('[FR drama-info] fallback JSON parse OK for', ep);
+                                Object.assign(d, parsed);
+                                delete d.raw; // not raw anymore
+                            }
+                        } catch {}
+                    }
+                    if (d?.raw) continue; // still raw → skip
+                }
+
+                // Search episode_list in all known nesting patterns
+                const candidates = [
+                    d?.data?.info,
+                    d?.data?.data?.info,
+                    d?.data,
+                    d?.data?.data,
+                    d?.result?.info,
+                    d?.result,
+                    d?.info,
+                    d,
+                ];
+                for (const c of candidates) {
+                    if (!c) continue;
+                    for (const key of ['episode_list', 'episodes', 'list', 'items', 'episode']) {
+                        if (Array.isArray(c[key]) && c[key].length > 0) {
+                            return { success: true, data: d, _tried: results };
+                        }
+                    }
+                }
+            } catch (e) {
+                results[ep] = { error: e.message };
+            }
+        }
+        return { success: false, error: 'No episode_list found', _tried: results };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('freereels:trending', async () => {
+    try {
+        const auth = await _frEnsureAuth();
+        const data = await _frRequest('GET', '/search/trending_searches', null, _frBaseHeaders(auth));
+        return { success: true, data };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('freereels:feed', async (_e, { moduleKey = '', next = 'offset=0' } = {}) => {
+    try {
+        const auth = await _frEnsureAuth();
+        const data = await _frRequest('POST', '/homepage/v2/tab/feed', { module_key: moduleKey, next }, _frBaseHeaders(auth));
+        return { success: true, data };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('freereels:download', async (_e, { url, outputFolder, title = 'freereels_video' }) => {
+    const path = require('path');
+    const fs = require('fs');
+    const { execFile } = require('child_process');
+    const https = require('https');
+
+    if (!fs.existsSync(outputFolder)) fs.mkdirSync(outputFolder, { recursive: true });
+    const safeTitle = title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 80);
+
+    // Try yt-dlp first
+    const ytDlpPaths = [
+        path.join(process.resourcesPath || '', 'yt-dlp.exe'),
+        'yt-dlp',
+        path.join(__dirname, '../../bin/yt-dlp.exe'),
+    ];
+    let ytDlpPath = ytDlpPaths.find(p => { try { return require('fs').existsSync(p); } catch { return false; } }) || 'yt-dlp';
+
+    const outTemplate = path.join(outputFolder, safeTitle + '.%(ext)s');
+    const ytArgs = [url, '-o', outTemplate, '--no-playlist', '--merge-output-format', 'mp4', '--quiet'];
+
+    const ytResult = await new Promise(resolve => {
+        const proc = execFile(ytDlpPath, ytArgs, { timeout: 120000 }, (err, stdout, stderr) => {
+            if (!err) {
+                // Find output file
+                const mp4 = path.join(outputFolder, safeTitle + '.mp4');
+                if (fs.existsSync(mp4)) resolve({ success: true, outputPath: mp4 });
+                else {
+                    const files = fs.readdirSync(outputFolder).filter(f => f.startsWith(safeTitle));
+                    resolve(files.length ? { success: true, outputPath: path.join(outputFolder, files[0]) } : { success: false, error: 'yt-dlp: không tìm thấy file đầu ra' });
+                }
+            } else {
+                resolve({ success: false, error: stderr || err.message });
+            }
+        });
+    });
+    if (ytResult.success) return ytResult;
+
+    // Fallback: direct download (for direct mp4/m3u8 URLs)
+    const outputPath = path.join(outputFolder, safeTitle + '.mp4');
+    if (url.includes('.m3u8')) {
+        // Use ffmpeg for HLS
+        const ffmpegPath = require('ffmpeg-static') || 'ffmpeg';
+        return new Promise(resolve => {
+            execFile(ffmpegPath, ['-i', url, '-c', 'copy', '-y', outputPath], { timeout: 300000 }, (err) => {
+                if (!err) resolve({ success: true, outputPath });
+                else resolve({ success: false, error: 'HLS download thất bại: ' + err.message });
+            });
+        });
+    }
+    // Direct mp4 download
+    return new Promise(resolve => {
+        const file = require('fs').createWriteStream(outputPath);
+        https.get(url, { headers: { 'User-Agent': FR_MOBILE_UA, 'Referer': 'https://www.free-reels.com/' } }, res => {
+            res.pipe(file);
+            file.on('finish', () => resolve({ success: true, outputPath }));
+        }).on('error', e => resolve({ success: false, error: e.message }));
+    });
 });
 
 ipcMain.handle('bilibili:download', async (_e, { url, outputFolder, quality = 'best', bvid }) => {
@@ -9409,15 +10770,63 @@ ipcMain.handle('capcut:select-file', async (_, { filters, multiple = false }) =>
 // ── REMOTION RENDER ──────────────────────────────────────────────────────────
 ipcMain.handle('remotion:get-system-prompt', () => getSystemPrompt());
 
-ipcMain.handle('remotion:render-code', async (event, { code, outputFilename, outputDir }) => {
+// Lấy dung lượng ổ đĩa còn trống trên Windows (GB)
+function getFreeDiskGB(targetPath) {
+  try {
+    const { execSync } = require('child_process');
+    const drive = (targetPath || 'C:\\').match(/^([A-Za-z]:)/)?.[1] || 'C:';
+    const out = execSync(
+      `wmic logicaldisk where "DeviceID='${drive}'" get FreeSpace /value`,
+      { timeout: 3000, windowsHide: true }
+    ).toString();
+    const m = out.match(/FreeSpace=(\d+)/);
+    return m ? parseInt(m[1]) / (1024 ** 3) : null;
+  } catch { return null; }
+}
+
+// Dọn horror temp files inline (không cần IPC round-trip)
+function cleanHorrorTemp() {
+  try {
+    const tmpDir = require('os').tmpdir();
+    let freed = 0;
+    const tryRm = (p) => { try { freed += (fs.statSync(p).size || 0); fs.rmSync(p, { recursive: true, force: true }); } catch {} };
+    tryRm(path.join(tmpDir, 'horror-segs'));
+    for (const e of fs.readdirSync(tmpDir)) {
+      if (/^(horror-|hbg-)/i.test(e) || /_ps\d+\.mp4$/i.test(e)) tryRm(path.join(tmpDir, e));
+    }
+    return Math.round(freed / 1024 / 1024);
+  } catch { return 0; }
+}
+
+ipcMain.handle('remotion:render-code', async (event, { code, outputFilename, outputDir, durationInFrames }) => {
   const send = (msg) => { try { event.sender.send('remotion:log', msg); } catch (_) {} };
   try {
+    // Pre-render: kiểm tra disk space và dọn cache cũ
+    const outDir = outputDir || require('os').homedir();
+    const freeGB = getFreeDiskGB(outDir);
+    if (freeGB !== null && freeGB < 8) {
+      send(`⚠️ Ổ đĩa chỉ còn ${freeGB.toFixed(1)}GB — đang dọn cache trước khi render...`);
+      const freedMB = cleanHorrorTemp();
+      if (freedMB > 0) send(`🧹 Đã giải phóng ${freedMB} MB cache`);
+      const freeAfter = getFreeDiskGB(outDir);
+      if (freeAfter !== null && freeAfter < 5) {
+        return { ok: false, error: `Không đủ dung lượng ổ đĩa: còn ${freeAfter.toFixed(1)}GB, cần ít nhất 5GB để render. Xóa bớt file trên ổ ${outDir.slice(0,2)}.` };
+      }
+    }
+
     send('📝 Đang ghi file component...');
-    const compositionId = writeGeneratedFiles(code);
+    const compositionId = writeGeneratedFiles(code, durationInFrames);
     send(`🎬 Composition ID: ${compositionId}`);
     const outPath = await remotionRenderVideo(compositionId, outputFilename, send, outputDir || null);
     return { ok: true, path: outPath };
   } catch (err) {
+    const msg = err.message || '';
+    if (msg.includes('ENOSPC') || msg.includes('nospc') || msg.includes('no space')) {
+      send('🧹 Hết dung lượng — đang dọn cache...');
+      const freedMB = cleanHorrorTemp();
+      send(`🧹 Đã giải phóng ${freedMB} MB — vui lòng thử render lại`);
+      return { ok: false, error: `Hết dung lượng ổ đĩa (ENOSPC). Đã dọn ${freedMB}MB cache. Xóa thêm file rồi render lại.` };
+    }
     send(`❌ Lỗi: ${err.message}`);
     return { ok: false, error: err.message };
   }
@@ -9588,6 +10997,31 @@ ipcMain.handle('remotion:copy-ref-images-to-public', async (_, { filePaths }) =>
 });
 
 const _refExtMime = { jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', webp:'image/webp', gif:'image/gif', mp4:'video/mp4', mov:'video/quicktime', avi:'video/x-msvideo', mkv:'video/x-matroska', webm:'video/webm' };
+
+// Chọn nhiều video để xử lý hàng loạt (batch)
+ipcMain.handle('remotion:select-source-videos', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Chọn nhiều video để xử lý hàng loạt',
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Video', extensions: ['mp4','mov','avi','mkv','webm'] }],
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  const files = [];
+  for (const fp of result.filePaths) {
+    const ext = path.extname(fp).slice(1).toLowerCase();
+    const stat = fs.statSync(fp);
+    let durationSec = 0;
+    try {
+      const out = require('child_process').execSync(
+        `"${ffprobePath}" -v quiet -print_format json -show_format "${fp}"`,
+        { timeout: 10000 }
+      ).toString();
+      durationSec = parseFloat(JSON.parse(out)?.format?.duration || '0');
+    } catch (_) {}
+    files.push({ path: fp, name: path.basename(fp), mimeType: _refExtMime[ext] || 'video/mp4', size: stat.size, durationSec });
+  }
+  return files;
+});
 
 // Chọn video nguồn để chỉnh sửa + copy vào remotion/public/input.mp4
 ipcMain.handle('remotion:select-source-video', async () => {
@@ -11021,7 +12455,7 @@ ipcMain.handle('horror:bg-extract-frames', async (_e, { videoPath }) => {
 ipcMain.handle('horror:bg-save-frame', async (_e, { outDir, frameIndex, dataUrl }) => {
   try {
     const b64 = dataUrl.replace(/^data:image\/\w+;base64,/, '');
-    fs.writeFileSync(path.join(outDir, `frame_${String(frameIndex).padStart(6,'0')}.jpg`), Buffer.from(b64, 'base64'));
+    fs.writeFileSync(path.join(outDir, `frame_${String(frameIndex).padStart(6,'0')}.png`), Buffer.from(b64, 'base64'));
     return { ok: true };
   } catch (e) { return { ok: false, error: e.message }; }
 });
@@ -11035,7 +12469,7 @@ ipcMain.handle('horror:bg-reassemble', async (_e, { outDir, videoPath, outputPat
       const p = _sp(ffmpegBin, [
         '-y',
         '-framerate', String(fps),
-        '-i', path.join(outDir, 'frame_%06d.jpg'),
+        '-i', path.join(outDir, 'frame_%06d.png'),
         '-i', videoPath,
         '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
@@ -11224,6 +12658,76 @@ ipcMain.handle('horror:concat-segments', async (event, { segmentPaths, outputPat
         code === 0
           ? resolve({ ok: true, path: outputPath })
           : resolve({ ok: false, error: stderr.split('\n').filter(Boolean).slice(-2).join(' ') });
+      });
+      proc.on('error', e => resolve({ ok: false, error: e.message }));
+    });
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:split-video — cắt video thành N đoạn theo segment_time ──
+ipcMain.handle('horror:split-video', async (_e, { filePath, segmentSecs, outputDir }) => {
+  try {
+    const ffmpegBin = require('ffmpeg-static');
+    const { spawn: _sp } = require('child_process');
+    const os = require('os');
+    const outDirPath = outputDir || os.tmpdir();
+    const stamp = Date.now();
+    const outPattern = path.join(outDirPath, `horror-split-${stamp}-%03d.mp4`);
+    return await new Promise((resolve) => {
+      const args = [
+        '-y', '-i', filePath,
+        '-c', 'copy',
+        '-f', 'segment',
+        '-segment_time', String(segmentSecs),
+        '-reset_timestamps', '1',
+        outPattern,
+      ];
+      const proc = _sp(ffmpegBin, args);
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => {
+        if (code !== 0) return resolve({ ok: false, error: stderr.split('\n').filter(Boolean).slice(-3).join(' ') });
+        const prefix = `horror-split-${stamp}-`;
+        try {
+          const files = fs.readdirSync(outDirPath)
+            .filter(f => f.startsWith(prefix) && f.endsWith('.mp4'))
+            .sort()
+            .map((f, i) => ({ path: path.join(outDirPath, f), index: i }));
+          resolve({ ok: true, segments: files });
+        } catch (e2) { resolve({ ok: false, error: e2.message }); }
+      });
+      proc.on('error', e => resolve({ ok: false, error: e.message }));
+    });
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:delete-file — xóa 1 file tạm ──
+ipcMain.handle('horror:delete-file', async (_e, { filePath }) => {
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    return { ok: true };
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// ── horror:ffmpeg-filter — né Content ID nhanh: hue shift + noise (giây, không cần frame extraction) ──
+ipcMain.handle('horror:ffmpeg-filter', async (_e, { filePath, outputPath }) => {
+  try {
+    const ffmpegBin = require('ffmpeg-static');
+    const { spawn: _sp } = require('child_process');
+    return await new Promise((resolve) => {
+      const args = [
+        '-y', '-i', filePath,
+        '-vf', 'hue=h=15,noise=alls=4:allf=t+u',
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+        '-c:a', 'copy',
+        outputPath,
+      ];
+      const proc = _sp(ffmpegBin, args);
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => {
+        if (code !== 0) return resolve({ ok: false, error: stderr.split('\n').filter(Boolean).slice(-3).join(' ') });
+        resolve({ ok: true, path: outputPath });
       });
       proc.on('error', e => resolve({ ok: false, error: e.message }));
     });
@@ -11836,31 +13340,95 @@ Truyện: ${fullTranscript.slice(0, 3000)}`;
 });
 
 // ── HONGGUO (红果短剧) ─────────────────────────────────────────────────────────
-async function hongguoFetch(url) {
+async function hongguoFetch(url, _depth = 0) {
+  if (_depth > 4) throw new Error('Too many redirects');
   const https = require('https');
+  const http  = require('http');
+  const zlib  = require('zlib');
+  const mod   = url.startsWith('https') ? https : http;
   return new Promise((resolve, reject) => {
-    const req = https.get(url, {
+    const req = mod.get(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
+        'Accept-Encoding': 'gzip, deflate',
+        'Accept-Language': 'vi-VN,vi;q=0.9,zh-CN;q=0.8',
         'Referer': 'https://hongguoduanju.com/',
       }
     }, (res) => {
+      // Tự follow redirect (301/302/307/308) — Node.js https.get không tự follow
+      if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume(); // drain để release socket
+        const loc = res.headers.location;
+        const next = loc.startsWith('http') ? loc : `https://hongguoduanju.com${loc}`;
+        return hongguoFetch(next, _depth + 1).then(resolve).catch(reject);
+      }
+      // Giải nén nếu server gửi gzip/deflate
+      let stream = res;
+      const enc = res.headers['content-encoding'];
+      if (enc === 'gzip')    stream = res.pipe(zlib.createGunzip());
+      else if (enc === 'deflate') stream = res.pipe(zlib.createInflate());
       let raw = '';
-      res.on('data', d => { raw += d; });
-      res.on('end', () => {
+      stream.on('data', d => { raw += d.toString('utf8'); });
+      stream.on('end', () => {
         try {
           const firstLine = raw.split('\n')[0].trim();
+          if (!firstLine) throw new Error(`Empty response (HTTP ${res.statusCode})`);
           resolve({ ok: true, data: JSON.parse(firstLine), status: res.statusCode });
         } catch(e) {
-          reject(new Error(`JSON parse failed: ${e.message} | preview: ${raw.substring(0, 200)}`));
+          reject(new Error(`JSON parse failed: ${e.message} | HTTP ${res.statusCode} | preview: ${raw.substring(0, 300)}`));
         }
       });
+      stream.on('error', reject);
     });
     req.on('error', reject);
     req.setTimeout(15000, () => { req.destroy(); reject(new Error('Hongguo fetch timeout')); });
   });
 }
+
+// ── Hongguo category browse (paginated) ────────────────────────────────────
+ipcMain.handle('hongguo:get-category', async (event, { page = 1, genre = '' } = {}) => {
+  try {
+    // QUAN TRỌNG: page=1 đặt TRƯỚC __loader sẽ bị server trả 204 (redirect canonical)
+    // → page 1: không truyền page param; page N>1: đặt AFTER __ssrDirect=true
+    let url = `https://hongguoduanju.com/category?__loader=category_page&__ssrDirect=true`;
+    if (genre) url += `&selector_item_id=${encodeURIComponent(genre)}`;
+    if (page > 1) url += `&page=${page}`;
+    const { data } = await hongguoFetch(url);
+    const videos = (data?.recommendList || []).map(v => ({
+      series_id: v.series_id,
+      title: v.series_name,
+      cover: v.series_cover,
+      episode_cnt: v.episode_cnt,
+      accessible_episode_cnt: v.accessible_episode_cnt,
+      pay_type: v.pay_type,
+      episode_right_text: v.episode_right_text,
+      tags: (v.tags || []).map(t => t.name || t),
+      intro: v.series_intro,
+    }));
+    return { ok: true, videos, pagination: data?.pagination, genres: (data?.selectorList?.[0]?.items || []) };
+  } catch(e) { return { ok: false, error: e.message }; }
+});
+
+// ── Hongguo search by keyword ────────────────────────────────────────────────
+ipcMain.handle('hongguo:search', async (event, { keyword = '', page = 1 } = {}) => {
+  try {
+    const url = `https://hongguoduanju.com/search?keyword=${encodeURIComponent(keyword)}&page=${page}&__loader=search_page&__ssrDirect=true`;
+    const { data } = await hongguoFetch(url);
+    const videos = (data?.searchList || []).map(v => ({
+      series_id: v.series_id,
+      title: v.series_name || v.series_title,
+      cover: v.series_cover,
+      episode_cnt: v.episode_cnt,
+      accessible_episode_cnt: v.accessible_episode_cnt,
+      pay_type: v.pay_type,
+      episode_right_text: v.episode_right_text,
+      tags: (v.tags || []).map(t => t.name || t),
+      intro: v.series_intro,
+    }));
+    return { ok: true, videos, totalCount: data?.totalCount || 0 };
+  } catch(e) { return { ok: false, error: e.message }; }
+});
 
 ipcMain.handle('hongguo:get-home', async () => {
   try {
@@ -11898,6 +13466,13 @@ ipcMain.handle('hongguo:get-series-info', async (event, seriesId) => {
     const { data } = await hongguoFetch(url);
     const sd = data?.seriesDetail;
     if (!sd) return { ok: false, error: 'Không tìm thấy series' };
+    // Debug: log cấu trúc vid_list để kiểm tra
+    const vl = sd.vid_list || [];
+    console.log('[Hongguo] vid_list sample (5 đầu):', JSON.stringify(vl.slice(0, 5)));
+    console.log('[Hongguo] episode_cnt:', sd.episode_cnt, '| vid_list.length:', vl.length);
+    // Thử lấy episode_list nếu có (format khác của API)
+    const epList = sd.episode_list || sd.episodes || [];
+    if (epList.length) console.log('[Hongguo] episode_list sample:', JSON.stringify(epList.slice(0, 3)));
     return {
       ok: true,
       series_id: sd.series_id,
@@ -11906,7 +13481,7 @@ ipcMain.handle('hongguo:get-series-info', async (event, seriesId) => {
       episode_cnt: sd.episode_cnt,
       accessible_episode_cnt: sd.accessible_episode_cnt,
       tags: sd.tags || [],
-      vid_list: sd.vid_list || [],
+      vid_list: vl,
       intro: sd.series_intro,
     };
   } catch(e) { return { ok: false, error: e.message }; }
@@ -11938,8 +13513,10 @@ ipcMain.handle('hongguo:download-episode', async (event, { seriesId, vidId, outP
     // 1. Get fresh video URL
     send({ epNum, status: 'fetching', msg: 'Đang lấy URL...' });
     const ssrUrl = `https://hongguoduanju.com/player/${seriesId}?vid=${vidId}&__loader=player_%28series_id%29%2Fpage&__ssrDirect=true`;
+    console.log(`[Hongguo DL] Tập ${epNum} | seriesId=${seriesId} | vidId=${vidId} | URL: ${ssrUrl}`);
     const { data } = await hongguoFetch(ssrUrl);
     const videoUrl = data?.video_player_info?.main_url;
+    console.log(`[Hongguo DL] Tập ${epNum} | main_url: ${videoUrl ? videoUrl.substring(0, 100) : 'NULL'}`);
     if (!videoUrl) return { ok: false, error: 'Không lấy được URL video' };
 
     // 2. Download with progress

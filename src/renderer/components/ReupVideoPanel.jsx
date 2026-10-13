@@ -1,4 +1,6 @@
 ﻿import React, { useState, useRef, useEffect, useCallback } from 'react';
+import HongguoPanel from './HongguoPanel';
+import FreeReelsPanel from './FreeReelsPanel';
 import { generateSeoMetadata, generateThumbnailPromptsOnly, analyzeThumbImageToPrompt } from './CreatorStudio';
 import { transcribeAudioChunked } from '../services/audioToVideo';
 import { retryWithKeyRotation } from '../services/keyRotation.js';
@@ -2801,6 +2803,8 @@ function VideoCleanerPanel({ initialTab } = {}) {
           {[
             { id: 'ytchannel',    label: 'Reup YouTube',  emoji: '📺', activeCls: 'bg-blue-600 text-white shadow-md',  inactiveCls: 'bg-blue-900/40 text-blue-300 hover:bg-blue-700 hover:text-white border border-blue-700/40' },
             { id: 'bilibili-reup', label: 'Reup Bilibili', emoji: '🔴', activeCls: 'bg-pink-600 text-white shadow-md', inactiveCls: 'bg-pink-900/40 text-pink-300 hover:bg-pink-700 hover:text-white border border-pink-700/40' },
+            { id: 'hongguo',      label: 'Hongguo 红果',  emoji: '🍎', activeCls: 'bg-red-700 text-white shadow-md',  inactiveCls: 'bg-red-900/40 text-red-300 hover:bg-red-700 hover:text-white border border-red-700/40' },
+            { id: 'freereels',    label: 'FreeReels',     emoji: '🎬', activeCls: 'bg-rose-700 text-white shadow-md', inactiveCls: 'bg-rose-900/40 text-rose-300 hover:bg-rose-700 hover:text-white border border-rose-700/40' },
           ].map(t => (
             <button key={t.id} onClick={() => setMainTab(t.id)}
               className={`flex items-center gap-2 px-5 py-2 rounded-lg text-[13px] font-black transition-all ${mainTab === t.id ? t.activeCls : t.inactiveCls}`}>
@@ -2942,6 +2946,20 @@ function VideoCleanerPanel({ initialTab } = {}) {
             rfTargetCode={rfTargetCode} setRfTargetCode={setRfTargetCode}
             rfTargetLang={rfTargetLang} setRfTargetLang={setRfTargetLang}
           />
+        </div>
+      )}
+
+      {/* HONGGUO TAB */}
+      {mainTab === 'hongguo' && (
+        <div className="flex-1 overflow-hidden flex flex-col">
+          <HongguoPanel />
+        </div>
+      )}
+
+      {/* FREEREELS TAB */}
+      {mainTab === 'freereels' && (
+        <div className="flex-1 overflow-hidden flex flex-col">
+          <FreeReelsPanel />
         </div>
       )}
 

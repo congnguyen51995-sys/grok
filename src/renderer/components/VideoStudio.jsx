@@ -1,6 +1,59 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { UploadCloud, FolderOpen, Scissors, Terminal, Film, Play, Loader2, Layers, CheckSquare, Square, RefreshCw, Settings, Image as ImageIcon, ChevronDown, ChevronUp,} from 'lucide-react';
 
+// % width của crop box trong preview 16:9
+const CROP_BOX_PCT = { '1:1': 56.25, '9:16': 31.64 };
+
+function CropAdjuster({ frameUrl, cropRatio, posX, onPosX }) {
+  const boxW   = CROP_BOX_PCT[cropRatio] ?? 100;
+  const maxLeft = 100 - boxW;
+  const boxLeft = (posX / 100) * maxLeft;
+  const presets = [
+    { label: '◀ Trái', v: 0 },
+    { label: '⬛ Giữa', v: 50 },
+    { label: '▶ Phải', v: 100 },
+  ];
+  return (
+    <div className="space-y-2">
+      <div className="relative w-full rounded-lg overflow-hidden border border-slate-700 select-none"
+        style={{ aspectRatio: '16/9', background: '#000' }}>
+        {frameUrl
+          ? <img src={frameUrl} className="w-full h-full object-cover pointer-events-none" draggable={false} />
+          : <div className="w-full h-full flex items-center justify-center text-slate-700 text-[10px]">
+              <Film className="w-5 h-5 mr-1.5 opacity-30" /> Chọn video để xem vùng cắt
+            </div>
+        }
+        {/* Overlay trái */}
+        <div className="absolute top-0 bottom-0 left-0 bg-black/65 transition-all" style={{ width: `${boxLeft}%` }} />
+        {/* Crop box */}
+        <div className="absolute top-0 bottom-0 border-2 border-rose-400 transition-all" style={{ left: `${boxLeft}%`, width: `${boxW}%` }}>
+          <div className="absolute top-1 left-1 bg-black/70 text-[9px] text-rose-300 font-bold px-1.5 py-0.5 rounded">
+            {cropRatio} · {Math.round(posX)}%
+          </div>
+          <div className="absolute top-0 bottom-0 left-1/2 w-px bg-rose-400/30" />
+        </div>
+        {/* Overlay phải */}
+        <div className="absolute top-0 bottom-0 right-0 bg-black/65 transition-all" style={{ width: `${maxLeft - boxLeft}%` }} />
+      </div>
+      <div className="flex items-center gap-2">
+        <span className="text-[9px] text-slate-500 shrink-0">◀</span>
+        <input type="range" min={0} max={100} step={1} value={posX}
+          onChange={e => onPosX(Number(e.target.value))}
+          className="flex-1 h-1.5 accent-rose-500 cursor-pointer" />
+        <span className="text-[9px] text-slate-500 shrink-0">▶</span>
+      </div>
+      <div className="flex gap-1.5">
+        {presets.map(p => (
+          <button key={p.label} onClick={() => onPosX(p.v)}
+            className={`flex-1 py-1 rounded text-[9px] font-bold border transition-all ${Math.abs(posX - p.v) < 2 ? 'bg-rose-800/60 border-rose-600 text-rose-200' : 'bg-slate-800/50 border-slate-700 text-slate-500 hover:border-rose-700/50'}`}>
+            {p.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function VideoStudio({ dark = true }) {
     // State Quản lý Tab chung
     const [subTab, setSubTab] = useState('extract'); // 'cut', 'merge', hoặc 'extract'
@@ -14,6 +67,11 @@ export default function VideoStudio({ dark = true }) {
     const [cutOutputFolder, setCutOutputFolder] = useState('');
     const [isCutting, setIsCutting] = useState(false);
     const [outputVideos, setOutputVideos] = useState([]);
+    const [trimHeadSec, setTrimHeadSec] = useState(0);
+    const [trimTailSec, setTrimTailSec] = useState(0);
+    const [cropRatio, setCropRatio] = useState(null); // null | '1:1' | '9:16'
+    const [cropX, setCropX] = useState(50); // 0=trái … 50=giữa … 100=phải
+    const [cropFrameUrl, setCropFrameUrl] = useState(null);
 
     // ================= STATE CHO GHÉP VIDEO =================
     const [mergeInputFolder, setMergeInputFolder] = useState('');
@@ -56,7 +114,7 @@ export default function VideoStudio({ dark = true }) {
         setIsCutting(true);
         setLogOpen(true);
         setLogs([{ time: new Date().toLocaleTimeString(), text: 'Bắt đầu khởi tạo cắt video...', type: 'info' }]);
-        const result = await window.electronAPI.cutVideo({ inputPath: inputFile, segmentTime, outputFolder: cutOutputFolder });
+        const result = await window.electronAPI.cutVideo({ inputPath: inputFile, segmentTime, outputFolder: cutOutputFolder, trimHead: trimHeadSec, trimTail: trimTailSec, cropRatio, cropX });
         if (result.success) {
             setLogs(prev => [...prev.slice(-299), { time: new Date().toLocaleTimeString(), text: '✅ Hoàn tất cắt video!', type: 'success' }]);
             if (result.files) setOutputVideos(result.files);
@@ -168,7 +226,18 @@ export default function VideoStudio({ dark = true }) {
                             </div>
                             <div className="p-5 flex-1 overflow-y-auto space-y-6">
                                 <div>
-                                    <button onClick={async () => { const p = await window.electronAPI.selectFile('video'); if (p) setInputFile(p); }} className={`w-full h-32 border-2 border-dashed rounded-xl flex flex-col items-center justify-center gap-3 transition-colors ${inputFile ? 'border-blue-500/50 bg-blue-900/10' : 'border-slate-700 bg-[#0f172a] hover:bg-slate-800'}`}>
+                                    <button onClick={async () => {
+                                        const p = await window.electronAPI.selectFile('video');
+                                        if (p) {
+                                            setInputFile(p);
+                                            setCropFrameUrl(null);
+                                            setCropX(50);
+                                            // Extract frame để preview crop
+                                            window.electronAPI.extractFrame?.({ inputPath: p, timeOffset: 1 })
+                                                .then(res => { if (res?.ok && res.base64) setCropFrameUrl(`data:image/jpeg;base64,${res.base64}`); })
+                                                .catch(() => {});
+                                        }
+                                    }} className={`w-full h-32 border-2 border-dashed rounded-xl flex flex-col items-center justify-center gap-3 transition-colors ${inputFile ? 'border-blue-500/50 bg-blue-900/10' : 'border-slate-700 bg-[#0f172a] hover:bg-slate-800'}`}>
                                         <div className={`p-3 rounded-full ${inputFile ? 'bg-blue-500/20 text-blue-400' : 'bg-slate-800 text-slate-400'}`}><UploadCloud size={24} /></div>
                                         <div className="text-center px-4">
                                             <p className={`text-sm font-bold truncate w-[250px] ${inputFile ? 'text-blue-400' : 'text-slate-200'}`}>{inputFile ? inputFile.split('\\').pop() : 'Nhấn để chọn file'}</p>
@@ -184,6 +253,49 @@ export default function VideoStudio({ dark = true }) {
                                         ))}
                                     </div>
                                 </div>
+                                {/* Cắt đầu / đuôi */}
+                                <div>
+                                    <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest mb-2 block">✂️ Cắt đầu / đuôi (giây)</label>
+                                    <div className="flex gap-3">
+                                        <div className="flex-1">
+                                            <label className="text-[10px] text-emerald-400 font-semibold mb-1 block">Bỏ đầu</label>
+                                            <input type="number" min="0" value={trimHeadSec} onChange={e => setTrimHeadSec(Math.max(0, parseInt(e.target.value) || 0))}
+                                                className="w-full bg-[#0f172a] border border-emerald-500/30 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500 text-center font-mono" />
+                                        </div>
+                                        <div className="flex-1">
+                                            <label className="text-[10px] text-rose-400 font-semibold mb-1 block">Bỏ đuôi</label>
+                                            <input type="number" min="0" value={trimTailSec} onChange={e => setTrimTailSec(Math.max(0, parseInt(e.target.value) || 0))}
+                                                className="w-full bg-[#0f172a] border border-rose-500/30 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-rose-500 text-center font-mono" />
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Crop tỉ lệ */}
+                                <div>
+                                    <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest mb-2 block">🔲 Crop tỉ lệ (từ 16:9)</label>
+                                    <div className="flex gap-2">
+                                        {[
+                                            { val: null,   label: '16:9', sub: 'Giữ nguyên' },
+                                            { val: '1:1',  label: '1:1',  sub: '1080×1080' },
+                                            { val: '9:16', label: '9:16', sub: '1080×1920' },
+                                        ].map(opt => (
+                                            <button key={String(opt.val)} onClick={() => setCropRatio(opt.val)}
+                                                className={`flex-1 py-2 rounded-lg text-xs font-bold border flex flex-col items-center gap-0.5 transition-all ${cropRatio === opt.val ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white hover:border-slate-500'}`}>
+                                                <span>{opt.label}</span>
+                                                <span className="text-[9px] opacity-70 font-normal">{opt.sub}</span>
+                                            </button>
+                                        ))}
+                                    </div>
+                                    {cropRatio && <p className="text-[9px] text-amber-500/80 mt-1.5">⚠ Crop sẽ re-encode video (chậm hơn copy)</p>}
+                                    {/* Crop adjuster — chỉ hiện khi chọn 1:1 hoặc 9:16 */}
+                                    {cropRatio && (
+                                        <div className="mt-3 border border-slate-700/60 rounded-xl p-3 bg-[#0a101e] space-y-1.5">
+                                            <p className="text-[10px] font-bold text-slate-400 mb-2">🎯 Chỉnh vùng cắt</p>
+                                            <CropAdjuster frameUrl={cropFrameUrl} cropRatio={cropRatio} posX={cropX} onPosX={setCropX} />
+                                        </div>
+                                    )}
+                                </div>
+
                                 <div>
                                     <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest mb-2 block">Thư mục lưu</label>
                                     <div className="flex gap-2">

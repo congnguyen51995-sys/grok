@@ -35,7 +35,6 @@ import CreatorStudio from './components/CreatorStudio'
 import ReupVideo from './components/ReupVideo'
 import AudioStoryPanel from './components/AudioStoryPanel'
 import HorrorStoryPanel from './components/HorrorStoryPanel'
-import HongguoPanel from './components/HongguoPanel'
 import RemotionStudio from './components/RemotionStudio'
 import AIVideoRemixer from './components/AIVideoRemixer'
 import EyesChallengePanel from './components/EyesChallengePanel'
@@ -179,7 +178,6 @@ const NAV_GROUPS = [
       { id: 'reup-taitao',  label: 'Tái Tạo',    emoji: '🎬', activeCls: 'bg-orange-600 text-white', inactiveCls: 'bg-orange-900/40 text-orange-300 hover:bg-orange-600/70 hover:text-white border border-orange-700/40' },
       { id: 'mc-studio',    label: 'Truyện Audio', emoji: '🎙️', activeCls: 'bg-pink-600 text-white',   inactiveCls: 'bg-pink-900/40 text-pink-300 hover:bg-pink-600/70 hover:text-white border border-pink-700/40' },
       { id: 'horror-story', label: 'Truyện Ma',  emoji: '👻', activeCls: 'bg-violet-700 text-white',  inactiveCls: 'bg-violet-900/40 text-violet-300 hover:bg-violet-700/70 hover:text-white border border-violet-700/40' },
-      { id: 'hongguo',      label: 'Hongguo',     emoji: '🍎', activeCls: 'bg-red-700 text-white',     inactiveCls: 'bg-red-900/40 text-red-300 hover:bg-red-700/70 hover:text-white border border-red-700/40' },
     ],
   },
   {
@@ -1000,11 +998,6 @@ export default function App({ onLicenseExpired }) {
         {/* ── HORROR STORY (always mounted) ── */}
         <div className="absolute inset-0 w-full h-full overflow-y-auto" style={{ display: currentTab === 'horror-story' ? 'block' : 'none' }}>
           <ErrorBoundary><HorrorStoryPanel /></ErrorBoundary>
-        </div>
-
-        {/* ── HONGGUO (always mounted) ── */}
-        <div className="absolute inset-0 w-full h-full overflow-hidden" style={{ display: currentTab === 'hongguo' ? 'flex' : 'none' }}>
-          <ErrorBoundary><HongguoPanel /></ErrorBoundary>
         </div>
 
         {/* ── REMOTION STUDIO (always mounted) ── */}

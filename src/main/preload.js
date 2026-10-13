@@ -65,6 +65,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onWatermarkLog: (cb) => { const w = (_e, d) => cb(d); ipcRenderer.on('watermark-log', w); return w; },
   videoRecreate:       (data) => ipcRenderer.invoke('video:recreate', data),
   onVideoRecreatLog:   (cb)   => { const w = (_e, d) => cb(d); ipcRenderer.on('video-recreate-log', w); return w; },
+  videoMergeEpisodes:  (data) => ipcRenderer.invoke('video:merge-episodes', data),
+  videoAddOverlay:             (data) => ipcRenderer.invoke('video:add-overlay', data),
+  geminiUploadVideoForTranslation: (data) => ipcRenderer.invoke('freereels:upload-video-for-translation', data),
+  onFreeReelsUploadProgress:   (cb) => { const w = (_e, d) => cb(d); ipcRenderer.on('freereels:upload-progress', w); return w; },
   // ── CÁC HÀM CŨ ────────────────────────────────────────────────────────────
   getJobs:    ()         => ipcRenderer.invoke('db:get-jobs'),
   createJob:  (jobData)  => ipcRenderer.invoke('db:create-job', jobData),
@@ -103,6 +107,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onWhisperProgress:      (cb)   => ipcRenderer.on('whisper:progress', (_e, d) => cb(d)),
   // ── GROQ WHISPER (cloud, nhanh + chính xác hơn) ─────────────────────────────
   groqWhisperChunk: (data) => ipcRenderer.invoke('groq:whisper-chunk', data),
+  whisperLocalTranscribe: (data) => ipcRenderer.invoke('whisper:local-transcribe', data),
   // ── AUDIO TO VIDEO ───────────────────────────────────────────────────────
   selectAudioFile:     ()   => ipcRenderer.invoke('dialog:select-audio-file'),
   selectMultipleFiles: ()   => ipcRenderer.invoke('dialog:select-multiple-files'),
@@ -170,6 +175,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   bilibiliSearch:        (opts) => ipcRenderer.invoke('bilibili:search',        opts),
   bilibiliChannelVideos: (opts) => ipcRenderer.invoke('bilibili:channelVideos', opts),
   bilibiliDownload:      (opts) => ipcRenderer.invoke('bilibili:download',      opts),
+  bilibiliTrending:      (opts) => ipcRenderer.invoke('bilibili:trending',      opts),
+
+  // ── FREEREELS ────────────────────────────────────────────────────────────────
+  freeReelsAuth:         (opts) => ipcRenderer.invoke('freereels:auth',         opts),
+  freeReelsHome:         (opts) => ipcRenderer.invoke('freereels:home',         opts),
+  freeReelsContentList:  (opts) => ipcRenderer.invoke('freereels:content-list', opts),
+  freeReelsSearch:       (opts) => ipcRenderer.invoke('freereels:search',       opts),
+  freeReelsDramaInfo:    (opts) => ipcRenderer.invoke('freereels:drama-info',   opts),
+  freeReelsTrending:     ()     => ipcRenderer.invoke('freereels:trending'),
+  freeReelsFeed:         (opts) => ipcRenderer.invoke('freereels:feed',         opts),
+  freeReelsDownload:     (opts) => ipcRenderer.invoke('freereels:download',     opts),
   // ── YOUTUBE CHANNEL FETCHER ──────────────────────────────────────────────────
   ytChannelVideos:  (opts) => ipcRenderer.invoke('youtube:channel-videos',  opts),
   ytDownloadBest:   (opts) => ipcRenderer.invoke('youtube:download-best',   opts),
@@ -252,6 +268,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   kokoroStopServer:  ()     => ipcRenderer.invoke('kokoro:stop-server'),
   kokoroSynthesize:  (data) => ipcRenderer.invoke('kokoro:synthesize', data),
   onKokoroLog:       (cb)   => ipcRenderer.on('kokoro-log', (_e, d) => cb(d)),
+  // ── CAPCUT TTS ──────────────────────────────────────────────────────────────
+  capcutTTS:         (data) => ipcRenderer.invoke('capcut:tts', data),
+  capcutTTSSRT:      (data) => ipcRenderer.invoke('capcut:tts-srt', data),
   // ── STORY LOOP ───────────────────────────────────────────────────────────────
   veoGenerateSingle:  (data) => ipcRenderer.invoke('veo:generate-single', data),
   ffmpegLoopVideo:    (data) => ipcRenderer.invoke('ffmpeg:loop-video-for-audio', data),
@@ -305,6 +324,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   remotionOpenDir:          (dir)       => ipcRenderer.invoke('remotion:open-dir', dir),
   remotionOpenVideo:            (filePath) => ipcRenderer.invoke('remotion:open-video', filePath),
   remotionSelectSourceVideo:       ()       => ipcRenderer.invoke('remotion:select-source-video'),
+  remotionSelectSourceVideos:      ()       => ipcRenderer.invoke('remotion:select-source-videos'),
   remotionCopyVideoToPublic:       (data)   => ipcRenderer.invoke('remotion:copy-video-to-public', data),
   remotionSelectReferenceFiles:    ()       => ipcRenderer.invoke('remotion:select-reference-files'),
   remotionReadFileBase64:          (fp)     => ipcRenderer.invoke('remotion:read-file-base64', fp),
@@ -380,9 +400,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   horrorBgSaveGenerated:   (data) => ipcRenderer.invoke('horror:bg-save-generated', data),
   horrorPreTrim:           (data) => ipcRenderer.invoke('horror:pre-trim', data),
   horrorPitchShift:        (data) => ipcRenderer.invoke('horror:pitch-shift', data),
+  horrorSplitVideo:        (data) => ipcRenderer.invoke('horror:split-video', data),
+  horrorDeleteFile:        (data) => ipcRenderer.invoke('horror:delete-file', data),
+  horrorFfmpegFilter:      (data) => ipcRenderer.invoke('horror:ffmpeg-filter', data),
 
   // ── HONGGUO (红果短剧) ─────────────────────────────────────────────────
   hongguoGetHome:        ()                      => ipcRenderer.invoke('hongguo:get-home'),
+  hongguoGetCategory:    (opts)                  => ipcRenderer.invoke('hongguo:get-category',       opts),
+  hongguoSearch:         (opts)                  => ipcRenderer.invoke('hongguo:search',              opts),
   hongguoGetSeriesInfo:  (seriesId)              => ipcRenderer.invoke('hongguo:get-series-info',    seriesId),
   hongguoGetVideoUrl:    (seriesId, vidId)       => ipcRenderer.invoke('hongguo:get-video-url',      seriesId, vidId),
   hongguoDownloadEpisode:(opts)                  => ipcRenderer.invoke('hongguo:download-episode',   opts),

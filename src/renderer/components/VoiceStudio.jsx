@@ -296,6 +296,65 @@ export default function VoiceStudio({ dark = true }) {
     const [kkReady,         setKkReady]         = useState(false);   // server running
     const [kkModelsReady,   setKkModelsReady]   = useState(false);   // model files exist
     const [kkStarting,      setKkStarting]      = useState(false);
+    // ── CAPCUT TTS STATE ─────────────────────────────────────────────────────────
+    const CC_VOICES = [
+      { label: 'Cô Gái Hoạt Ngôn',   voice: 'BV074_streaming',                        resourceId: '7102355709945188865' },
+      { label: 'Nhỏ Ngọt Ngào',       voice: 'BV421_vivn_streaming',                   resourceId: '7252594014782755330' },
+      { label: 'Giọng Nữ Phổ Thông',  voice: 'vi_female_huong',                        resourceId: '7264854897953083905' },
+      { label: 'Giọng Bé',            voice: 'BV074_streaming_dsp',                    resourceId: '7550087831092251920' },
+      { label: 'Mai',                  voice: 'BV562_streaming',                        resourceId: '7483736254694035984' },
+      { label: 'Ban Mai',              voice: 'multi_female_yangguangnv_uranus_bigtts', resourceId: '7637456432522218773' },
+      { label: 'Review Phim',          voice: 'multi_female_richgirl_uranus_bigtts',    resourceId: '7637460351541447956' },
+      { label: 'Giọng Gái Mới Lớn',   voice: 'multi_female_peiqi_uranus_bigtts',       resourceId: '7637458789033151751' },
+      { label: 'Sunny Idol',           voice: 'multi_female_kiwi_uranus_bigtts',        resourceId: '7637457995882089749' },
+      { label: 'Thanh Niên Tự Tin',   voice: 'BV075_streaming',                        resourceId: '7102355803792740865' },
+      { label: 'Giọng Nam Trầm',      voice: 'multi_male_felipe_uranus_bigtts',        resourceId: '7637456729696996628' },
+      { label: 'Hoai My',             voice: 'vi-VN-HoaiMyNeural',                     resourceId: '7371666434650280464' },
+    ];
+    const [ccSelectedVoice, setCcSelectedVoice] = useState('BV074_streaming');
+    const [ccText,          setCcText]          = useState('');
+    const [ccProjectName,   setCcProjectName]   = useState('capcut_output');
+    const [ccOutputFolder,  setCcOutputFolder]  = useState('');
+    const [ccGenerating,    setCcGenerating]    = useState(false);
+    const [ccAudioUrl,      setCcAudioUrl]      = useState('');
+    const [ccLogs,          setCcLogs]          = useState([]);
+    const ccLogRef = useRef(null);
+    const addCcLog = (msg) => setCcLogs(prev => [...prev.slice(-199), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+    useEffect(() => { if (ccLogRef.current) ccLogRef.current.scrollTop = ccLogRef.current.scrollHeight; }, [ccLogs]);
+
+    const handleCcSynthesize = async () => {
+      if (!ccText.trim()) return;
+      const folder = ccOutputFolder || 'C:\\Users\\Public\\Videos';
+      const outPath = `${folder}\\${ccProjectName || 'capcut_output'}_${Date.now()}.wav`;
+      setCcGenerating(true);
+      setCcAudioUrl('');
+      const voiceObj = CC_VOICES.find(v => v.voice === ccSelectedVoice) || CC_VOICES[0];
+
+      let r;
+      if (isSRTContent(ccText)) {
+        const segs = parseSRT(ccText);
+        addCcLog(`🎙 CapCut SRT: ${segs.length} đoạn theo mốc thời gian...`);
+        r = await window.electronAPI?.capcutTTSSRT?.({
+          segments: segs.map(s => ({ text: s.text, startMs: s.startMs, endMs: s.endMs })),
+          voice: voiceObj.voice, resourceId: voiceObj.resourceId, outputPath: outPath,
+        });
+      } else {
+        addCcLog('🎙 Đang gọi CapCut TTS API...');
+        r = await window.electronAPI?.capcutTTS?.({
+          text: ccText, voice: voiceObj.voice, resourceId: voiceObj.resourceId, outputPath: outPath,
+        });
+      }
+
+      setCcGenerating(false);
+      if (r?.success) {
+        const url = `file:///${(r.path || outPath).replace(/\\/g, '/')}?t=${Date.now()}`;
+        setCcAudioUrl(url);
+        addCcLog(`✅ Hoàn tất: ${r.path || outPath}`);
+      } else {
+        addCcLog(`❌ ${r?.error || 'Lỗi không xác định'}`);
+      }
+    };
+
     const [kkVoices,        setKkVoices]        = useState([]);
     const [kkSelectedVoice, setKkSelectedVoice] = useState('af_heart');
     const [kkLangFilter,    setKkLangFilter]    = useState('all');
@@ -1250,6 +1309,9 @@ export default function VoiceStudio({ dark = true }) {
                 <button onClick={() => setSubTab('kokoro')} className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm transition-all ${subTab === 'kokoro' ? 'bg-cyan-600 text-white shadow-md' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}>
                     <Mic size={16} /> Kokoro TTS
                     {kkReady && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"/>}
+                </button>
+                <button onClick={() => setSubTab('capcut')} className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm transition-all ${subTab === 'capcut' ? 'bg-rose-600 text-white shadow-md' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}>
+                    🎬 CapCut TTS
                 </button>
             </div>
 
@@ -3596,6 +3658,87 @@ export default function VoiceStudio({ dark = true }) {
             </div>
             )}
             {/* END TAB: KOKORO TTS */}
+
+            {/* ════════════════════════════════════════════════════════════════ */}
+            {/* ══  TAB: CAPCUT TTS  ══════════════════════════════════════════ */}
+            {/* ════════════════════════════════════════════════════════════════ */}
+            {subTab === 'capcut' && (
+            <div className="flex flex-1 p-6 gap-6 overflow-hidden min-h-0">
+
+              {/* CỘT TRÁI — Voice list */}
+              <div className="flex flex-col w-[40%] h-full shrink-0 min-h-0 gap-4 overflow-y-auto pr-1">
+
+                <div className="bg-[#0d1424] border border-slate-700 rounded-xl p-4 shrink-0">
+                  <p className="text-sm font-bold text-rose-400 mb-1">🎬 CapCut TTS</p>
+                  <p className="text-[10px] text-slate-500">Giọng tiếng Việt từ CapCut API · Online · Miễn phí</p>
+                  <p className="text-[10px] text-amber-500 mt-1.5">⚡ Lần đầu chạy tự cài SDK (~30s)</p>
+                </div>
+
+                <div className="flex-1 min-h-0 overflow-y-auto">
+                  <p className="text-[10px] text-slate-500 font-bold uppercase mb-2 tracking-wider">Chọn giọng ({CC_VOICES.length})</p>
+                  <div className="flex flex-col gap-1.5">
+                    {CC_VOICES.map(v => (
+                      <button key={v.voice} onClick={() => setCcSelectedVoice(v.voice)}
+                        className={`px-3 py-2.5 rounded-lg text-left transition-all border ${ccSelectedVoice === v.voice ? 'bg-rose-600/20 border-rose-500 text-rose-300' : 'border-slate-700 text-slate-400 hover:border-slate-500 hover:text-white'}`}>
+                        <div className="text-[11px] font-bold">{v.label}</div>
+                        <div className="text-[9px] opacity-50 font-mono">{v.voice}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* CỘT PHẢI */}
+              <div className="flex flex-col flex-1 h-full min-h-0 gap-4 overflow-y-auto pl-1">
+
+                <div className="shrink-0">
+                  <div className="flex justify-between items-center mb-1.5">
+                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Văn bản</p>
+                    <span className="text-[10px] text-slate-600">{ccText.length} ký tự</span>
+                  </div>
+                  <textarea value={ccText} onChange={e => setCcText(e.target.value)} rows={8}
+                    placeholder="Nhập văn bản hoặc paste SRT (tự giữ mốc thời gian)"
+                    className="w-full bg-[#0d1424] border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-slate-300 placeholder-slate-600 resize-none focus:outline-none focus:border-rose-600" />
+                </div>
+
+                <div className="bg-[#0d1424] border border-slate-700 rounded-xl p-4 shrink-0 space-y-3">
+                  <div className="flex items-center gap-3">
+                    <label className="text-[10px] text-slate-500 font-bold uppercase w-20 shrink-0">Tên file</label>
+                    <input value={ccProjectName} onChange={e => setCcProjectName(e.target.value)}
+                      className="flex-1 bg-[#141c2f] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-rose-600" />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <label className="text-[10px] text-slate-500 font-bold uppercase w-20 shrink-0">Thư mục</label>
+                    <input value={ccOutputFolder} onChange={e => setCcOutputFolder(e.target.value)} placeholder="C:\Users\Public\Videos"
+                      className="flex-1 bg-[#141c2f] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-rose-600" />
+                    <button onClick={async () => { const d = await window.electronAPI?.selectFolder?.(); if (d) setCcOutputFolder(d); }}
+                      className="px-2 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-300 text-xs rounded-lg">📁</button>
+                  </div>
+                </div>
+
+                <button onClick={handleCcSynthesize} disabled={ccGenerating || !ccText.trim()}
+                  className="w-full py-3 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold rounded-xl transition-all shrink-0">
+                  {ccGenerating ? '⏳ Đang tổng hợp...' : '🎬 Tạo giọng CapCut'}
+                </button>
+
+                {ccAudioUrl && (
+                  <div className="bg-[#0d1424] border border-rose-800/50 rounded-xl p-4 shrink-0">
+                    <p className="text-[10px] text-rose-400 font-bold mb-2">▶ Nghe kết quả</p>
+                    <audio controls src={ccAudioUrl} className="w-full" />
+                  </div>
+                )}
+
+                <div className="flex-1 min-h-0 bg-[#060d1a] border border-slate-800 rounded-xl p-3 overflow-y-auto" ref={ccLogRef}>
+                  {ccLogs.length === 0
+                    ? <p className="text-[10px] text-slate-600 italic">Log sẽ hiển thị ở đây...</p>
+                    : ccLogs.map((l, i) => (
+                      <p key={i} className={`text-[10px] font-mono mb-0.5 ${l.includes('✅') ? 'text-emerald-400' : l.includes('❌') ? 'text-red-400' : 'text-slate-400'}`}>{l}</p>
+                    ))}
+                </div>
+              </div>
+            </div>
+            )}
+            {/* END TAB: CAPCUT TTS */}
 
         </div>
     );

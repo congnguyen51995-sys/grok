@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 
 const API = window.electronAPI;
 
@@ -15,66 +15,120 @@ const fmtNum = (n) => {
   return String(n);
 };
 
+const CATEGORIES = [
+  { id: 'popular',  label: '🔥 Nổi bật' },
+  { id: 'ranking',  label: '🏆 BXH Tuần' },
+  { id: '1',        label: '📺 Anime' },
+  { id: '4',        label: '🎮 Game' },
+  { id: '160',      label: '🌿 Đời sống' },
+  { id: '5',        label: '🎤 Giải trí' },
+  { id: '188',      label: '💻 Công nghệ' },
+];
+
+function VideoCard({ item, isSelected, dlState, translated, onSelect, onDownload, onChannel, showRank }) {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <div
+      className={`group relative flex flex-col rounded-xl overflow-hidden border transition-all cursor-pointer
+        ${isSelected
+          ? 'border-blue-500 bg-blue-950/40 ring-1 ring-blue-500/40'
+          : 'bg-slate-800 border-slate-700/50 hover:border-blue-500/50 hover:bg-slate-750'}`}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      onClick={() => onSelect(item)}>
+
+      <div className="relative aspect-video bg-slate-900 overflow-hidden">
+        {item.thumbnail && (
+          <img src={item.thumbnail} alt={item.title} referrerPolicy="no-referrer"
+            className="w-full h-full object-cover" loading="lazy"/>
+        )}
+        {showRank && item.rank <= 3 && (
+          <span className={`absolute top-1.5 left-1.5 text-[11px] font-black px-1.5 py-0.5 rounded shadow-lg
+            ${item.rank === 1 ? 'bg-yellow-500 text-black' : item.rank === 2 ? 'bg-slate-300 text-black' : 'bg-amber-700 text-white'}`}>
+            #{item.rank}
+          </span>
+        )}
+        {showRank && item.rank > 3 && (
+          <span className="absolute top-1.5 left-1.5 bg-black/60 text-slate-300 text-[10px] px-1.5 py-0.5 rounded font-mono">
+            #{item.rank}
+          </span>
+        )}
+        {item.duration > 0 && (
+          <span className="absolute bottom-1.5 right-1.5 bg-black/70 text-white text-[10px] px-1.5 py-0.5 rounded font-mono">
+            {fmtDur(item.duration)}
+          </span>
+        )}
+        {item.play > 0 && !showRank && (
+          <span className="absolute top-1.5 left-1.5 bg-black/60 text-blue-300 text-[10px] px-1.5 py-0.5 rounded flex items-center gap-1">
+            ▶ {fmtNum(item.play)}
+          </span>
+        )}
+        {isSelected ? (
+          <div className="absolute inset-0 bg-blue-600/20 flex items-center justify-center">
+            <div className="w-8 h-8 rounded-full bg-blue-500/80 flex items-center justify-center text-white text-sm font-bold">▶</div>
+          </div>
+        ) : hovered && (
+          <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+            <div className="w-10 h-10 rounded-full bg-blue-600/90 flex items-center justify-center text-white text-xl">▶</div>
+          </div>
+        )}
+      </div>
+
+      <div className="p-2 flex flex-col gap-0.5 flex-1">
+        <p className="text-[10px] text-slate-200 line-clamp-2 leading-tight font-medium" title={item.title}>
+          {translated?.[item.bvid] || item.title || '(Không có tiêu đề)'}
+        </p>
+        {item.tname && <span className="text-[9px] text-slate-500">{item.tname}</span>}
+        {item.author && (
+          <button onClick={e => { e.stopPropagation(); onChannel?.(item.mid, item.author); }}
+            className="text-left text-[9px] text-blue-400/70 hover:text-blue-300 truncate transition mt-0.5">
+            📺 @{item.author}
+          </button>
+        )}
+        {showRank && item.play > 0 && (
+          <span className="text-[9px] text-slate-500 mt-0.5">▶ {fmtNum(item.play)} lượt xem</span>
+        )}
+        {dlState?.status === 'done' && (
+          <div className="mt-auto text-center text-[9px] text-green-400 font-bold">✅ Đã tải</div>
+        )}
+        {dlState?.status === 'downloading' && (
+          <div className="mt-auto">
+            <div className="w-full h-1 bg-slate-700 rounded-full overflow-hidden">
+              <div className="h-full bg-blue-500 rounded-full transition-all" style={{ width: `${dlState.percent || 0}%` }}/>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function BilibiliSearch({ onAddToQueue }) {
-  const [keyword,     setKeyword]     = useState('');
-  const [results,     setResults]     = useState([]);
-  const [loading,     setLoading]     = useState(false);
-  const [error,       setError]       = useState('');
-  const [page,        setPage]        = useState(1);
-  const [hasMore,     setHasMore]     = useState(false);
-  const [dlQueue,     setDlQueue]     = useState({});
-  const [outFolder,   setOutFolder]   = useState('');
-  const [quality,     setQuality]     = useState('best');
-  const [hoverId,     setHoverId]     = useState(null);
-  const [fullscreen,  setFullscreen]  = useState(null); // modal fullscreen
-  const [selected,    setSelected]    = useState(null); // inline preview item
-  const [channel,     setChannel]     = useState(null);
-  const [chDlQueue,   setChDlQueue]   = useState({});
-  const [autoTrans,   setAutoTrans]   = useState(false);
-  const [translated,  setTranslated]  = useState({});
+  const [tab,          setTab]          = useState('home'); // 'home' | 'search'
+  const [keyword,      setKeyword]      = useState('');
+  const [results,      setResults]      = useState([]);
+  const [searchLoading,setSearchLoading]= useState(false);
+  const [searchError,  setSearchError]  = useState('');
+  const [page,         setPage]         = useState(1);
+  const [hasMore,      setHasMore]      = useState(false);
 
-  const search = useCallback(async (kw, pg = 1) => {
-    if (!kw.trim()) return;
-    setLoading(true);
-    setError('');
-    if (pg === 1) { setResults([]); setHasMore(false); }
-    try {
-      const res = await API.bilibiliSearch({ keyword: kw.trim(), page: pg });
-      if (res.error) { setError(res.error); return; }
-      const items = res.items || [];
-      setResults(prev => pg === 1 ? items : [...prev, ...items]);
-      setPage(pg + 1);
-      setHasMore(items.length >= 20);
-      if (autoTrans) translateBatch(items);
-    } catch (e) {
-      setError(e.message || 'Lỗi không xác định');
-    } finally {
-      setLoading(false);
-    }
-  }, [autoTrans]);
+  // Home/discovery state
+  const [homeItems,    setHomeItems]    = useState([]);
+  const [homeCat,      setHomeCat]      = useState('popular');
+  const [homeLoading,  setHomeLoading]  = useState(false);
+  const [homeError,    setHomeError]    = useState('');
+  const [homePage,     setHomePage]     = useState(1);
+  const [homeHasMore,  setHomeHasMore]  = useState(false);
 
-  const pickFolder = async () => {
-    const f = await API.selectFolder();
-    if (f) setOutFolder(f);
-  };
-
-  const download = async (item) => {
-    if (!outFolder) { alert('Chọn thư mục lưu trước!'); return; }
-    const id = item.bvid;
-    setDlQueue(q => ({ ...q, [id]: { status: 'downloading', progress: 0 } }));
-    const unsub = API.onDownloaderProgress((d) => {
-      if (d._sourceId !== id) return;
-      setDlQueue(q => ({ ...q, [id]: { status: 'downloading', ...d } }));
-    });
-    try {
-      const res = await API.bilibiliDownload({ url: item.url, outputFolder: outFolder, quality, bvid: id });
-      setDlQueue(q => ({ ...q, [id]: { status: res.success ? 'done' : 'error', error: res.error, outputPath: res.outputPath } }));
-    } catch (e) {
-      setDlQueue(q => ({ ...q, [id]: { status: 'error', error: e.message } }));
-    } finally {
-      unsub?.();
-    }
-  };
+  const [dlQueue,      setDlQueue]      = useState({});
+  const [outFolder,    setOutFolder]    = useState('');
+  const [quality,      setQuality]      = useState('best');
+  const [fullscreen,   setFullscreen]   = useState(null);
+  const [selected,     setSelected]     = useState(null);
+  const [channel,      setChannel]      = useState(null);
+  const [chDlQueue,    setChDlQueue]    = useState({});
+  const [autoTrans,    setAutoTrans]    = useState(false);
+  const [translated,   setTranslated]   = useState({});
 
   const translateTitle = useCallback(async (text) => {
     try {
@@ -95,6 +149,80 @@ export default function BilibiliSearch({ onAddToQueue }) {
     setTranslated(prev => ({ ...prev, ...newTrans }));
   }, [translateTitle]);
 
+  // Load trending/home content
+  const loadHome = useCallback(async (cat, pg = 1) => {
+    setHomeLoading(true);
+    setHomeError('');
+    if (pg === 1) { setHomeItems([]); setHomeHasMore(false); }
+    try {
+      const res = await API.bilibiliTrending?.({ category: cat, page: pg });
+      if (!res || res.error) { setHomeError(res?.error || 'Không thể tải nội dung'); return; }
+      const items = res.items || [];
+      setHomeItems(prev => pg === 1 ? items : [...prev, ...items]);
+      setHomePage(pg + 1);
+      setHomeHasMore(!!res.hasMore);
+      if (autoTrans) translateBatch(items);
+    } catch (e) {
+      setHomeError(e.message || 'Lỗi không xác định');
+    } finally {
+      setHomeLoading(false);
+    }
+  }, [autoTrans, translateBatch]);
+
+  // Load home on mount
+  useEffect(() => {
+    loadHome('popular', 1);
+  }, []);
+
+  const switchCategory = (cat) => {
+    setHomeCat(cat);
+    setSelected(null);
+    loadHome(cat, 1);
+  };
+
+  const search = useCallback(async (kw, pg = 1) => {
+    if (!kw.trim()) return;
+    setSearchLoading(true);
+    setSearchError('');
+    if (pg === 1) { setResults([]); setHasMore(false); }
+    try {
+      const res = await API.bilibiliSearch({ keyword: kw.trim(), page: pg });
+      if (res.error) { setSearchError(res.error); return; }
+      const items = res.items || [];
+      setResults(prev => pg === 1 ? items : [...prev, ...items]);
+      setPage(pg + 1);
+      setHasMore(items.length >= 20);
+      if (autoTrans) translateBatch(items);
+    } catch (e) {
+      setSearchError(e.message || 'Lỗi không xác định');
+    } finally {
+      setSearchLoading(false);
+    }
+  }, [autoTrans, translateBatch]);
+
+  const pickFolder = async () => {
+    const f = await API.selectFolder();
+    if (f) setOutFolder(f);
+  };
+
+  const download = async (item) => {
+    if (!outFolder) { alert('Chọn thư mục lưu trước!'); return; }
+    const id = item.bvid;
+    setDlQueue(q => ({ ...q, [id]: { status: 'downloading', progress: 0 } }));
+    const unsub = API.onDownloaderProgress?.((d) => {
+      if (d._sourceId !== id) return;
+      setDlQueue(q => ({ ...q, [id]: { status: 'downloading', ...d } }));
+    });
+    try {
+      const res = await API.bilibiliDownload({ url: item.url, outputFolder: outFolder, quality, bvid: id });
+      setDlQueue(q => ({ ...q, [id]: { status: res.success ? 'done' : 'error', error: res.error, outputPath: res.outputPath } }));
+    } catch (e) {
+      setDlQueue(q => ({ ...q, [id]: { status: 'error', error: e.message } }));
+    } finally {
+      unsub?.();
+    }
+  };
+
   const openChannel = useCallback(async (mid, name, pg = 1) => {
     if (!mid) { alert('Không có thông tin kênh cho video này.'); return; }
     setChannel({ mid, name, items: pg === 1 ? [] : channel?.items || [], loading: true, error: '', page: pg, totalPages: 1 });
@@ -112,7 +240,7 @@ export default function BilibiliSearch({ onAddToQueue }) {
     } catch (e) {
       setChannel(c => ({ ...c, loading: false, error: e.message }));
     }
-  }, [channel, autoTrans]);
+  }, [channel, autoTrans, translateBatch]);
 
   const downloadCh = async (item) => {
     if (!outFolder) { alert('Chọn thư mục lưu trước!'); return; }
@@ -133,6 +261,10 @@ export default function BilibiliSearch({ onAddToQueue }) {
   const selectVideo = (item) => {
     setSelected(prev => prev?.bvid === item.bvid ? null : item);
   };
+
+  const activeItems = tab === 'home' ? homeItems : results;
+  const showRank = tab === 'home' && (homeCat === 'ranking' || (homeCat !== 'popular' && !isNaN(Number(homeCat))));
+  const dl = selected ? dlQueue[selected.bvid] : null;
 
   // ── FULLSCREEN MODAL ──
   const FullscreenModal = fullscreen && (
@@ -180,11 +312,11 @@ export default function BilibiliSearch({ onAddToQueue }) {
           )}
           <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3">
             {channel.items.map(item => {
-              const dl = chDlQueue[item.bvid];
+              const chDl = chDlQueue[item.bvid];
               return (
                 <div key={item.bvid} className="flex flex-col bg-slate-800 rounded-xl overflow-hidden border border-slate-700/50 hover:border-blue-500/50 transition-all">
                   <div className="relative aspect-video bg-slate-900 overflow-hidden cursor-pointer"
-                    onClick={() => selectVideo(item)}>
+                    onClick={() => { setSelected(item); setChannel(null); }}>
                     {item.thumbnail && <img src={item.thumbnail} alt={item.title} referrerPolicy="no-referrer" className="w-full h-full object-cover" loading="lazy"/>}
                     {item.duration > 0 && (
                       <span className="absolute bottom-1 right-1 bg-black/70 text-white text-[9px] px-1 py-0.5 rounded font-mono">{fmtDur(item.duration)}</span>
@@ -197,22 +329,22 @@ export default function BilibiliSearch({ onAddToQueue }) {
                     <p className="text-[10px] text-slate-200 line-clamp-2 leading-tight" title={item.title}>
                       {translated[item.bvid] || item.title || '(Không có tiêu đề)'}
                     </p>
-                    {!dl && (
+                    {!chDl && (
                       <button onClick={() => downloadCh(item)} disabled={!outFolder}
                         className="mt-auto w-full py-1 rounded text-[10px] font-bold bg-blue-700 hover:bg-blue-600 disabled:opacity-30 transition">
                         ⬇ Tải {quality === 'best' ? 'HD' : quality + 'p'}
                       </button>
                     )}
-                    {dl?.status === 'downloading' && (
+                    {chDl?.status === 'downloading' && (
                       <div className="mt-auto flex flex-col gap-0.5">
                         <div className="w-full h-1.5 bg-slate-700 rounded-full overflow-hidden">
-                          <div className="h-full bg-blue-500 rounded-full transition-all" style={{ width: `${dl.percent || 0}%` }}/>
+                          <div className="h-full bg-blue-500 rounded-full transition-all" style={{ width: `${chDl.percent || 0}%` }}/>
                         </div>
-                        <span className="text-[9px] text-slate-400 text-center">{dl.percent ? `${dl.percent.toFixed(0)}%` : 'Đang tải...'}</span>
+                        <span className="text-[9px] text-slate-400 text-center">{chDl.percent ? `${chDl.percent.toFixed(0)}%` : 'Đang tải...'}</span>
                       </div>
                     )}
-                    {dl?.status === 'done' && <div className="mt-auto text-center text-[10px] text-green-400 font-bold">✅ Xong</div>}
-                    {dl?.status === 'error' && (
+                    {chDl?.status === 'done' && <div className="mt-auto text-center text-[10px] text-green-400 font-bold">✅ Xong</div>}
+                    {chDl?.status === 'error' && (
                       <div className="mt-auto flex flex-col gap-0.5">
                         <div className="text-[9px] text-red-400 text-center">❌ Lỗi</div>
                         <button onClick={() => { setChDlQueue(q => { const n={...q}; delete n[item.bvid]; return n; }); downloadCh(item); }}
@@ -232,15 +364,10 @@ export default function BilibiliSearch({ onAddToQueue }) {
               </button>
             </div>
           )}
-          {channel.loading && channel.items.length > 0 && (
-            <div className="flex justify-center mt-4"><span className="text-slate-500 text-sm">⏳ Đang tải...</span></div>
-          )}
         </div>
       </div>
     </div>
   );
-
-  const dl = selected ? dlQueue[selected.bvid] : null;
 
   return (
     <div className="flex flex-col w-full h-full bg-slate-900 text-white overflow-hidden">
@@ -249,26 +376,60 @@ export default function BilibiliSearch({ onAddToQueue }) {
 
       {/* HEADER */}
       <div className="flex-shrink-0 border-b border-slate-700/60 bg-[#060a12]">
-        <div className="flex items-center gap-3 px-5 pt-4 pb-2">
+        <div className="flex items-center gap-3 px-5 pt-3 pb-2">
           <span className="text-2xl">📺</span>
-          <div>
-            <div className="text-[15px] font-black text-white tracking-wide uppercase">Tìm Video Bilibili</div>
-            <div className="text-[10px] text-slate-500">Không cần đăng nhập · Không cần VPN · Nội dung Trung Quốc phong phú</div>
+          <div className="flex-1">
+            <div className="text-[15px] font-black text-white tracking-wide uppercase">Reup Bilibili</div>
+            <div className="text-[10px] text-slate-500">哔哩哔哩 · Không cần VPN · Không cần đăng nhập</div>
+          </div>
+          {/* Tab switcher */}
+          <div className="flex gap-1 bg-slate-800 rounded-xl p-1">
+            <button onClick={() => setTab('home')}
+              className={`px-4 py-1.5 rounded-lg text-[12px] font-bold transition ${tab === 'home' ? 'bg-blue-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+              🏠 Khám Phá
+            </button>
+            <button onClick={() => setTab('search')}
+              className={`px-4 py-1.5 rounded-lg text-[12px] font-bold transition ${tab === 'search' ? 'bg-blue-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+              🔍 Tìm Kiếm
+            </button>
           </div>
         </div>
-        <div className="flex items-center gap-3 px-5 pb-3">
-          <input
-            value={keyword}
-            onChange={e => setKeyword(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && search(keyword)}
-            placeholder="Nhập từ khóa tìm kiếm (tiếng Trung hoặc tiếng Anh)..."
-            className="flex-1 px-4 py-2.5 bg-slate-800/80 border border-slate-600/60 rounded-xl text-[13px] font-medium text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
-          />
-          <button onClick={() => search(keyword)} disabled={loading || !keyword.trim()}
-            className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 rounded-xl text-[13px] font-black text-white transition shadow-md shadow-blue-900/30 min-w-[110px] justify-center">
-            {loading && page === 2 ? <><span className="animate-spin">⏳</span> Đang tìm...</> : <>🔍 Tìm Video</>}
-          </button>
-        </div>
+
+        {/* Search bar — only in search tab */}
+        {tab === 'search' && (
+          <div className="flex items-center gap-3 px-5 pb-2">
+            <input
+              value={keyword}
+              onChange={e => setKeyword(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && search(keyword)}
+              placeholder="Nhập từ khóa tìm kiếm (tiếng Trung hoặc tiếng Anh)..."
+              className="flex-1 px-4 py-2.5 bg-slate-800/80 border border-slate-600/60 rounded-xl text-[13px] font-medium text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
+            />
+            <button onClick={() => search(keyword)} disabled={searchLoading || !keyword.trim()}
+              className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 rounded-xl text-[13px] font-black text-white transition shadow-md shadow-blue-900/30 min-w-[110px] justify-center">
+              {searchLoading && page === 2 ? <><span className="animate-spin">⏳</span> Đang tìm...</> : <>🔍 Tìm Video</>}
+            </button>
+          </div>
+        )}
+
+        {/* Category bar — home tab */}
+        {tab === 'home' && (
+          <div className="flex items-center gap-2 px-5 pb-2 overflow-x-auto">
+            {CATEGORIES.map(cat => (
+              <button key={cat.id} onClick={() => switchCategory(cat.id)}
+                className={`px-3 py-1 rounded-lg text-[11px] font-bold transition border whitespace-nowrap flex-shrink-0
+                  ${homeCat === cat.id ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white hover:border-slate-500'}`}>
+                {cat.label}
+              </button>
+            ))}
+            <button onClick={() => loadHome(homeCat, 1)}
+              className="ml-auto flex-shrink-0 px-3 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-[11px] text-slate-400 hover:text-white transition">
+              🔄 Tải lại
+            </button>
+          </div>
+        )}
+
+        {/* Common controls: quality + folder + translate */}
         <div className="flex items-center gap-2 px-5 pb-3">
           <span className="text-[11px] font-bold text-slate-500 uppercase tracking-widest mr-1">Chất lượng:</span>
           {[['best','Tốt nhất'],['1080','1080p'],['720','720p'],['480','480p']].map(([v,l]) => (
@@ -282,32 +443,45 @@ export default function BilibiliSearch({ onAddToQueue }) {
             className="flex items-center gap-1.5 px-3 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-slate-500 rounded-lg text-[11px] font-bold text-slate-300 transition max-w-[200px]">
             📁 <span className="truncate">{outFolder ? outFolder.split(/[/\\]/).pop() : 'Chọn thư mục lưu'}</span>
           </button>
-          <button onClick={() => { const next = !autoTrans; setAutoTrans(next); if (next && results.length > 0) translateBatch(results); }}
+          <button onClick={() => { const next = !autoTrans; setAutoTrans(next); if (next && activeItems.length > 0) translateBatch(activeItems); }}
             className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-[11px] font-bold transition border ${autoTrans ? 'bg-green-700 border-green-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'}`}>
             🌐 {autoTrans ? 'Đang dịch VI' : 'Dịch VI'}
           </button>
-          {results.length > 0 && <span className="ml-auto text-[11px] text-slate-500">{results.length} video</span>}
+          {activeItems.length > 0 && <span className="ml-auto text-[11px] text-slate-500">{activeItems.length} video</span>}
         </div>
       </div>
 
       {/* CONTENT — split layout khi có video được chọn */}
       <div className="flex-1 flex overflow-hidden min-h-0">
 
-        {/* DANH SÁCH KẾT QUẢ */}
+        {/* VIDEO GRID */}
         <div className={`flex flex-col overflow-hidden transition-all duration-300 ${selected ? 'w-[42%] border-r border-slate-700/60' : 'w-full'}`}>
           <div className="flex-1 overflow-y-auto px-3 py-3">
-            {error && (
-              <div className="mb-3 px-4 py-2 bg-red-900/40 border border-red-700/50 rounded-lg text-sm text-red-300">❌ {error}</div>
+
+            {/* Home tab states */}
+            {tab === 'home' && homeError && (
+              <div className="mb-3 px-4 py-2 bg-red-900/40 border border-red-700/50 rounded-lg text-sm text-red-300">❌ {homeError}</div>
             )}
-            {loading && results.length === 0 && (
+            {tab === 'home' && homeLoading && homeItems.length === 0 && (
+              <div className="flex flex-col items-center justify-center h-64 gap-4">
+                <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"/>
+                <div className="text-sm text-slate-400">Đang tải nội dung Bilibili...</div>
+              </div>
+            )}
+
+            {/* Search tab states */}
+            {tab === 'search' && searchError && (
+              <div className="mb-3 px-4 py-2 bg-red-900/40 border border-red-700/50 rounded-lg text-sm text-red-300">❌ {searchError}</div>
+            )}
+            {tab === 'search' && searchLoading && results.length === 0 && (
               <div className="flex flex-col items-center justify-center h-64 gap-4">
                 <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"/>
                 <div className="text-sm text-slate-400">Đang tìm kiếm trên Bilibili...</div>
               </div>
             )}
-            {!loading && results.length === 0 && !error && (
+            {tab === 'search' && !searchLoading && results.length === 0 && !searchError && (
               <div className="flex flex-col items-center justify-center h-full text-slate-600 select-none gap-3">
-                <div className="text-6xl">📺</div>
+                <div className="text-6xl">🔍</div>
                 <div className="text-sm font-semibold">Nhập từ khóa và nhấn Tìm để bắt đầu</div>
                 <div className="text-xs text-slate-700 text-center max-w-xs">
                   Không cần đăng nhập · Không cần VPN<br/>
@@ -315,77 +489,38 @@ export default function BilibiliSearch({ onAddToQueue }) {
                 </div>
               </div>
             )}
-            {results.length > 0 && (
+
+            {/* Video grid */}
+            {activeItems.length > 0 && (
               <div className={`grid gap-3 ${selected ? 'grid-cols-2' : 'grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6'}`}>
-                {results.map(item => {
-                  const isSelected = selected?.bvid === item.bvid;
-                  const itemDl = dlQueue[item.bvid];
-                  return (
-                    <div key={item.bvid}
-                      className={`group relative flex flex-col rounded-xl overflow-hidden border transition-all cursor-pointer
-                        ${isSelected
-                          ? 'border-blue-500 bg-blue-950/40 ring-1 ring-blue-500/40'
-                          : 'bg-slate-800 border-slate-700/50 hover:border-blue-500/50'}`}
-                      onMouseEnter={() => setHoverId(item.bvid)}
-                      onMouseLeave={() => setHoverId(null)}
-                      onClick={() => selectVideo(item)}>
-
-                      {/* THUMBNAIL */}
-                      <div className="relative aspect-video bg-slate-900 overflow-hidden">
-                        {item.thumbnail && (
-                          <img src={item.thumbnail} alt={item.title} referrerPolicy="no-referrer"
-                            className="w-full h-full object-cover" loading="lazy"/>
-                        )}
-                        {item.duration > 0 && (
-                          <span className="absolute bottom-1.5 right-1.5 bg-black/70 text-white text-[10px] px-1.5 py-0.5 rounded font-mono">
-                            {fmtDur(item.duration)}
-                          </span>
-                        )}
-                        {item.play > 0 && (
-                          <span className="absolute top-1.5 left-1.5 bg-black/60 text-blue-300 text-[10px] px-1.5 py-0.5 rounded flex items-center gap-1">
-                            ▶ {fmtNum(item.play)}
-                          </span>
-                        )}
-                        {isSelected && (
-                          <div className="absolute inset-0 bg-blue-600/20 flex items-center justify-center">
-                            <div className="w-8 h-8 rounded-full bg-blue-500/80 flex items-center justify-center text-white text-sm font-bold">▶</div>
-                          </div>
-                        )}
-                        {!isSelected && (hoverId === item.bvid) && (
-                          <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-                            <div className="w-10 h-10 rounded-full bg-blue-600/90 flex items-center justify-center text-white text-xl">▶</div>
-                          </div>
-                        )}
-                      </div>
-
-                      {/* INFO */}
-                      <div className="p-2 flex flex-col gap-0.5 flex-1">
-                        <p className="text-[10px] text-slate-200 line-clamp-2 leading-tight font-medium" title={item.title}>
-                          {translated[item.bvid] || item.title || '(Không có tiêu đề)'}
-                        </p>
-                        {item.author && (
-                          <button onClick={e => { e.stopPropagation(); openChannel(item.mid, item.author); }}
-                            className="text-left text-[9px] text-blue-400/70 hover:text-blue-300 truncate transition mt-0.5">
-                            📺 @{item.author}
-                          </button>
-                        )}
-                        {itemDl?.status === 'done' && (
-                          <div className="mt-auto text-center text-[9px] text-green-400 font-bold">✅ Đã tải</div>
-                        )}
-                        {itemDl?.status === 'downloading' && (
-                          <div className="mt-auto">
-                            <div className="w-full h-1 bg-slate-700 rounded-full overflow-hidden">
-                              <div className="h-full bg-blue-500 rounded-full transition-all" style={{ width: `${itemDl.percent || 0}%` }}/>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
+                {activeItems.map(item => (
+                  <VideoCard
+                    key={item.bvid}
+                    item={item}
+                    isSelected={selected?.bvid === item.bvid}
+                    dlState={dlQueue[item.bvid]}
+                    translated={translated}
+                    onSelect={selectVideo}
+                    onChannel={openChannel}
+                    showRank={showRank}
+                  />
+                ))}
               </div>
             )}
-            {hasMore && !loading && (
+
+            {/* Load more buttons */}
+            {tab === 'home' && homeHasMore && !homeLoading && (
+              <div className="flex justify-center mt-4">
+                <button onClick={() => loadHome(homeCat, homePage)}
+                  className="px-6 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm font-semibold transition">
+                  Tải thêm...
+                </button>
+              </div>
+            )}
+            {tab === 'home' && homeLoading && homeItems.length > 0 && (
+              <div className="flex justify-center mt-4"><span className="text-slate-500 text-sm">⏳ Đang tải...</span></div>
+            )}
+            {tab === 'search' && hasMore && !searchLoading && (
               <div className="flex justify-center mt-4">
                 <button onClick={() => search(keyword, page)}
                   className="px-6 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm font-semibold transition">
@@ -393,7 +528,7 @@ export default function BilibiliSearch({ onAddToQueue }) {
                 </button>
               </div>
             )}
-            {loading && results.length > 0 && (
+            {tab === 'search' && searchLoading && results.length > 0 && (
               <div className="flex justify-center mt-4">
                 <span className="text-slate-500 text-sm">⏳ Đang tải...</span>
               </div>
@@ -404,7 +539,6 @@ export default function BilibiliSearch({ onAddToQueue }) {
         {/* PREVIEW PANEL */}
         {selected && (
           <div className="w-[58%] flex flex-col bg-[#070b14] overflow-hidden">
-            {/* Player */}
             <div className="relative w-full bg-black" style={{ aspectRatio: '16/9' }}>
               <iframe
                 key={selected.bvid}
@@ -413,24 +547,19 @@ export default function BilibiliSearch({ onAddToQueue }) {
                 className="w-full h-full border-0"
                 sandbox="allow-scripts allow-same-origin allow-presentation allow-popups"
               />
-              {/* Close & Fullscreen buttons */}
               <div className="absolute top-2 right-2 flex gap-1.5">
-                <button onClick={() => setFullscreen(selected)}
-                  title="Toàn màn hình"
+                <button onClick={() => setFullscreen(selected)} title="Toàn màn hình"
                   className="w-7 h-7 rounded-full bg-black/60 hover:bg-black/90 flex items-center justify-center text-white text-xs transition">
                   ⛶
                 </button>
-                <button onClick={() => setSelected(null)}
-                  title="Đóng xem trước"
+                <button onClick={() => setSelected(null)} title="Đóng xem trước"
                   className="w-7 h-7 rounded-full bg-black/60 hover:bg-red-700/90 flex items-center justify-center text-white text-xs transition">
                   ✕
                 </button>
               </div>
             </div>
 
-            {/* Info + Actions */}
             <div className="flex-1 overflow-y-auto px-4 py-3 flex flex-col gap-3">
-              {/* Title */}
               <div>
                 <div className="text-[13px] font-bold text-white leading-snug">
                   {translated[selected.bvid] || selected.title}
@@ -440,7 +569,6 @@ export default function BilibiliSearch({ onAddToQueue }) {
                 )}
               </div>
 
-              {/* Meta */}
               <div className="flex flex-wrap gap-2">
                 {selected.duration > 0 && (
                   <span className="px-2 py-0.5 bg-slate-800 rounded text-[11px] text-slate-300">
@@ -457,6 +585,11 @@ export default function BilibiliSearch({ onAddToQueue }) {
                     👍 {fmtNum(selected.like)}
                   </span>
                 )}
+                {selected.tname && (
+                  <span className="px-2 py-0.5 bg-slate-700 rounded text-[11px] text-slate-400">
+                    {selected.tname}
+                  </span>
+                )}
                 {selected.author && (
                   <button onClick={() => openChannel(selected.mid, selected.author)}
                     className="px-2 py-0.5 bg-blue-900/40 hover:bg-blue-800/60 border border-blue-700/40 rounded text-[11px] text-blue-300 transition">
@@ -465,9 +598,7 @@ export default function BilibiliSearch({ onAddToQueue }) {
                 )}
               </div>
 
-              {/* Actions */}
               <div className="flex flex-col gap-2 mt-auto pt-2 border-t border-slate-700/40">
-                {/* Thêm vào hàng đợi reup */}
                 {onAddToQueue && (
                   <button onClick={() => onAddToQueue(selected)}
                     className="w-full py-2.5 rounded-xl text-[13px] font-black bg-pink-600 hover:bg-pink-500 text-white transition shadow-md shadow-pink-900/30 flex items-center justify-center gap-2">
@@ -475,7 +606,6 @@ export default function BilibiliSearch({ onAddToQueue }) {
                   </button>
                 )}
 
-                {/* Tải về */}
                 <div className="flex gap-2">
                   <button onClick={pickFolder}
                     className="flex items-center gap-1.5 px-3 py-2 bg-slate-700 hover:bg-slate-600 border border-slate-600 rounded-lg text-[11px] font-bold text-slate-300 transition min-w-0 truncate flex-shrink-0">
@@ -518,7 +648,6 @@ export default function BilibiliSearch({ onAddToQueue }) {
                   )}
                 </div>
 
-                {/* Link gốc */}
                 {selected.url && (
                   <a href={selected.url} target="_blank" rel="noreferrer"
                     className="text-center text-[10px] text-slate-600 hover:text-slate-400 transition underline underline-offset-2">

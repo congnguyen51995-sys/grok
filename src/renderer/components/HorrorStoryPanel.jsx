@@ -29,62 +29,51 @@ const LS_LB_BOT_TXT   = 'horror_lb_bot_txt';
 const LS_DEFAULT_INSTR = 'horror_default_instruction';
 const LS_CROP_X        = 'horror_crop_x';
 
-const DEFAULT_INSTRUCTION = `TẠO VIDEO EDIT KIỂU CHUYÊN NGHIỆP — REACTIVE THEO LỜI THOẠI, NHIỀU LỚP TEXT ĐỘNG:
+// Tăng version để force-reset localStorage cũ sang code-template mới
+const DEFAULT_INSTR_VERSION = 'v5-codetpl';
+const LS_DEFAULT_INSTR_VER  = 'horror_default_instr_ver';
 
-━━ TEXT ANIMATIONS (bắt buộc tất cả) ━━
-1. TYPEWRITER SUBTITLE: mỗi câu thoại → text xuất hiện từng chữ
-   charCount = Math.floor(interpolate(frame,[sf,sf+seg.text.length*1.8],[0,seg.text.length],{extrapolateRight:'clamp'}))
-   style: bottom 15%, fontSize 21, color #fff, textShadow "0 0 6px #ff2200", borderLeft "3px solid #cc0000", bg rgba(0,0,0,0.72)
-   ⚠️ VÙNG bottom 0%–14% CHỈ DÀNH CHO LOWER THIRD — subtitle KHÔNG ĐƯỢC đặt trong vùng này
+const DEFAULT_INSTRUCTION = `CÁC COMPONENT BẮT BUỘC — COPY TEMPLATE, ĐIỀN NỘI DUNG TỪ TRANSCRIPT:
 
-2. CHAPTER TITLE: 3–5 lần — tên nhân vật/địa điểm/sự kiện kinh dị lấy từ transcript
-   Fade in 20fr, hold, fade out — fontSize 46, fontWeight 900, color #ff2200, textShadow "0 0 24px #ff0000", uppercase, center
+【A】CHAPTER TITLE — bắt buộc 3 lần — fontSize 46, đỏ, uppercase, top 16%, fade in/out:
+const CHAPTERS = ['<cụm từ nhân vật/địa điểm từ transcript>','<cụm 2>','<cụm 3>'];
+const CH = [[60,170],[Math.round(durationInFrames*0.4),Math.round(durationInFrames*0.4)+110],[Math.round(durationInFrames*0.75),Math.round(durationInFrames*0.75)+110]];
+{CH.map(([s,e],i) => frame>=s&&frame<e && (
+  <div key={'ch'+i} style={{position:'absolute',top:'16%',width:'100%',textAlign:'center',color:'#ff2200',fontSize:46,fontWeight:900,textTransform:'uppercase',textShadow:'0 0 24px #ff0000,0 0 8px #800',fontFamily:'Georgia,serif',opacity:interpolate(frame,[s,s+20,e-20,e],[0,1,1,0],{extrapolateLeft:'clamp',extrapolateRight:'clamp'})}}>
+    {CHAPTERS[i]}
+  </div>
+))}
 
-3. SCENE CARD GÓC TRÊN TRÁI: "📍 [địa điểm]" hoặc "⏰ [giờ]" slide từ trái — 3–4 lần
-   translateX interpolate(frame,[ap,ap+16],[-200,0]) — fontSize 14, bg rgba(0,0,0,0.88), borderLeft "3px solid #f00"
+【B】SCENE CARD — bắt buộc 3 lần — góc trên trái, slide từ trái:
+const SCENES = ['📍 <địa điểm từ transcript>','⏰ <thời gian/bối cảnh>','📍 <địa điểm 2>'];
+const SF = [[30,90],[Math.round(durationInFrames*0.35),Math.round(durationInFrames*0.35)+60],[Math.round(durationInFrames*0.7),Math.round(durationInFrames*0.7)+60]];
+{SF.map(([s,e],i) => frame>=s&&frame<e && (
+  <div key={'sf'+i} style={{position:'absolute',top:'27%',left:0,padding:'6px 14px',background:'rgba(0,0,0,0.88)',borderLeft:'3px solid #f00',color:'#fff',fontSize:14,fontWeight:'bold',transform:\`translateX(\${interpolate(frame,[s,s+16,e-10,e],[-180,0,0,-180],{extrapolateLeft:'clamp',extrapolateRight:'clamp'})}px)\`}}>
+    {SCENES[i]}
+  </div>
+))}
 
-4. HIGHLIGHT WORD: từ khóa kinh dị nổi bật CENTER, scale pop
-   scale = interpolate(frame,[s,s+8,s+20,s+28],[0,1.2,1,0]) — fontSize 60+, textShadow đỏ rực
+【C】LOWER THIRD — bắt buộc 2 lần — bottom 0, slide từ trái, height 44:
+const LT = [{f:120,t:'<tóm tắt cảnh 1 từ transcript>'},{f:Math.round(durationInFrames*0.55),t:'<tóm tắt 2>'}];
+{LT.map(({f,t}) => frame>=f&&frame<f+120 && (
+  <div key={'lt'+f} style={{position:'absolute',bottom:0,left:0,right:0,height:44,background:'linear-gradient(90deg,#cc0000 0%,#000 100%)',display:'flex',alignItems:'center',paddingLeft:14,color:'#fff',fontSize:15,fontWeight:'bold',transform:\`translateX(\${interpolate(frame,[f,f+20,f+100,f+120],[-1200,0,0,-1200],{extrapolateLeft:'clamp',extrapolateRight:'clamp'})}px)\`}}>
+    {t}
+  </div>
+))}
 
-5. LOWER THIRD: tóm tắt cảnh — position absolute, bottom 0, left 0, right 0, height 44, bg linear-gradient(90deg,#cc0000,#000), slide từ trái: translateX interpolate(frame,[ap,ap+20],[-1200,0])
-   ⚠️ LOWER THIRD luôn ở bottom 0 — KHÔNG được đặt cao hơn bottom 14% để tránh đè subtitle
+【D】KEYWORD REACTIONS — reactive theo SUBTITLES, bắt buộc implement đủ 5 nhóm:
+const matchKw = (t,l) => l.some(w => t.toLowerCase().includes(w));
+const aS = SUBTITLES.find(s => frame>=Math.round(s.start*fps) && frame<Math.round(s.end*fps));
+const kTxt = aS?.text||''; const kF = aS ? frame-Math.round(aS.start*fps) : 0;
+{matchKw(kTxt,['máu','chết','giết','xác','dao','súng','thương','ngã']) && <AbsoluteFill style={{backgroundColor:\`rgba(180,0,0,\${interpolate(kF,[0,3,12,22],[0,0.45,0.35,0],{extrapolateLeft:'clamp',extrapolateRight:'clamp'})})\`,pointerEvents:'none'}}/>}
+{matchKw(kTxt,['ma','hồn','linh','quỷ','tối','đêm','bóng','âm','khuya','rùng','vắng']) && <AbsoluteFill style={{background:'radial-gradient(circle,transparent 38%,rgba(0,0,0,0.55) 100%)',pointerEvents:'none',opacity:interpolate(kF,[0,5,20,28],[0,1,0.8,0],{extrapolateLeft:'clamp',extrapolateRight:'clamp'})}}/>}
+{matchKw(kTxt,['sợ','kinh hãi','hoảng','run rẩy','khóc thét']) && <AbsoluteFill style={{background:'radial-gradient(circle,transparent 42%,rgba(0,0,0,0.45) 100%)',pointerEvents:'none',opacity:interpolate(kF,[0,5,15,25],[0,0.85,0.65,0],{extrapolateLeft:'clamp',extrapolateRight:'clamp'})}}/>}
+{matchKw(kTxt,['hét','thét','gào','rú','la hét']) && <AbsoluteFill style={{backgroundColor:\`rgba(255,255,255,\${interpolate(kF,[0,2,8,12],[0,0.2,0.08,0],{extrapolateLeft:'clamp',extrapolateRight:'clamp'})})\`,pointerEvents:'none'}}/>}
+{matchKw(kTxt,['bỗng','đột nhiên','thình lình','đột ngột','bỗng dưng']) && <AbsoluteFill style={{background:'radial-gradient(circle,transparent 35%,rgba(0,0,0,0.7) 100%)',pointerEvents:'none',opacity:interpolate(kF,[0,3,8,14],[0,1,0.5,0],{extrapolateLeft:'clamp',extrapolateRight:'clamp'})}}/>}
 
-━━ KEYWORD VISUAL REACTIONS (reactive theo từng từ trong transcript) ━━
-Scan SUBTITLES, tại frame mỗi segment có chứa TỪ KHÓA → kích hoạt effect trong ~20–30 frames.
-Dùng hàm matchKw(text, list) = list.some(w => text.toLowerCase().includes(w)) để kiểm tra.
-
-NHÓM 1 — CHẾT/MÁU/NGUY HIỂM: máu,chết,giết,xác,dao,súng,thương,nạn,thịt,vết,đỏ,ngã
-→ RED_FLASH: bg rgba(180,0,0, interpolate(f,[0,3,12,22],[0,0.5,0.4,0],extrap:'clamp'))
-
-NHÓM 2 — MA/ÂM/TỐI: ma,hồn,linh,quỷ,tối,đêm,bóng,âm,mờ,khuya,nhà hoang,lạnh,lặng,im,vắng,rùng
-→ DARK_SURGE: vignette tối đột ngột + bg rgba(0,0,0,opacity interpolate(f,[0,5,15,25],[0,0.55,0.45,0]))
-
-NHÓM 3 — SỢ HÃI (chỉ từ rõ ràng, KHÔNG dùng "run"/"lạnh"): sợ,kinh hãi,hoảng loạn,khóc thét,hoảng sợ,mồ hôi,run rẩy,toát mồ hôi
-→ DARK_PULSE nhẹ: vignette opacity interpolate(f,[0,5,15,25],[0,0.4,0.35,0]) — KHÔNG shake/translate (tránh giật)
-
-NHÓM 4 — HÉT RÕ RÀNG (chỉ từ cực mạnh, không dùng từ phổ biến): hét,thét,gào,rú,la hét,thét lên
-→ WHITE_FLASH nhẹ: opacity 0→0.25→0 trong 10fr — KHÔNG zoom/scale (tránh giật)
-
-NHÓM 5 — HÀNH ĐỘNG/ĐỔ ĐUỔI: chạy,trốn,đuổi,nhảy,vọt,lao,nhanh,vội,gấp
-→ MOTION_BLUR: filter blur(1.5px) nhịp 8fr — KHÔNG dùng scaleX để tránh jitter
-
-NHÓM 6 — BẤT NGỜ/CĂNG THẲNG (chỉ từ thực sự bất ngờ, KHÔNG dùng "lúc đó"/"khi đó"/"tự nhiên"):
-bỗng,đột nhiên,thình lình,bỗng nhiên,bỗng dưng,chợt nghe,đột ngột
-→ SUSPENSE_FLASH: vignette nhanh tối 6fr rồi sáng lại — KHÔNG shake/translate (tránh giật)
-
-⚠️ FALLBACK MẶC ĐỊNH — áp dụng kể cả khi KHÔNG có từ khóa nào:
-Chỉ dùng 2 effect tĩnh sau (KHÔNG dùng transform/translate/shake):
-- Pulse vignette nhẹ: vignette opacity sin(frame*0.035)*0.12+0.12
-- Flicker ánh sáng: brightness interpolate(frame%60,[0,2,7,15,22,30],[1,0.97,1.01,0.98,1,0.99])
-→ ⛔ TUYỆT ĐỐI KHÔNG có "Subtle shake thường trực" hay bất kỳ translateX/translateY nào trong FALLBACK — gây jitter liên tục khi render
-
-⛔ KHÔNG BAO GIỜ apply translateX/translateY/transform lên thẳng phần tử <Video> hay div bọc trực tiếp nó
-  — Nếu cần shake/motion: CHỈ apply lên AbsoluteFill wrapper NGOÀI CÙNG để toàn bộ frame (video + subtitle + overlay) di chuyển đồng bộ
-  — Apply transform lên riêng Video → MC bị giật còn subtitle/overlay đứng yên = jitter rõ ràng
-
-⛔ TUYỆT ĐỐI KHÔNG dùng AudioContext, Web Audio API, oscillator, createOscillator trong code
-  — Remotion render headless bằng Chromium thật: AudioContext chạy và ghi âm vào video → gây âm thanh lạ vang vọng
-  — KHÔNG có useEffect nào gọi AudioContext, playHorrorSting, hay bất kỳ audio synthesis nào`;
+⛔ KHÔNG filter/brightness thay đổi theo frame trên wrapper bọc <Video> → giật
+⛔ KHÔNG translateX/translateY lên <Video> hay wrapper trực tiếp bọc Video → jitter
+⛔ KHÔNG AudioContext/Web Audio/oscillator → âm thanh lạ vang vọng khi render`;
 
 
 const GEMINI_MODELS = [
@@ -109,15 +98,15 @@ const HORROR_PRESETS = [
   { id: 'flicker',       cat: 'overlay', label: '⚡ Nhấp nháy đèn',      prompt: 'Light flicker: opacity = interpolate(frame%60,[0,3,7,12,22,30,52,60],[0,0.09,0.02,0.11,0.08,0.03,0.07,0]) — đèn chập chờn' },
   { id: 'red_pulse',     cat: 'overlay', label: '🩸 Xung đỏ ám',         prompt: 'Red pulse: AbsoluteFill background rgba(170,0,0,1), opacity = Math.sin(frame/45*Math.PI)*0.065+0.065' },
   { id: 'cold_overlay',  cat: 'overlay', label: '💨 Lạnh xanh âm',       prompt: 'Cold blue: AbsoluteFill background rgba(0,20,80,0.07) + opacity sin nhẹ mỗi 120 frame' },
-  { id: 'zoom_in',       cat: 'motion',  label: '🔍 Zoom vào chậm',      prompt: 'Ken Burns: div bọc Video, transform scale từ 1.0 → 1.09 qua interpolate(frame,[0,totalFrames],[1.0,1.09])' },
-  { id: 'zoom_out',      cat: 'motion',  label: '🔎 Zoom ra chậm',       prompt: 'Ken Burns: scale từ 1.09 → 1.0 qua interpolate(frame,[0,totalFrames],[1.09,1.0])' },
-  { id: 'slight_shake',  cat: 'motion',  label: '📳 Run rẩy nhẹ',        prompt: 'Camera shake: transform translateX(sin(frame*0.11)*2.5px) translateY(cos(frame*0.09)*1.5px)' },
+  { id: 'zoom_in',       cat: 'motion',  label: '🔍 Zoom vào chậm',      prompt: 'Ken Burns zoom vào: áp dụng TRỰC TIẾP lên style của <Video> (KHÔNG bọc AbsoluteFill riêng): style={{...existingVideoStyle, transform:`scale(${interpolate(frame,[0,totalFrames],[1.0,1.09])})`,transformOrigin:"center center"}} — scale mượt 1.0→1.09, KHÔNG wrapper riêng, KHÔNG per-frame non-smooth' },
+  { id: 'zoom_out',      cat: 'motion',  label: '🔎 Zoom ra chậm',       prompt: 'Ken Burns zoom ra: áp dụng TRỰC TIẾP lên style của <Video> (KHÔNG bọc AbsoluteFill riêng): style={{...existingVideoStyle, transform:`scale(${interpolate(frame,[0,totalFrames],[1.09,1.0])})`,transformOrigin:"center center"}} — scale mượt 1.09→1.0' },
+  { id: 'slight_shake',  cat: 'motion',  label: '📳 Run rẩy nhẹ',        prompt: 'Camera shake NGẮT QUÃNG — KHÔNG run liên tục mọi frame. Chỉ rung từng đợt ngắn (20fr) mỗi 5 giây. Code mẫu phải dùng chính xác pattern này trên outermost AbsoluteFill:\nconst SP=150,sP=frame%SP,sOn=sP<20;\nconst sAmp=sOn?interpolate(sP,[0,3,15,20],[0,2.5,2,0],{extrapolateLeft:"clamp",extrapolateRight:"clamp"}):0;\nconst sX=sOn?Math.sin(sP*2.1)*sAmp:0, sY=sOn?Math.cos(sP*1.8)*sAmp*0.6:0;\n<AbsoluteFill style={{transform:`translate(${sX}px,${sY}px)`,overflow:"hidden"}}> — KHÔNG apply lên div/wrapper bọc riêng Video' },
   { id: 'horror_title',  cat: 'text',    label: '💀 Tiêu đề horror',     prompt: 'Tiêu đề: frame 60-210, font Georgia serif 52px bold trắng, textShadow "0 0 12px #ff0000,0 0 28px #800000", opacity fade 60→90 / 180→210, top center padding 70px' },
   { id: 'watermark',     cat: 'text',    label: '©️ Watermark kênh',      prompt: 'Watermark góc dưới phải: channelName, 13px bold, rgba(255,255,255,0.55), position absolute bottom 20 right 20' },
   { id: 'lower_third',   cat: 'text',    label: '📊 Lower third',        prompt: 'Lower third: slide từ trái vào frame 30-70 qua interpolate translateX, tên kênh + tagline, bg linear-gradient đỏ/đen, height 52, bottom 28%' },
   { id: 'subscribe_end', cat: 'text',    label: '🔔 Subscribe end card', prompt: 'Subscribe 5s cuối: "ĐĂNG KÝ KÊNH" + channelName, opacity fade totalFrames-150→-120, font 28px bold, center, glow đỏ' },
-  { id: 'speed_slow',    cat: 'speed',   label: '🎵 Giọng chậm 0.95x',   prompt: '<Video playbackRate={0.95} /> — QUAN TRỌNG: khi dùng playbackRate, tất cả subtitle frame phải tính: frameStart=Math.round(word.start/0.95*fps), frameEnd=Math.round(word.end/0.95*fps)' },
-  { id: 'speed_fast',    cat: 'speed',   label: '🎵 Giọng nhanh 1.05x',  prompt: '<Video playbackRate={1.05} /> — QUAN TRỌNG: khi dùng playbackRate, tất cả subtitle frame phải tính: frameStart=Math.round(word.start/1.05*fps), frameEnd=Math.round(word.end/1.05*fps)' },
+  { id: 'speed_slow',    cat: 'speed',   label: '🎵 Giọng chậm 0.95x',   prompt: '<Video playbackRate={0.95} /> — Timestamp trong SUBTITLES đã được điều chỉnh sẵn cho playbackRate=0.95, dùng trực tiếp s.start*fps KHÔNG tính lại' },
+  { id: 'speed_fast',    cat: 'speed',   label: '🎵 Giọng nhanh 1.05x',  prompt: '<Video playbackRate={1.05} /> — Timestamp trong SUBTITLES đã được điều chỉnh sẵn cho playbackRate=1.05, dùng trực tiếp s.start*fps KHÔNG tính lại' },
 ];
 
 const CAT_META = {
@@ -172,6 +161,18 @@ function patchCodeDuration(code, durationSec) {
     .replace(/(durationInFrames:\s*)\d+/g, `$1${frames}`);
 }
 
+// Post-process: thay bất kỳ tên kênh sai nào trong string literals bằng tên đúng
+// Gemini đôi khi đọc transcript và lấy tên kênh từ audio thay vì dùng biến channelName
+function patchChannelName(code, correctName) {
+  if (!correctName) return code;
+  const esc = correctName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Tìm "kênh <text>" không phải đúng tên hoặc biến ${channelName}
+  return code.replace(
+    new RegExp(`kênh\\s+(?!\\$\\{channelName\\}|${esc})([\\w\\sÀ-ɏḀ-ỿ]{2,60}?)(?=['"\x60\\n,!?.)\\]><])`, 'g'),
+    `kênh ${correctName}`
+  );
+}
+
 // Xóa startFrom khỏi <Video src=...input.mp4...> — startFrom đẩy seek vượt EOF → delayRender treo
 // Đồng thời đảm bảo endAt={frames-1} để không render frame cuối vượt duration
 function patchCodeVideoSafe(code, durationSec) {
@@ -191,14 +192,11 @@ function patchCodeVideoSafe(code, durationSec) {
 
 function patchCodeSubtitles(code, segs, speedRate = 1) {
   if (!code.includes('SUBTITLE_PLACEHOLDER')) return code;
-  // Khi video dùng playbackRate={r}, video chạy chậm hơn/nhanh hơn timeline.
-  // Tại Remotion frame F, video ở giây: F/fps * r → subtitle ở giây T xuất hiện tại frame T/r*fps.
-  // Vì Gemini tính frame = start * fps (không biết r), ta chia timestamp cho r trước khi inject.
+  // playbackRate compensation: chia timestamp để Gemini dùng start*fps sẽ ra đúng frame
   const rate = speedRate !== 1 ? speedRate : 1;
   const data = segs && segs.length
     ? JSON.stringify(segs.map(s => ({ start: +(s.start / rate).toFixed(2), end: +(s.end / rate).toFixed(2), text: s.text.trim() })))
     : '[]';
-  // Gemini có thể bọc trong nháy đơn, nháy đôi, hoặc bare — handle cả 3
   return code
     .replace(/"SUBTITLE_PLACEHOLDER"/g, data)
     .replace(/'SUBTITLE_PLACEHOLDER'/g, data)
@@ -231,6 +229,9 @@ function sanitizeGeneratedCode(code) {
     // Strip uninitialized const (từ chunk join boundary: "const foo" không có = value)
     if (/^const\s+[A-Za-z_$][\w$]*\s*;?\s*$/.test(trimmed)) continue;
 
+    // Strip brightness(${expr}) khỏi CSS filter string → gây per-frame recomposite → giật
+    const patchedLine = line.includes('brightness(${') ? line.replace(/\s*brightness\(\$\{[^}]+\}\)/g, '') : line;
+
     // Detect: const [ bắt đầu bằng JSON object có numeric value → invalid destructuring
     if (!skipping && /^const\s*\[/.test(trimmed) && /\{"[^"]+"\s*:\s*[\d-]/.test(trimmed)) {
       skipping = true;
@@ -250,15 +251,42 @@ function sanitizeGeneratedCode(code) {
       if (skipDepth <= 0) skipping = false;
       continue;
     }
-    out.push(line);
+    out.push(patchedLine);
   }
   return out.join('\n');
+}
+
+// Phát hiện và xóa dòng cuối bị cắt giữa chừng (string literal chưa đóng)
+// Nguyên nhân: Gemini truncate ngay giữa dòng → join thêm '\n' tạo newline trong string → SWC lỗi
+function fixTruncatedLastLine(code) {
+  if (!code) return code;
+  const lines = code.split('\n');
+  let i = lines.length - 1;
+  while (i >= 0 && !lines[i].trim()) i--;
+  if (i < 0) return code;
+  const lastLine = lines[i];
+  let sq = 0, dq = 0, bt = 0, esc = false;
+  for (const ch of lastLine) {
+    if (esc) { esc = false; continue; }
+    if (ch === '\\') { esc = true; continue; }
+    if (ch === "'") sq++;
+    else if (ch === '"') dq++;
+    else if (ch === '`') bt++;
+  }
+  // Số lẻ → dòng bị cắt giữa string literal → xóa dòng đó để completion viết lại từ đầu
+  if (sq % 2 !== 0 || dq % 2 !== 0 || bt % 2 !== 0) {
+    lines.splice(i, 1);
+    return lines.join('\n');
+  }
+  return code;
 }
 
 // Kiểm tra JSX có đầy đủ không (Gemini đôi khi cắt ngang khi gần max token)
 function isCodeComplete(code) {
   if (!code || code.length < 200) return false;
   if (!code.includes('export default')) return false;
+  // Nếu không có import remotion → đầu file bị cắt (phần completion pass sẽ không fix được import)
+  // Nhưng không return false ở đây vì auto-inject sẽ xử lý — chỉ check export default là đủ
   const lines = code.trimEnd().split('\n');
   const last3 = lines.slice(-3).join('\n');
   // Case 1: standalone export cuối file — "export default GeneratedVideo;"
@@ -695,7 +723,17 @@ export default function HorrorStoryPanel() {
 
   // Settings
   const [channelName,      setChannelName]      = useState(() => localStorage.getItem(LS_CHANNEL) || '@ThanhCongMedia');
-  const [defaultInstruction, setDefaultInstruction] = useState(() => localStorage.getItem(LS_DEFAULT_INSTR) ?? DEFAULT_INSTRUCTION);
+  const [defaultInstruction, setDefaultInstruction] = useState(() => {
+    const saved = localStorage.getItem(LS_DEFAULT_INSTR);
+    const savedVer = localStorage.getItem(LS_DEFAULT_INSTR_VER);
+    // Force-reset khi version cũ hoặc rỗng → đảm bảo dùng code-template mới
+    if (!saved || savedVer !== DEFAULT_INSTR_VERSION) {
+      localStorage.setItem(LS_DEFAULT_INSTR, DEFAULT_INSTRUCTION);
+      localStorage.setItem(LS_DEFAULT_INSTR_VER, DEFAULT_INSTR_VERSION);
+      return DEFAULT_INSTRUCTION;
+    }
+    return saved;
+  });
   const [orientation,   setOrientation]   = useState(() => localStorage.getItem(LS_ORIENT) || 'portrait');
   const [model,         setModel]         = useState(() => { const s = localStorage.getItem(LS_MODEL); return GEMINI_MODELS.find(m => m.id === s) ? s : 'gemini-3.5-flash'; });
   const [outputDir,     setOutputDir]     = useState(() => localStorage.getItem(LS_OUT_DIR) || '');
@@ -708,13 +746,15 @@ export default function HorrorStoryPanel() {
   const [trimEndSec,     setTrimEndSec]     = useState(0);
   // Pitch shift để lách Content ID
   const [pitchShiftOn,   setPitchShiftOn]   = useState(true);
+  // ffmpeg filter nhanh để né Content ID (hue shift + noise)
+  const [fastCidMode,    setFastCidMode]    = useState(true);
 
   // Letterbox
   const [bgReplaceEnabled, setBgReplaceEnabled] = useState(false);
   const [bgImagePath,      setBgImagePath]      = useState('');
   const [bgVideoPath,      setBgVideoPath]      = useState('');
   const [bgType,           setBgType]           = useState('image'); // 'image' | 'video'
-  const [bgEdgeSoftness,   setBgEdgeSoftness]   = useState(8);
+  const [bgEdgeSoftness,   setBgEdgeSoftness]   = useState(12);
   const [flipMid,          setFlipMid]          = useState(false); // scaleX(-1) cho đoạn giữa
   const bgSegRef = useRef(null); // cache MediaPipe instance
 
@@ -730,6 +770,14 @@ export default function HorrorStoryPanel() {
   const [activeSegIdx,  setActiveSegIdx]  = useState(null);
   const [finalPath,     setFinalPath]     = useState(null);
   const [chatVideoPath, setChatVideoPath] = useState(null); // video từ chat (không qua segment)
+
+  // Auto-segment
+  const [autoSegEnabled, setAutoSegEnabled] = useState(true);
+  const [segMins,        setSegMins]        = useState(10);
+
+  // Batch mode
+  const [batchMode,  setBatchMode]  = useState(false);
+  const [batchFiles, setBatchFiles] = useState([]); // [{path,name,durationSec,status,error}]
 
   // Chat / code
   const [messages,      setMessages]      = useState([]);
@@ -824,11 +872,19 @@ export default function HorrorStoryPanel() {
     const selectedList = HORROR_PRESETS.filter(p => effects.has(p.id)).map(p => `• ${p.label}: ${p.prompt}`).join('\n');
 
     const letterboxSection = lbEnabled ? `
-• 🎬 Letterbox cinematic (ĐẶT CUỐI CÙNG, zIndex 50, che trên tất cả):
-  - Thanh đen TRÊN: AbsoluteFill top:0, height:"${lbTop}%", background:"#000", display:flex, alignItems:center, paddingLeft:20
-    ${lbTopText ? `text trong thanh: "${lbTopText}", fontSize:Math.max(10, Math.round(${asp.height}*${lbTop}/100*0.35)), fontWeight:"bold", color:"#fff", opacity:0.88, letterSpacing:"0.08em"` : '(không có text)'}
-  - Thanh đen DƯỚI: AbsoluteFill bottom:0, top:auto, height:"${lbBot}%", background:"#000", display:flex, alignItems:center, justifyContent:flex-end, paddingRight:20
-    ${lbBotText ? `text trong thanh: "${lbBotText}", fontSize:Math.max(10, Math.round(${asp.height}*${lbBot}/100*0.32)), fontWeight:"bold", color:"#fff", opacity:0.82` : '(không có text)'}` : '';
+• 🎬 Letterbox cinematic — CHE ĐEN HOÀN TOÀN (ĐỪNG dùng AbsoluteFill — phải dùng <div> với position:'absolute'):
+  PHẢI viết chính xác như sau (copy và điền height):
+
+  {/* Letterbox TOP */}
+  <div style={{position:'absolute',top:0,left:0,right:0,height:'${lbTop}%',background:'#000',zIndex:9999,display:'flex',alignItems:'center',paddingLeft:20,overflow:'hidden'}}>
+    ${lbTopText ? `<span style={{color:'#fff',fontWeight:'bold',fontSize:Math.max(10,Math.round(${asp.height}*${lbTop}/100*0.35)),opacity:0.88,letterSpacing:'0.08em'}}>${lbTopText}</span>` : ''}
+  </div>
+  {/* Letterbox BOTTOM — che hết chữ/logo/watermark từ video gốc */}
+  <div style={{position:'absolute',bottom:0,left:0,right:0,height:'${lbBot}%',background:'#000',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'flex-end',paddingRight:20,overflow:'hidden'}}>
+    ${lbBotText ? `<span style={{color:'#fff',fontWeight:'bold',fontSize:Math.max(10,Math.round(${asp.height}*${lbBot}/100*0.32)),opacity:0.82}}>${lbBotText}</span>` : ''}
+  </div>
+
+  ⚠️ zIndex:9999 bắt buộc — thanh đen phải che lên TẤT CẢ overlay khác kể cả subtitle và chữ từ video gốc` : '';
 
     return `${systemPrompt ? systemPrompt + '\n\n' : ''}═══ HORROR VIDEO EDITOR — REMOTION ═══
 Video nguồn đã copy vào public/input.mp4 (${cappedSec.toFixed(1)}s).
@@ -840,12 +896,14 @@ const { durationInFrames: totalFrames } = useVideoConfig();
 
 ⚠️ BẮT BUỘC: <Video> PHẢI LÀ ELEMENT ĐẦU TIÊN trong return(), trước mọi overlay:
 return (
-  <AbsoluteFill ...>
-    <AbsoluteFill style={{transform:...}}><Video src={staticFile('input.mp4')} endAt={totalFrames-1} style={{width:'100%',height:'100%',objectFit:'cover'${orientation === 'square' ? '' : `,objectPosition:'${cropX}% 50%'`},...colorFilter}} /></AbsoluteFill>
+  <AbsoluteFill>
+    <AbsoluteFill style={{overflow:'hidden'}}><Video src={staticFile('input.mp4')} endAt={totalFrames-1} style={{width:'100%',height:'100%',objectFit:'cover'${orientation === 'square' ? '' : `,objectPosition:'${cropX}% 50%'`},...colorFilter}} /></AbsoluteFill>
     {/* overlays sau */}
   </AbsoluteFill>
 );
 ${orientation === 'square' ? '(Video đã cắt 1:1 — KHÔNG cần objectPosition)' : `(objectPosition '${cropX}% 50%' = vị trí đã chọn — GIỮ NGUYÊN)`}
+⛔ TUYỆT ĐỐI KHÔNG dùng transform/scale/translateX/translateY/top/left thay đổi theo frame trên AbsoluteFill bọc <Video> — background sẽ giật rõ ràng mỗi frame!
+   Nếu muốn Ken Burns: dùng objectPosition animation trực tiếp trên <Video>, KHÔNG transform wrapper.
 ⚠️ QUY TẮC VIDEO BẮT BUỘC — VI PHẠM SẼ LỖI:
 - KHÔNG dùng startFrom trên <Video> (không được phép trừ khi thực sự cần bắt đầu từ giữa clip)
 - endAt={totalFrames - 1} BẮT BUỘC — tránh seek vượt EOF → Chromium treo delayRender
@@ -856,35 +914,18 @@ ${orientation === 'square' ? '(Video đã cắt 1:1 — KHÔNG cần objectPosit
 - Không import hay dùng <Audio> riêng — âm thanh lấy từ <Video> tự động
 Mỗi overlay là AbsoluteFill riêng đặt TRÊN Video (pointerEvents:'none').
 
-HIỆU ỨNG CẦN ÁP DỤNG (tất cả, không bỏ sót):
-${selectedList || 'Hiệu ứng horror cơ bản'}${letterboxSection}
+══ YÊU CẦU BẮT BUỘC — THỰC HIỆN TẤT CẢ, KHÔNG BỎ SÓT ══
+${(defaultInstruction.trim() || DEFAULT_INSTRUCTION)}${extraNote ? `\n\nYÊU CẦU BỔ SUNG: ${extraNote}` : ''}
 
 [DỮ LIỆU TRANSCRIPT — DÙNG ĐỂ TẠO TEXT ĐỘNG]
 const SUBTITLES = SUBTITLE_PLACEHOLDER;
 (SUBTITLE_PLACEHOLDER sẽ được inject tự động — KHÔNG thay đổi tên này)
-
-Dùng SUBTITLES để tạo CÁC HÀM TEXT ĐỘNG sau (tự viết, không copy template):
-
-// Helper: tìm câu đang nói ở frame hiện tại
-const cur = SUBTITLES.find(s => frame >= s.start*30 && frame < s.end*30);
-
-Tạo ÍT NHẤT 3 loại text layer khác nhau từ SUBTITLES:
-A) TypewriterSub: câu thoại xuất hiện từng chữ, style horror (glow đỏ, border trái đỏ)
-B) SceneCard: 3–4 địa điểm/thời gian trích từ transcript, slide từ trái góc trên
-C) HighlightWord: 2–3 từ khóa quan trọng nhất, nổi bật với scale animation — ĐẶT position:'absolute', top:'12%' (KHÔNG dùng justifyContent:center/alignItems:center để tránh che MC ở giữa màn hình)
-Bonus: ChapterTitle (tiêu đề chương, đặt top:'8%'), LowerThird (thanh tóm tắt, đặt bottom:'22%' trên subtitle)
-
-${transcriptSegs.length ? `[LỜI THOẠI TRONG VIDEO — Whisper đã phiên âm chính xác]
+⚡ SUB TIMING: s.start*fps trực tiếp, KHÔNG chia/nhân thêm — timestamps đã chuẩn
+${transcriptSegs.length ? `[LỜI THOẠI — Whisper phiên âm]
 ${formatTranscript(transcriptSegs)}
-
-Phân tích SUBTITLES để:
-① Trích TÊN NHÂN VẬT, ĐỊA ĐIỂM, THỜI GIAN → dùng cho ChapterTitle và SceneCard
-② Scan từng s.text tìm từ khóa nhóm máu/tối/sợ/hét/chạy → kích hoạt effect tương ứng tại frame s.start*30
-③ Chọn 2–3 segment có nội dung drama cao nhất → HighlightWord
-④ NHÂN VẬT NÓI GÌ → màn hình thể hiện điều đó: nói "bóng tối" thì tối lại, nói "máu" thì đỏ flash, nói "chạy" thì rung lắc
-⑤ Mỗi text/effect đồng bộ chính xác theo s.start và s.end (nhân 30 để ra frame)
-` : ''}YÊU CẦU MẶC ĐỊNH (luôn thực hiện):
-${defaultInstruction}${extraNote ? `\n\nYÊU CẦU BỔ SUNG: ${extraNote}` : ''}
+` : ''}
+HIỆU ỨNG BỔ SUNG (áp dụng THÊM vào bên trên, không thay thế):
+${selectedList || 'Hiệu ứng horror cơ bản'}${letterboxSection}
 
 [RÀNG BUỘC — KHÔNG THAY ĐỔI]
 COMPOSITION_WIDTH = ${asp.width}
@@ -892,13 +933,18 @@ COMPOSITION_HEIGHT = ${asp.height}
 COMPOSITION_FPS = 30
 COMPOSITION_DURATION_FRAMES = ${frames}
 ${flipMid ? `FLIP_MID = true
-→ Thêm wrapper AbsoluteFill bao quanh <Video> với style={{ transform: frame >= Math.floor(totalFrames/3) && frame < Math.floor(totalFrames*2/3) ? 'scaleX(-1)' : 'none' }}
-   (lật ngang MC ở đoạn giữa 1/3 → 2/3 duration)` : ''}
-⚠️ VỀ TEXT LAYERS: KHÔNG đặt bất kỳ text/overlay nào tại center màn hình (tránh che mặt MC)
-   Text/overlay phải ở: top ≤ 25% HOẶC bottom ≥ 75% (phần thân dưới) HOẶC góc cạnh
-⚠️ CHỈ TRẢ VỀ CODE JSX THUẦN — KHÔNG GIẢI THÍCH, KHÔNG ĐÁNH SỐ, KHÔNG COMMENT THỪA.
-⚠️ COMPACT: gộp các const nhỏ thành 1 dòng, không xuống hàng không cần thiết. Mục tiêu < 220 dòng.
-⚠️ KẾT THÚC BẮT BUỘC bằng dòng: export default GeneratedVideo;
+→ AbsoluteFill bao quanh <Video>: style={{transform: frame>=Math.floor(totalFrames/3)&&frame<Math.floor(totalFrames*2/3)?'scaleX(-1)':'none'}}` : ''}
+⚠️ Text/overlay: top ≤ 25% HOẶC bottom ≥ 75% — KHÔNG che mặt MC ở giữa
+⛔⛔⛔ QUAN TRỌNG NHẤT — VI PHẠM SẼ BỊ TỪ CHỐI ⛔⛔⛔
+TÊN KÊNH DUY NHẤT ĐƯỢC PHÉP: "${channelName}"
+- TUYỆT ĐỐI KHÔNG dùng tên kênh từ transcript (kể cả nghe thấy trong audio)
+- MỌI text "subscribe", "đăng ký", "theo dõi", "kênh X" PHẢI dùng biến channelName hoặc literal "${channelName}"
+- Ví dụ ĐÚNG: \`kênh \${channelName}\` hoặc \`"${channelName}"\`
+- Ví dụ SAI: "Ghiền Mì Gõ", "kênh ABC", bất kỳ tên kênh nào KHÔNG PHẢI "${channelName}"
+⛔⛔⛔ HẾT CẢNH BÁO ⛔⛔⛔
+⚠️ CHỈ TRẢ VỀ CODE JSX THUẦN — không giải thích, không đánh số.
+⚠️ Mục tiêu 280–350 dòng — đủ để implement ĐẦY ĐỦ text animations + keyword reactions + effects.
+⚠️ KẾT THÚC bằng: export default GeneratedVideo;
 Bắt đầu bằng: import { AbsoluteFill, ... } from 'remotion';`;
   };
 
@@ -914,9 +960,13 @@ Bắt đầu bằng: import { AbsoluteFill, ... } from 'remotion';`;
     let part = sanitizeGeneratedCode(extractCode(raw));
 
     // Nếu là completion pass: ghép code gốc + phần đuôi vừa nhận
-    let code = _truncatedCode ? (_truncatedCode + '\n' + part) : part;
+    // fixTruncatedLastLine: xóa dòng cuối bị cắt giữa string literal (vd: "text bị cắt\ngiữa")
+    const cleanedTrunc = _truncatedCode ? fixTruncatedLastLine(_truncatedCode) : null;
+    let code = cleanedTrunc ? (cleanedTrunc + '\n' + part) : part;
     if (_truncatedCode) {
-      addLog(`✅ Ghép code: ${_truncatedCode.split('\n').length} dòng + ${part.split('\n').length} dòng (key #${(_keyOffset % keys.length) + 1})`);
+      const stripped = _truncatedCode.split('\n').length - (cleanedTrunc?.split('\n').length ?? 0);
+      const note = stripped > 0 ? ` (đã bỏ ${stripped} dòng partial)` : '';
+      addLog(`✅ Ghép code: ${cleanedTrunc.split('\n').length} dòng + ${part.split('\n').length} dòng (key #${(_keyOffset % keys.length) + 1})${note}`);
     }
 
     // Nếu code vẫn bị cắt → completion pass với key TIẾP THEO
@@ -928,17 +978,18 @@ Bắt đầu bằng: import { AbsoluteFill, ... } from 'remotion';`;
       } else {
         const keyLabel = keys.length > 1 ? ` (xoay sang key #${(nextOffset % keys.length) + 1})` : '';
         addLog(`⚠ Code bị cắt (${code.split('\n').length} dòng) — tiếp tục${keyLabel}...`);
-        const completionPrompt = `Code Remotion JSX bị cắt ngang. Trả về PHẦN CÒN THIẾU:
+        const completionPrompt = `Code Remotion JSX bị cắt ngang (có thể bị cắt GIỮA MỘT DÒNG). Trả về PHẦN CÒN THIẾU:
 
 \`\`\`jsx
 ${code.split('\n').slice(-15).join('\n')}
 \`\`\`
-(15 dòng cuối để biết context — ĐỪNG lặp lại phần này)
+(15 dòng cuối để biết context — ĐỪNG lặp lại)
 
 Yêu cầu:
+- Nếu dòng cuối cùng trong context bị cắt giữa string/template literal → bắt đầu lại dòng đó từ đầu
 - Đóng đủ JSX tags còn mở, đóng return(), đóng function
 - Dòng cuối: export default GeneratedVideo;
-- CHỈ code phần còn thiếu, KHÔNG giải thích`;
+- CHỈ code phần còn thiếu, KHÔNG giải thích, KHÔNG markdown`;
         return generateCode(completionPrompt, [], aiMsgId, code, nextOffset);
       }
     }
@@ -951,11 +1002,16 @@ Yêu cầu:
   };
 
   // ── Render one segment ────────────────────────────────────────────────────
-  const renderSegment = async (code, segIndex, durationSec, subtitles = []) => {
+  // fileLabel: tên prefix tùy chỉnh (vd "horror_P01") — nếu null dùng "horror_seg{segIndex}"
+  const renderSegment = async (code, segIndex, durationSec, subtitles = [], fileLabel = null) => {
     if (!code || code.trimStart().startsWith('```')) return { ok: false, error: 'Gemini trả về markdown thô — extractCode thất bại' };
+    // Auto-inject Remotion import nếu Gemini quên (thường xảy ra khi completion pass ghép code)
+    if (!code.includes("from 'remotion'") && !code.includes('from "remotion"')) {
+      code = `import { AbsoluteFill, Video, useCurrentFrame, useVideoConfig, interpolate, staticFile } from 'remotion';\n` + code;
+    }
     // Accept cả function declaration và arrow function
     const hasFunction = code.includes('function') || /const\s+\w+\s*=\s*(async\s*)?\(/.test(code) || code.includes('=>');
-    if (!code.includes('import') || !hasFunction) return { ok: false, error: 'Gemini trả về văn bản thay vì code — thử gửi lại' };
+    if (!hasFunction) return { ok: false, error: 'Gemini trả về văn bản thay vì code — không có function component' };
     if (!isCodeComplete(code)) return { ok: false, error: `Code JSX bị cắt (${code.split('\n').length} dòng) — Gemini chưa hoàn thành` };
     // Bắt buộc phải có <Video> (staticFile) — thiếu là màn hình đen, không âm thanh
     if (!code.includes('staticFile') && !code.includes('<Video')) return { ok: false, error: 'Code thiếu <Video> component — màn hình sẽ đen. Gemini quên video nguồn.' };
@@ -964,10 +1020,12 @@ Yêu cầu:
     const speedRate = rateMatch ? parseFloat(rateMatch[1]) : 1;
     const patchedCode = patchCodeSubtitles(patchCodeVideoSafe(patchCodeDuration(code, durationSec), durationSec), subtitles, speedRate);
     const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const prefix = fileLabel || `horror_seg${segIndex}`;
     return window.electronAPI?.remotionRenderCode?.({
       code: patchedCode,
-      outputFilename: `horror_seg${segIndex}_${ts}.mp4`,
+      outputFilename: `${prefix}_${ts}.mp4`,
       outputDir: outputDir || undefined,
+      durationInFrames: Math.round(durationSec * 30),
     });
   };
 
@@ -1104,11 +1162,14 @@ Yêu cầu:
     const outCanvas    = document.createElement('canvas');
     const personCanvas = document.createElement('canvas');
     const maskCanvas   = document.createElement('canvas');
-    outCanvas.width = personCanvas.width = maskCanvas.width = width;
-    outCanvas.height = personCanvas.height = maskCanvas.height = height;
+    const prevMaskCanvas = document.createElement('canvas'); // temporal smoothing
+    outCanvas.width = personCanvas.width = maskCanvas.width = prevMaskCanvas.width = width;
+    outCanvas.height = personCanvas.height = maskCanvas.height = prevMaskCanvas.height = height;
     const outCtx    = outCanvas.getContext('2d');
     const personCtx = personCanvas.getContext('2d');
     const maskCtx   = maskCanvas.getContext('2d');
+    const prevMaskCtx = prevMaskCanvas.getContext('2d');
+    let hasPrevMask = false;
 
     let segMask = null;
     seg.onResults(r => { segMask = r.segmentationMask; });
@@ -1150,6 +1211,20 @@ Yêu cầu:
         if (bgEdgeSoftness > 0) maskCtx.filter = `blur(${bgEdgeSoftness}px)`;
         maskCtx.drawImage(segMask, 0, 0, width, height);
         maskCtx.filter = 'none';
+        // Temporal smoothing: EMA blend alpha channel để giảm jitter biên mặt/người
+        if (hasPrevMask) {
+          const ema = 0.6; // current weight 60%, prev 40%
+          const currPx = maskCtx.getImageData(0, 0, width, height);
+          const prevPx = prevMaskCtx.getImageData(0, 0, width, height);
+          for (let p = 3; p < currPx.data.length; p += 4) {
+            currPx.data[p] = (ema * currPx.data[p] + (1 - ema) * prevPx.data[p]) | 0;
+          }
+          maskCtx.putImageData(currPx, 0, 0);
+        }
+        // Lưu mask đã blend cho frame kế tiếp
+        prevMaskCtx.clearRect(0, 0, width, height);
+        prevMaskCtx.drawImage(maskCanvas, 0, 0);
+        hasPrevMask = true;
         // Person = frame nguồn cắt theo mask
         personCtx.clearRect(0, 0, width, height);
         personCtx.drawImage(frameImg, 0, 0);
@@ -1161,7 +1236,7 @@ Yêu cầu:
         outCtx.drawImage(frameImg, 0, 0);
       }
 
-      const dataUrl = outCanvas.toDataURL('image/jpeg', 0.93);
+      const dataUrl = outCanvas.toDataURL('image/png');
       await window.electronAPI?.horrorBgSaveFrame?.({ outDir, frameIndex: i, dataUrl });
 
       if (i % 60 === 0 || i === count) {
@@ -1180,6 +1255,285 @@ Yêu cầu:
     if (!reassembleRes?.ok) { addLog(`⚠ Ghép thất bại: ${reassembleRes?.error}`); return videoPath; }
     addLog('✅ Thay nền xong!');
     return outPath;
+  };
+
+  // ── Né Content ID nhanh: hue shift + noise qua ffmpeg ────────────────────
+  const applyFastCidFilter = async (videoPath, label = '') => {
+    if (!fastCidMode) return videoPath;
+    const outPath = videoPath.replace(/\.mp4$/i, '_cid.mp4');
+    addLog(`⚡ ${label ? label + ': ' : ''}Né Content ID nhanh...`);
+    const res = await window.electronAPI?.horrorFfmpegFilter?.({ filePath: videoPath, outputPath: outPath });
+    if (!res?.ok) { addLog(`⚠ ffmpeg filter thất bại: ${res?.error} — dùng video gốc`); return videoPath; }
+    addLog(`✅ ${label ? label + ': ' : ''}CID filter xong`);
+    return res.path;
+  };
+
+  // ── Auto-segment: cắt → xử lý từng đoạn → concat ────────────────────────
+  // batchOverride = { path, name, durationSec } — dùng khi gọi từ batch loop
+  const handleAutoSegmentRun = async (batchOverride = null) => {
+    if (!batchOverride && (!srcVideo || isBusy)) return;
+    const keys = loadKeys();
+    if (!keys.length) { alert('Chưa có Gemini API key. Vào Cài đặt để thêm.'); return; }
+    if (!batchOverride) abortRef.current = false;
+
+    setMessages([]); setGeneratedCode(''); setPhase('generating');
+    setStreamBuffer(''); setLogs([]); setLogOpen(true);
+    setFinalPath(null); setActiveSegIdx(null); setChatVideoPath(null);
+
+    let srcPath = batchOverride?.path || srcVideo.path;
+    let totalSec = batchOverride?.durationSec || srcVideo?.durationSec || 60;
+    const _srcName = batchOverride?.name || srcVideo?.name || srcPath.split(/[\\/]/).pop();
+
+    // Pre-trim
+    if (trimStartSec > 0 || trimEndSec > 0) {
+      const effDur = Math.max(1, totalSec - trimStartSec - trimEndSec);
+      addLog(`✂️ Pre-trim: bỏ ${trimStartSec}s đầu + ${trimEndSec}s cuối → còn ${effDur.toFixed(1)}s`);
+      setRenderStatus({ seg: 0, total: 0, pct: 0, step: 'Pre-trim...' });
+      const ptRes = await window.electronAPI?.horrorPreTrim?.({ inputPath: srcPath, startSec: trimStartSec, durationSec: effDur });
+      if (ptRes?.ok) { srcPath = ptRes.path; totalSec = effDur; addLog('✅ Pre-trim xong'); }
+      else addLog(`⚠ Pre-trim thất bại: ${ptRes?.error} — dùng video gốc`);
+    }
+
+    // Pre-crop
+    if (orientation === 'square') {
+      addLog(`✂️ Pre-crop: cắt video về 1:1...`);
+      setRenderStatus({ seg: 0, total: 0, pct: 0, step: 'Pre-crop 1:1...' });
+      const pcRes = await window.electronAPI?.horrorPreCrop?.({ inputPath: srcPath, outputAspect: 'square', cropX });
+      if (pcRes?.ok) { srcPath = pcRes.path; addLog(`✅ Pre-crop xong`); }
+      else addLog(`❌ Pre-crop thất bại: ${pcRes?.error || 'không rõ'} — dùng video gốc`);
+    }
+
+    // Split video
+    const segSecs = segMins * 60;
+    addLog(`✂️ Cắt video thành đoạn ${segMins} phút...`);
+    setRenderStatus({ seg: 0, total: 0, pct: 0, step: 'Cắt video...' });
+    const splitRes = await window.electronAPI?.horrorSplitVideo?.({ filePath: srcPath, segmentSecs: segSecs, outputDir: outputDir || undefined });
+    if (!splitRes?.ok) {
+      addLog(`❌ Không thể cắt video: ${splitRes?.error}`);
+      setPhase('error');
+      return;
+    }
+
+    const splitSegs = splitRes.segments;
+    addLog(`✅ Đã cắt thành ${splitSegs.length} đoạn`);
+    setRenderStatus({ seg: 0, total: splitSegs.length, pct: 0, step: 'Chuẩn bị...' });
+
+    // Init segment display
+    const segDurSecs = splitSegs.map((_, i) => Math.min(segSecs, totalSec - i * segSecs));
+    const segList = splitSegs.map((s, i) => ({
+      id: i, startSec: i * segSecs, endSec: Math.min((i + 1) * segSecs, totalSec),
+      durationSec: segDurSecs[i], status: 'pending', videoPath: null, trimPath: s.path, subtitles: [],
+    }));
+    setSegments(segList);
+
+    const userMsgId = Date.now();
+    const aiMsgId = userMsgId + 1;
+    const effectNames = [...effects].map(id => HORROR_PRESETS.find(p => p.id === id)?.label || id).join(', ');
+    setMessages([
+      { id: userMsgId, role: 'user', content: `🎬 Auto-segment ${splitSegs.length} đoạn × ${segMins} phút | ${effects.size} effects: ${effectNames}` },
+      { id: aiMsgId,   role: 'ai',   content: '', phase: 'generating' },
+    ]);
+    localStorage.setItem(LS_MODEL, model);
+
+    const renderedPaths = [];
+    const _bgActive = bgReplaceEnabled && (bgType === 'video' ? !!bgVideoPath : !!bgImagePath);
+    const totalParts = splitSegs.length;
+    const pad = totalParts >= 10 ? 2 : 1;
+    const srcBaseName = (_srcName || srcPath.split(/[\\/]/).pop() || 'horror').replace(/\.[^.]+$/, '');
+
+    for (let i = 0; i < splitSegs.length; i++) {
+      if (abortRef.current) { addLog('⛔ Đã huỷ'); break; }
+
+      const seg = splitSegs[i];
+      const segDur = segDurSecs[i];
+      const partLabel = `P${String(i + 1).padStart(pad, '0')}`;
+      addLog(`\n▶ Đoạn ${i + 1}/${splitSegs.length} — ${partLabel} (${fmtSec(segDur)})`);
+      setRenderStatus({ seg: i + 1, total: splitSegs.length, pct: 0, step: 'Chuẩn bị...' });
+      setSegments(prev => prev.map((s, idx) => idx === i ? { ...s, status: 'transcribing' } : s));
+
+      // Transcribe + BG Replace chạy song song
+      let subs = [];
+      let videoPathForRender = seg.path;
+      const doSegTranscribe = async () => {
+        addLog(`🎤 ${partLabel}: Whisper phân tích âm thanh...`);
+        setRenderStatus(s => ({ ...s, step: 'Whisper...' }));
+        try {
+          const tr = await doTranscribe(
+            seg.path, segDur,
+            (msg) => addLog(`  📢 ${msg}`),
+            (done, total, count) => { if (total > 1) addLog(`  🔤 Chunk ${done}/${total}: ${count} câu`); },
+            (msg) => addLog(msg),
+            (msg) => addLog(`  📦 ${msg}`),
+          );
+          return tr?.segments || [];
+        } catch (e) { addLog(`⚠ Whisper thất bại: ${e.message}`); return []; }
+      };
+      const doSegReplaceBg = async () => {
+        let vp = seg.path;
+        // Bước 1: ffmpeg filter nhanh (nếu bật)
+        if (fastCidMode) vp = await applyFastCidFilter(vp, partLabel);
+        // Bước 2: MediaPipe BG replace (nếu bật)
+        if (_bgActive) {
+          addLog(`🎭 ${partLabel}: Thay nền AI...`);
+          try { vp = await replaceBg(vp); }
+          catch (e) { addLog(`⚠ Thay nền thất bại: ${e.message} — dùng video trước`); }
+        }
+        return vp;
+      };
+      const activeSteps = [fastCidMode && 'CID filter', _bgActive && 'Thay nền', 'Whisper'].filter(Boolean).join(' + ');
+      addLog(`⚡ Song song: ${activeSteps}...`);
+      [subs, videoPathForRender] = await Promise.all([doSegTranscribe(), doSegReplaceBg()]);
+      addLog(`✅ Transcribe: ${subs.length} câu${_bgActive ? ' | Thay nền: xong' : ''}${fastCidMode ? ' | CID: xong' : ''}`);
+
+      // Copy (BG-replaced hoặc gốc) → public/input.mp4
+      await window.electronAPI?.remotionCopyVideoToPublic?.({ srcPath: videoPathForRender });
+
+      if (abortRef.current) { addLog('⛔ Đã huỷ'); break; }
+
+      // Gemini + Render — auto-retry 1 lần nếu lỗi (giữ subs, chỉ re-generate code)
+      const MAX_SEG_RETRIES = 1;
+      let segSucceeded = false;
+
+      for (let attempt = 0; attempt <= MAX_SEG_RETRIES && !segSucceeded; attempt++) {
+        if (attempt > 0) {
+          addLog(`🔄 Thử lại đoạn ${i + 1} (lần ${attempt + 1})...`);
+          setRenderStatus(s => ({ ...s, step: `Retry ${attempt}...` }));
+          // Nhỏ delay để Gemini rate limit hạ xuống
+          await new Promise(r => setTimeout(r, 3000));
+        }
+
+        if (abortRef.current) break;
+
+        setRenderStatus(s => ({ ...s, step: 'Gemini AI' }));
+        setSegments(prev => prev.map((s, idx) => idx === i ? { ...s, status: 'generating' } : s));
+        addLog(`🤖 Đoạn ${i + 1}: Gemini viết code${attempt > 0 ? ` (thử lại)` : ''}...`);
+        let code;
+        try {
+          code = patchChannelName(await generateCode(buildHorrorPrompt(segDur, '', subs), [], aiMsgId), channelName);
+          addLog(`✅ Code xong (${code.split('\n').length} dòng)`);
+        } catch (e) {
+          addLog(`⚠ Gemini thất bại: ${e.message}`);
+          if (attempt >= MAX_SEG_RETRIES) {
+            addLog(`❌ Đoạn ${i + 1}: bỏ qua sau ${MAX_SEG_RETRIES + 1} lần thử`);
+            setSegments(prev => prev.map((s, idx) => idx === i ? { ...s, status: 'error' } : s));
+          }
+          continue;
+        }
+
+        if (abortRef.current) break;
+
+        setRenderStatus(s => ({ ...s, step: 'Remotion render' }));
+        setSegments(prev => prev.map((s, idx) => idx === i ? { ...s, status: 'rendering' } : s));
+        addLog(`🎞️ ${partLabel}: Render${attempt > 0 ? ` (thử lại)` : ''}...`);
+        setPhase('rendering');
+        const result = await renderSegment(code, i, segDur, subs, `${srcBaseName}_${partLabel}`);
+
+        if (result?.ok) {
+          const renderPath = result.path; // file render gốc (trước pitch shift)
+          let finalSegPath = renderPath;
+          if (pitchShiftOn) {
+            addLog(`🎵 Pitch shift ${partLabel}...`);
+            const psRes = await window.electronAPI?.horrorPitchShift?.({ inputPath: finalSegPath });
+            if (psRes?.ok) {
+              // Xóa file render gốc — giữ lại bản pitch-shifted
+              window.electronAPI?.horrorDeleteFile?.({ filePath: renderPath }).catch(() => {});
+              finalSegPath = psRes.path;
+              addLog('✅ Pitch shift xong');
+            } else addLog(`⚠ Pitch shift lỗi: ${psRes?.error}`);
+          }
+          renderedPaths.push(finalSegPath);
+          setSegments(prev => prev.map((s, idx) => idx === i ? { ...s, status: 'done', videoPath: finalSegPath, subtitles: subs } : s));
+          addLog(`✅ ${partLabel} xong → ${finalSegPath}`);
+
+          // Xóa BG-replaced temp + split temp; cache remotion thường đã tự dọn
+          if (videoPathForRender !== seg.path) window.electronAPI?.horrorDeleteFile?.({ filePath: videoPathForRender }).catch(() => {});
+          window.electronAPI?.horrorDeleteFile?.({ filePath: seg.path }).catch(() => {});
+          segSucceeded = true;
+        } else {
+          addLog(`⚠ Render lần ${attempt + 1} thất bại: ${result?.error || '?'}`);
+          if (attempt >= MAX_SEG_RETRIES) {
+            addLog(`❌ ${partLabel}: bỏ qua sau ${MAX_SEG_RETRIES + 1} lần thử`);
+            setSegments(prev => prev.map((s, idx) => idx === i ? { ...s, status: 'error' } : s));
+          }
+        }
+      }
+    }
+
+    if (renderedPaths.length === 0) {
+      addLog('❌ Không có đoạn nào render thành công');
+      setPhase('error');
+      setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, phase: 'error' } : m));
+      return;
+    }
+
+    if (renderedPaths.length === 1) {
+      setFinalPath(renderedPaths[0]);
+      setActiveSegIdx(0);
+      setPhase('done');
+      setRenderStatus({ seg: 0, total: 0, pct: 0, step: '' });
+      setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, phase: 'done' } : m));
+      addLog(`\n✅ Hoàn thành! → ${renderedPaths[0]}`);
+      return;
+    }
+
+    // Xóa các split temp file còn lại (đoạn thất bại chưa bị xóa)
+    for (const s of splitSegs) {
+      window.electronAPI?.horrorDeleteFile?.({ filePath: s.path }).catch(() => {});
+    }
+
+    // Concat tất cả đoạn
+    addLog(`\n🔗 Ghép ${renderedPaths.length} đoạn thành 1 file...`);
+    setRenderStatus({ seg: renderedPaths.length, total: renderedPaths.length, pct: 100, step: 'Ghép video...' });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const outBase = outputDir || '';
+    const concatOutputPath = outBase
+      ? `${outBase}\\${srcBaseName}_final_${ts}.mp4`
+      : `${srcBaseName}_final_${ts}.mp4`;
+    const concatRes = await window.electronAPI?.horrorConcatSegments?.({ segmentPaths: renderedPaths, outputPath: concatOutputPath });
+
+    if (concatRes?.ok) {
+      setFinalPath(concatRes.path);
+      setActiveSegIdx(null);
+      addLog(`✅ Ghép xong → ${concatRes.path}`);
+      // Xóa các đoạn riêng lẻ — await để đảm bảo xóa thật sự trước khi báo xong
+      const delResults = await Promise.all(
+        renderedPaths.map(p => window.electronAPI?.horrorDeleteFile?.({ filePath: p }).catch(() => ({ ok: false })))
+      );
+      const delOk = delResults.filter(r => r?.ok).length;
+      addLog(`🧹 Đã xóa ${delOk}/${renderedPaths.length} đoạn tạm — chỉ giữ file final`);
+    } else {
+      addLog(`⚠ Ghép thất bại: ${concatRes?.error || '?'} — các đoạn riêng lẻ vẫn còn`);
+    }
+
+    setPhase('done');
+    setRenderStatus({ seg: 0, total: 0, pct: 0, step: '' });
+    setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, phase: 'done' } : m));
+    addLog('\n✅ Hoàn thành!');
+  };
+
+  // ── Batch: xử lý nhiều video tuần tự với cùng settings ─────────────────────
+  const handleBatchRun = async () => {
+    if (isBusy || !batchFiles.length) return;
+    if (!effects.size) { alert('Chưa chọn effect nào. Chọn ít nhất 1 effect trước khi batch.'); return; }
+    const keys = loadKeys();
+    if (!keys.length) { alert('Chưa có Gemini API key.'); return; }
+    abortRef.current = false;
+
+    for (let i = 0; i < batchFiles.length; i++) {
+      if (abortRef.current) break;
+      const f = batchFiles[i];
+      if (f.status === 'done') continue; // bỏ qua đã xong
+      setBatchFiles(prev => prev.map((x, idx) => idx === i ? { ...x, status: 'processing' } : x));
+      addLog(`\n\n══════════ Batch ${i + 1}/${batchFiles.length}: ${f.name} ══════════`);
+      try {
+        await handleAutoSegmentRun({ path: f.path, name: f.name, durationSec: f.durationSec });
+        setBatchFiles(prev => prev.map((x, idx) => idx === i ? { ...x, status: 'done' } : x));
+      } catch (e) {
+        setBatchFiles(prev => prev.map((x, idx) => idx === i ? { ...x, status: 'error', error: e.message } : x));
+        addLog(`❌ Batch ${i + 1} lỗi: ${e.message}`);
+      }
+    }
+    addLog('\n✅ Batch hoàn tất!');
   };
 
   // ── Apply effects (handles single + multi-segment) ────────────────────────
@@ -1236,14 +1590,23 @@ Yêu cầu:
     setRenderStatus({ seg: 1, total: 1, pct: 0, step: 'Chuẩn bị...' });
     addLog(`\n▶ Xử lý video: ${fmtSec(totalSec)}`);
 
-    // 1. BG Replace + Transcribe + Gemini — tất cả song song
+    // 1. BG Replace + CID Filter + Transcribe + Gemini — tất cả song song
     const doReplaceBg = async () => {
+      let vp = srcPath;
+      // Bước 1: ffmpeg filter nhanh (nếu bật)
+      if (fastCidMode) {
+        setRenderStatus(s => ({ ...s, pct: 0, step: 'CID filter' }));
+        vp = await applyFastCidFilter(vp);
+      }
+      // Bước 2: MediaPipe BG replace (nếu bật)
       const _hasBg = bgType === 'video' ? !!bgVideoPath : !!bgImagePath;
-      if (!bgReplaceEnabled || !_hasBg) return srcPath;
-      setRenderStatus(s => ({ ...s, pct: 0, step: 'Thay nền' }));
-      addLog('🎭 Thay nền AI...');
-      try { return await replaceBg(srcPath); }
-      catch (e) { addLog(`⚠ Thay nền lỗi: ${e.message} — dùng video gốc`); return srcPath; }
+      if (bgReplaceEnabled && _hasBg) {
+        setRenderStatus(s => ({ ...s, pct: 0, step: 'Thay nền' }));
+        addLog('🎭 Thay nền AI...');
+        try { vp = await replaceBg(vp); }
+        catch (e) { addLog(`⚠ Thay nền lỗi: ${e.message} — dùng video trước`); }
+      }
+      return vp;
     };
 
     const doTranscribeAndCode = async () => {
@@ -1267,7 +1630,7 @@ Yêu cầu:
       setSegments(prev => prev.map((s, idx) => idx === 0 ? { ...s, status: 'generating' } : s));
       addLog('🤖 Gemini viết code horror (song song với thay nền)...');
       try {
-        const code = await generateCode(buildHorrorPrompt(totalSec, '', subs), [], aiMsgId);
+        const code = patchChannelName(await generateCode(buildHorrorPrompt(totalSec, '', subs), [], aiMsgId), channelName);
         addLog(`✅ Code xong (${code.split('\n').length} dòng)`);
         return { subs, code };
       } catch (e) {
@@ -1417,7 +1780,7 @@ Yêu cầu:
       : buildHorrorPrompt(durationSec, combinedRequest, chatSubtitles);
 
     try {
-      const code = await generateCode(finalPrompt, [], aiMsgId);
+      const code = patchChannelName(await generateCode(finalPrompt, [], aiMsgId), channelName);
       setPhase('rendering');
       const segIdx = activeSegIdx ?? 0;
       const result = await renderSegment(code, segIdx, durationSec, chatSubtitles);
@@ -1650,12 +2013,12 @@ Yêu cầu:
               <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
                 <Wand2 className="w-3 h-3 text-amber-400" /> Lệnh mặc định Gemini
               </label>
-              <button onClick={() => { setDefaultInstruction(DEFAULT_INSTRUCTION); localStorage.setItem(LS_DEFAULT_INSTR, DEFAULT_INSTRUCTION); }}
+              <button onClick={() => { setDefaultInstruction(DEFAULT_INSTRUCTION); localStorage.setItem(LS_DEFAULT_INSTR, DEFAULT_INSTRUCTION); localStorage.setItem(LS_DEFAULT_INSTR_VER, DEFAULT_INSTR_VERSION); }}
                 className="text-[9px] text-slate-600 hover:text-amber-400 transition-colors">Reset</button>
             </div>
             <textarea
               value={defaultInstruction}
-              onChange={e => { setDefaultInstruction(e.target.value); localStorage.setItem(LS_DEFAULT_INSTR, e.target.value); }}
+              onChange={e => { setDefaultInstruction(e.target.value); localStorage.setItem(LS_DEFAULT_INSTR, e.target.value); localStorage.setItem(LS_DEFAULT_INSTR_VER, DEFAULT_INSTR_VERSION); }}
               rows={3}
               placeholder="Lệnh luôn gửi kèm Gemini mỗi lần tạo code..."
               className="w-full bg-[#131d30] border border-amber-900/40 text-slate-200 text-[11px] rounded-lg px-3 py-2 focus:outline-none focus:border-amber-500 resize-none custom-scrollbar placeholder-slate-600"
@@ -1706,6 +2069,16 @@ Yêu cầu:
                 <span>🎵 Pitch shift lách Content ID</span>
                 <div className={`w-7 h-3.5 rounded-full relative transition-all ${pitchShiftOn ? 'bg-emerald-600' : 'bg-slate-700'}`}>
                   <div className={`absolute top-0.5 w-2.5 h-2.5 rounded-full bg-white transition-all ${pitchShiftOn ? 'left-3.5' : 'left-0.5'}`} />
+                </div>
+              </button>
+              <button onClick={() => setFastCidMode(v => !v)}
+                className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg border transition-all text-[10px] font-medium ${fastCidMode ? 'border-amber-600/60 bg-amber-900/20 text-amber-300' : 'border-slate-700 bg-[#131d30] text-slate-500'}`}>
+                <div className="flex flex-col items-start gap-0.5">
+                  <span>⚡ Né Content ID nhanh (ffmpeg)</span>
+                  {fastCidMode && <span className="text-[8px] text-amber-500/80">Hue shift + noise — vài giây/đoạn thay vì 30 phút</span>}
+                </div>
+                <div className={`w-7 h-3.5 rounded-full relative transition-all shrink-0 ${fastCidMode ? 'bg-amber-600' : 'bg-slate-700'}`}>
+                  <div className={`absolute top-0.5 w-2.5 h-2.5 rounded-full bg-white transition-all ${fastCidMode ? 'left-3.5' : 'left-0.5'}`} />
                 </div>
               </button>
             </div>
@@ -1798,12 +2171,97 @@ Yêu cầu:
             </div>
           </div>
 
+          {/* Auto-segment toggle */}
+          <div className="border border-slate-700 rounded-xl p-2.5 space-y-2 bg-slate-900/40">
+            <div className="flex items-center justify-between">
+              <label className="flex items-center gap-2 cursor-pointer select-none" onClick={() => setAutoSegEnabled(v => !v)}>
+                <div className={`w-8 h-4 rounded-full transition-colors relative ${autoSegEnabled ? 'bg-rose-600' : 'bg-slate-700'}`}>
+                  <div className={`absolute top-0.5 w-3 h-3 rounded-full bg-white shadow transition-transform ${autoSegEnabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                </div>
+                <span className="text-[11px] font-bold text-slate-300">✂️ Cắt đoạn tự động</span>
+              </label>
+              {autoSegEnabled && (
+                <div className="flex gap-1">
+                  {[5, 10, 15].map(m => (
+                    <button key={m} onClick={() => setSegMins(m)}
+                      className={`px-2 py-0.5 rounded text-[10px] font-bold border transition-all ${segMins === m ? 'bg-rose-700 border-rose-500 text-white' : 'bg-slate-800 border-slate-600 text-slate-400 hover:border-rose-700/50'}`}>
+                      {m}ph
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            {autoSegEnabled && (
+              <p className="text-[9px] text-slate-500 leading-tight">Cắt video thành đoạn {segMins} phút → xử lý tuần tự → ghép 1 file cuối. Cache xóa sau mỗi đoạn.</p>
+            )}
+          </div>
+
+          {/* Batch mode */}
+          <div className={`border rounded-xl overflow-hidden ${batchMode ? 'border-indigo-700/60' : 'border-slate-800'}`}>
+            <button onClick={() => setBatchMode(v => !v)}
+              className={`w-full flex items-center gap-2 px-3 py-2.5 text-left transition-all ${batchMode ? 'bg-indigo-900/25' : 'bg-[#0e1628] hover:bg-slate-800/50'}`}>
+              <span className={`text-[11px] font-bold flex-1 ${batchMode ? 'text-indigo-200' : 'text-slate-400'}`}>📦 Làm hàng loạt (Batch)</span>
+              {batchMode && <span className="text-[9px] text-indigo-400 mr-1">{batchFiles.length} video</span>}
+              <div className={`w-8 h-4 rounded-full transition-all relative shrink-0 ${batchMode ? 'bg-indigo-600' : 'bg-slate-700'}`}>
+                <div className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${batchMode ? 'left-4' : 'left-0.5'}`} />
+              </div>
+            </button>
+            {batchMode && (
+              <div className="px-3 pb-3 pt-2 bg-indigo-950/15 space-y-2">
+                <p className="text-[9px] text-slate-500 leading-tight">Thêm nhiều video → xử lý tuần tự với cùng settings. Cần bật "Cắt đoạn tự động" ở trên.</p>
+                <button onClick={async () => {
+                  const files = await window.electronAPI?.remotionSelectSourceVideos?.();
+                  if (!files?.length) return;
+                  setBatchFiles(prev => {
+                    const existing = new Set(prev.map(f => f.path));
+                    const newFiles = files.filter(f => !existing.has(f.path)).map(f => ({ ...f, status: 'pending', error: '' }));
+                    return [...prev, ...newFiles];
+                  });
+                }} className="w-full py-2 border border-dashed border-indigo-600/50 rounded-lg text-[10px] text-indigo-400 hover:bg-indigo-900/20 flex items-center justify-center gap-1.5 transition-all">
+                  + Thêm video vào hàng đợi
+                </button>
+                {batchFiles.length > 0 && (
+                  <div className="space-y-1 max-h-36 overflow-y-auto pr-0.5">
+                    {batchFiles.map((f, i) => (
+                      <div key={f.path} className="flex items-center gap-1.5 bg-slate-900/60 rounded-lg px-2 py-1.5">
+                        <span className={`text-[9px] font-bold shrink-0 px-1 py-0.5 rounded ${
+                          f.status === 'done' ? 'bg-emerald-900 text-emerald-300' :
+                          f.status === 'processing' ? 'bg-indigo-900 text-indigo-300' :
+                          f.status === 'error' ? 'bg-red-900 text-red-300' :
+                          'bg-slate-800 text-slate-500'
+                        }`}>
+                          {f.status === 'done' ? '✓' : f.status === 'processing' ? '⏳' : f.status === 'error' ? '✕' : `${i+1}`}
+                        </span>
+                        <span className="flex-1 text-[9px] text-slate-400 truncate" title={f.path}>{f.name}</span>
+                        <span className="text-[8px] text-slate-600 shrink-0">{f.durationSec ? fmtSec(f.durationSec) : ''}</span>
+                        {!isBusy && (
+                          <button onClick={() => setBatchFiles(prev => prev.filter((_, idx) => idx !== i))}
+                            className="w-3.5 h-3.5 text-slate-600 hover:text-red-400 shrink-0 flex items-center justify-center text-[9px]">✕</button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {batchFiles.length > 0 && !isBusy && (
+                  <button onClick={() => setBatchFiles(prev => prev.map(f => ({ ...f, status: 'pending', error: '' })))}
+                    className="text-[9px] text-slate-500 hover:text-slate-400 underline">Reset trạng thái</button>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Apply */}
-          <button onClick={handleApplyEffects} disabled={!srcVideo || isBusy || effects.size === 0}
+          <button
+            onClick={batchMode ? handleBatchRun : autoSegEnabled ? handleAutoSegmentRun : handleApplyEffects}
+            disabled={batchMode ? (isBusy || !batchFiles.length || effects.size === 0 || !autoSegEnabled) : (!srcVideo || isBusy || effects.size === 0)}
             className="w-full flex items-center justify-center gap-2 py-3 rounded-xl font-black text-[13px] disabled:opacity-40 disabled:cursor-not-allowed text-white bg-gradient-to-r from-rose-700 to-red-600 hover:from-rose-600 hover:to-red-500 transition-all shadow-lg">
             {isBusy
               ? <><Loader2 className="w-4 h-4 animate-spin" />{phase === 'generating' ? ' Gemini viết code...' : ' Đang render...'}</>
-              : <><Sparkles className="w-4 h-4" /> Apply {effects.size} Effects + Render</>}
+              : batchMode
+                ? <><Sparkles className="w-4 h-4" /> Batch {batchFiles.filter(f=>f.status!=='done').length} video × {segMins}ph</>
+                : autoSegEnabled
+                  ? <><Sparkles className="w-4 h-4" /> Auto-segment {segMins}ph × Apply {effects.size} Effects</>
+                  : <><Sparkles className="w-4 h-4" /> Apply {effects.size} Effects + Render</>}
           </button>
 
           {isBusy && (

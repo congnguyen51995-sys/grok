@@ -15,6 +15,34 @@ function getFFmpeg() {
   try { return require('ffmpeg-static'); } catch { return 'ffmpeg'; }
 }
 
+// Phát hiện thời điểm speech thực sự bắt đầu trong N giây đầu file
+// Dùng làm fallback khi word-level timestamps trả về speechStart ≈ 0
+function detectSpeechOnset(filePath, probeSec = 15) {
+  return new Promise((resolve) => {
+    const ffmpeg = getFFmpeg();
+    const args = [
+      '-ss', '0', '-t', String(probeSec),
+      '-i', filePath,
+      '-af', 'silencedetect=noise=-35dB:duration=0.3',
+      '-f', 'null', '-',
+    ];
+    const proc = spawn(ffmpeg, args);
+    let out = '';
+    proc.stderr.on('data', d => { out += d.toString(); });
+    proc.on('close', () => {
+      // Tìm silence_end (lúc im lặng kết thúc = lúc có tiếng)
+      const matches = [...out.matchAll(/silence_end:\s*([\d.]+)/g)];
+      if (matches.length > 0) {
+        const firstSpeechSec = parseFloat(matches[0][1]);
+        resolve(Math.max(0, firstSpeechSec - 0.1)); // trừ 100ms buffer
+      } else {
+        resolve(0); // không phát hiện im lặng → có tiếng ngay từ đầu
+      }
+    });
+    proc.on('error', () => resolve(0));
+  });
+}
+
 function extractWavChunk(filePath, startSec, durationSec) {
   return new Promise((resolve, reject) => {
     const tmpFile = path.join(os.tmpdir(), `groq_asr_${Date.now()}.wav`);
@@ -38,9 +66,12 @@ function extractWavChunk(filePath, startSec, durationSec) {
 function buildMultipart(boundary, fields, fileEntry) {
   const parts = [];
   for (const [name, value] of Object.entries(fields)) {
-    parts.push(Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`
-    ));
+    const values = Array.isArray(value) ? value : [value];
+    for (const v of values) {
+      parts.push(Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${v}\r\n`
+      ));
+    }
   }
   parts.push(Buffer.from(
     `--${boundary}\r\nContent-Disposition: form-data; name="${fileEntry.name}"; filename="${fileEntry.filename}"\r\nContent-Type: ${fileEntry.contentType}\r\n\r\n`
@@ -50,15 +81,16 @@ function buildMultipart(boundary, fields, fileEntry) {
   return Buffer.concat(parts);
 }
 
-function postGroqWhisper(apiKey, wavData) {
+function postGroqWhisper(apiKey, wavData, language) {
   return new Promise((resolve, reject) => {
     const boundary = 'GWB' + Date.now().toString(16);
-    const body = buildMultipart(boundary, {
-      model:                       'whisper-large-v3-turbo',
-      language:                    'vi',
+    const fields = {
+      model:                       'whisper-large-v3',
       response_format:             'verbose_json',
-      'timestamp_granularities[]': 'segment',
-    }, {
+      'timestamp_granularities[]': ['segment', 'word'],
+    };
+    if (language) fields.language = language; // omit when undefined → Groq auto-detects
+    const body = buildMultipart(boundary, fields, {
       name: 'file', filename: 'audio.wav', contentType: 'audio/wav', data: wavData,
     });
 
@@ -97,19 +129,42 @@ function postGroqWhisper(apiKey, wavData) {
 }
 
 function registerGroqWhisperHandlers() {
-  ipcMain.handle('groq:whisper-chunk', async (_, { filePath, startSec, durationSec, apiKey }) => {
+  ipcMain.handle('groq:whisper-chunk', async (_, { filePath, startSec, durationSec, apiKey, language }) => {
     let wavPath = null;
     try {
+      // Với chunk đầu tiên (startSec=0), dùng silence detection để biết intro im lặng bao lâu
+      // Làm floor cho speechStart của segment 1 — tránh TTS phát trong khoảng silence đầu tập
+      let episodeSpeechFloor = 0;
+      if (startSec === 0) {
+        episodeSpeechFloor = await detectSpeechOnset(filePath, Math.min(durationSec, 20)).catch(() => 0);
+      }
+
       wavPath = await extractWavChunk(filePath, startSec, durationSec);
       const wavData = fs.readFileSync(wavPath);
-      const result  = await postGroqWhisper(apiKey, wavData);
+      const result  = await postGroqWhisper(apiKey, wavData, language);
 
+      const words = result.words || [];
       const segments = (result.segments || [])
-        .map(s => ({
-          start: startSec + (s.start ?? 0),
-          end:   startSec + (s.end   ?? 0),
-          text:  (s.text || '').trim(),
-        }))
+        .map((s, idx) => {
+          const segStart = startSec + (s.start ?? 0);
+          const segEnd   = startSec + (s.end   ?? 0);
+          // Tìm từ đầu tiên trong segment → dùng làm thời điểm thực nhân vật mở miệng nói
+          const firstWord = words.find(w => {
+            const ws = startSec + (w.start ?? 0);
+            return ws >= segStart - 0.05 && ws < segEnd;
+          });
+          let speechStart = firstWord ? startSec + (firstWord.start ?? 0) : segStart;
+          // Segment đầu tiên: đảm bảo không phát trước lúc intro kết thúc
+          if (idx === 0 && episodeSpeechFloor > 0) {
+            speechStart = Math.max(speechStart, episodeSpeechFloor);
+          }
+          return {
+            start:       segStart,
+            end:         segEnd,
+            speechStart,
+            text:        (s.text || '').trim(),
+          };
+        })
         .filter(s => s.text.length > 1);
 
       return { ok: true, segments, fullText: (result.text || '').trim() };

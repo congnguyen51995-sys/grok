@@ -173,12 +173,19 @@ MULTI-SCENE: use <Sequence from={N} durationInFrames={M}> for timed sections.
 
 Build cinematic, emotionally resonant scenes. Every frame should look like a high-quality social media visual.`;
 
-function writeGeneratedFiles(componentCode) {
+function writeGeneratedFiles(componentCode, explicitDurationFrames) {
   ensureDirs();
 
   // Extract composition ID from code (fallback to 'GeneratedVideo')
   const idMatch = componentCode.match(/COMPOSITION_ID\s*=\s*["'`](\w+)["'`]/);
   const compositionId = idMatch ? idMatch[1] : 'GeneratedVideo';
+
+  // Resolve duration: explicit param takes priority, then extract from code, then fallback 180
+  let durationFrames = explicitDurationFrames;
+  if (!durationFrames || durationFrames <= 0) {
+    const durMatch = componentCode.match(/COMPOSITION_DURATION_FRAMES\s*=\s*(\d+)/);
+    durationFrames = durMatch ? parseInt(durMatch[1]) : 180;
+  }
 
   // Write the component file
   fs.writeFileSync(path.join(GENERATED_DIR, 'CurrentVideo.jsx'), componentCode, 'utf8');
@@ -193,7 +200,6 @@ import {
   COMPOSITION_WIDTH,
   COMPOSITION_HEIGHT,
   COMPOSITION_FPS,
-  COMPOSITION_DURATION_FRAMES,
 } from './CurrentVideo.jsx';
 
 export const RemotionRoot = () => (
@@ -203,7 +209,7 @@ export const RemotionRoot = () => (
     width={COMPOSITION_WIDTH  || 1920}
     height={COMPOSITION_HEIGHT || 1080}
     fps={COMPOSITION_FPS || 30}
-    durationInFrames={COMPOSITION_DURATION_FRAMES || 180}
+    durationInFrames={${durationFrames}}
   />
 );
 `;

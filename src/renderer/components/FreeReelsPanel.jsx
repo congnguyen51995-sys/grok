@@ -106,26 +106,44 @@ function StatusBadge({ status, msg }) {
 }
 
 // ── Drama Card (browse) — compact like Hongguo ──────────────────────────────
-function DramaCard({ drama, onSelect, onQueueEp1 }) {
+function DramaCard({ drama, onSelect, onQueueEp1, isDone, onToggleDone }) {
   return (
-    <div className="group flex flex-col bg-slate-800 rounded-lg border border-slate-700/40 hover:border-rose-500/60 transition-all overflow-hidden cursor-pointer"
+    <div className={`group flex flex-col rounded-lg border transition-all overflow-hidden cursor-pointer
+        ${isDone
+          ? 'bg-slate-900 border-slate-700/20 opacity-40 hover:opacity-70'
+          : 'bg-slate-800 border-slate-700/40 hover:border-rose-500/60'}`}
       onClick={() => onSelect(drama)}>
       <div className="relative aspect-[2/3] bg-slate-900 overflow-hidden">
         {drama.cover ? (
           <img
             src={drama.cover}
             alt={drama.title}
-            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
+            className={`w-full h-full object-cover ${isDone ? '' : 'group-hover:scale-105'} transition-transform duration-200`}
             referrerPolicy="no-referrer"
           />
         ) : (
           <div className="w-full h-full flex items-center justify-center text-2xl opacity-30">🎬</div>
+        )}
+        {isDone && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/40">
+            <span className="text-green-400 text-lg font-bold">✓</span>
+          </div>
         )}
         {drama.episode_count > 0 && (
           <div className="absolute bottom-0.5 left-0.5 bg-black/75 text-white text-[8px] px-1 rounded-sm leading-tight">
             {drama.episode_count} tập
           </div>
         )}
+        {/* Toggle done button */}
+        <button
+          onClick={(e) => { e.stopPropagation(); onToggleDone(drama); }}
+          title={isDone ? 'Bỏ đánh dấu đã làm' : 'Đánh dấu đã reup xong'}
+          className={`absolute top-0.5 left-0.5 text-[9px] px-1 py-0.5 rounded-sm font-bold transition-opacity
+            ${isDone
+              ? 'bg-green-700/90 text-white opacity-100 hover:bg-red-700/90'
+              : 'bg-slate-700/80 text-slate-300 opacity-0 group-hover:opacity-100 hover:bg-green-700/90 hover:text-white'}`}>
+          {isDone ? '✓' : '+✓'}
+        </button>
         {drama.ep1url && (
           <button
             onClick={(e) => { e.stopPropagation(); onQueueEp1(drama); }}
@@ -135,7 +153,7 @@ function DramaCard({ drama, onSelect, onQueueEp1 }) {
         )}
       </div>
       <div className="px-1 py-0.5">
-        <p className="text-[9px] text-slate-300 line-clamp-1 leading-tight" title={drama.title}>
+        <p className={`text-[9px] line-clamp-1 leading-tight ${isDone ? 'text-slate-500' : 'text-slate-300'}`} title={drama.title}>
           {drama.title || '—'}
         </p>
       </div>
@@ -237,6 +255,19 @@ export default function FreeReelsPanel() {
   const [tab,         setTab]         = useState('browse'); // 'browse' | 'queue'
   const [browseTab,   setBrowseTab]   = useState('home');   // 'home' | 'search'
   const [activeTabKey, setActiveTabKey] = useState('');     // tab_key from API
+
+  // Done dramas (already reupped) — persisted as JSON array of drama ids
+  const [doneDramas, setDoneDramas] = useState(() => {
+    try { return new Set(JSON.parse(localStorage.getItem('fr_doneDramas') || '[]')); } catch { return new Set(); }
+  });
+  const toggleDoneDrama = (drama) => {
+    setDoneDramas(prev => {
+      const next = new Set(prev);
+      if (next.has(drama.id)) next.delete(drama.id); else next.add(drama.id);
+      localStorage.setItem('fr_doneDramas', JSON.stringify([...next]));
+      return next;
+    });
+  };
 
   // Browse state
   const [dramas,      setDramas]      = useState([]);
@@ -1835,6 +1866,8 @@ ${flaggedList}`;
                     <div className="grid grid-cols-4 gap-1.5">
                       {dramas.map((d, i) => (
                         <DramaCard key={d.id || i} drama={d} onSelect={selectDrama}
+                          isDone={doneDramas.has(d.id)}
+                          onToggleDone={toggleDoneDrama}
                           onQueueEp1={(drama) => {
                             addToQueue(drama.ep1url, `${drama.title} - Tập 1`, drama.cover);
                             setTab('queue');

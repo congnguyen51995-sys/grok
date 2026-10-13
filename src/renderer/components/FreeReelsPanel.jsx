@@ -845,6 +845,8 @@ export default function FreeReelsPanel() {
       let charContext = charContextSaved.trim() || null;
       let _savedGemT0    = NaN;          // mốc T0 Gemini
       const _gemTimestamps = new Map(); // idx → giây, từng dòng Gemini cung cấp
+      // Strip "CharName: " prefix phòng khi Gemini vẫn thêm (cả ASCII lẫn Unicode)
+      const stripCharPrefix = (t) => t.replace(/^\*?\[?[A-Za-zÀ-ỹ][A-Za-zÀ-ỹ\s\.]{0,35}\]?\*?\s*:\s*/, '').trim();
 
       if (uploadRes?.ok) {
         addLog(`📹 Gemini nhận video — đang phân tích + dịch ${segments.length} dòng...`);
@@ -878,6 +880,7 @@ Cố gắng cho đủ tất cả ${segments.length} dòng. Nếu không chắc m
 === NHIỆM VỤ 3: DỊCH TOÀN BỘ ${segments.length} DÒNG ===
 Dựa vào video (biết AI đang nói với AI), dịch chính xác với xưng hô đúng nhân vật.
 NGHIÊM CẤM đổi xưng hô. Không bỏ sót dòng nào.
+TUYỆT ĐỐI KHÔNG thêm tên nhân vật, ký hiệu hay label vào trước mỗi dòng dịch. Chỉ trả lời thoại thuần túy (ví dụ SAI: "Alexander: Tôi đã dọn...", ĐÚNG: "Tôi đã dọn...").
 
 QUY TẮC XƯNG HÔ TIẾNG VIỆT (bắt buộc — xác định QUAN HỆ + GIỚI TÍNH trước):
 
@@ -954,7 +957,7 @@ Trả về ĐÚNG FORMAT (không thêm markdown, không giải thích):
           const lineMap    = new Map();
           for (const line of transText.trim().split('\n')) {
             const m = line.match(/^(\d+)[.)]\s*(.+)/);
-            if (m) lineMap.set(parseInt(m[1]) - 1, m[2].trim());
+            if (m) lineMap.set(parseInt(m[1]) - 1, stripCharPrefix(m[2].trim()));
           }
           if (lineMap.size >= Math.ceil(segments.length * 0.7)) {
             viSegments = segments.map((s, i) => ({ ...s, text: lineMap.has(i) ? lineMap.get(i) : s.text }));
@@ -1021,7 +1024,7 @@ Trả về ĐÚNG FORMAT (không thêm markdown, không giải thích):
           const lmap = new Map();
           for (const line of batchVi.trim().split('\n')) {
             const m = line.match(/^(\d+)[.)]\s*(.+)/);
-            if (m) lmap.set(parseInt(m[1]) - 1, m[2].trim());
+            if (m) lmap.set(parseInt(m[1]) - 1, stripCharPrefix(m[2].trim()));
           }
           viSegments = [...viSegments, ...batch.map((s, i) => ({ ...s, text: lmap.has(bi + i) ? lmap.get(bi + i) : s.text }))];
           addLog(`✅ Dịch batch ${bi + 1}–${Math.min(bi + BATCH, segments.length)}: xong`);

@@ -12165,7 +12165,7 @@ ipcMain.handle('tiktok:post-video', async (_e, { videoPath, caption, product, pr
     const { postToTikTok } = require('./services/tiktok-playwright');
     const onLog      = (msg) => mainWindow?.webContents?.send('tiktok:log', { profileId, msg });
     const onProgress = (pct) => mainWindow?.webContents?.send('tiktok:progress', { profileId, pct });
-    return await postToTikTok({ videoPath, caption, product, scheduledAt, profileDir: ttProfileDir(profileId), headless: true, onLog, onProgress });
+    return await postToTikTok({ videoPath, caption, product, scheduledAt, profileDir: ttProfileDir(profileId), headless: false, onLog, onProgress });
   } catch (e) { return { ok: false, error: e.message }; }
 });
 

@@ -15,28 +15,38 @@ function getFFmpeg() {
   try { return require('ffmpeg-static'); } catch { return 'ffmpeg'; }
 }
 
-// Phát hiện thời điểm speech thực sự bắt đầu trong N giây đầu file
-// Dùng làm fallback khi word-level timestamps trả về speechStart ≈ 0
-function detectSpeechOnset(filePath, probeSec = 15) {
+// Phát hiện thời điểm GIỌNG NÓI thực sự bắt đầu trong N giây đầu file.
+// Lọc dải tần giọng người (200–3500 Hz) trước khi silencedetect
+// → nhạc nền bass/treble nặng không kích hoạt false-positive.
+// Trả về giây đầu tiên có giọng nói (0 nếu không phát hiện được).
+function detectSpeechOnset(filePath, probeSec = 20) {
   return new Promise((resolve) => {
     const ffmpeg = getFFmpeg();
     const args = [
       '-ss', '0', '-t', String(probeSec),
       '-i', filePath,
-      '-af', 'silencedetect=noise=-35dB:duration=0.3',
+      // highpass 200Hz cắt bass nhạc, lowpass 3500Hz cắt treble/hihat
+      // silencedetect: -38dB threshold, chờ ít nhất 0.15s liên tục
+      '-af', 'highpass=f=200,lowpass=f=3500,silencedetect=noise=-38dB:duration=0.15',
       '-f', 'null', '-',
     ];
     const proc = spawn(ffmpeg, args);
     let out = '';
     proc.stderr.on('data', d => { out += d.toString(); });
     proc.on('close', () => {
-      // Tìm silence_end (lúc im lặng kết thúc = lúc có tiếng)
-      const matches = [...out.matchAll(/silence_end:\s*([\d.]+)/g)];
-      if (matches.length > 0) {
-        const firstSpeechSec = parseFloat(matches[0][1]);
-        resolve(Math.max(0, firstSpeechSec - 0.1)); // trừ 100ms buffer
+      // silence_end = lúc im lặng kết thúc → giọng nói bắt đầu
+      const ends   = [...out.matchAll(/silence_end:\s*([\d.]+)/g)].map(m => parseFloat(m[1]));
+      const starts = [...out.matchAll(/silence_start:\s*([\d.]+)/g)].map(m => parseFloat(m[1]));
+      if (ends.length > 0) {
+        // Ưu tiên silence_end đầu tiên có khoảng im lặng dài (>1s) → bỏ qua nhạc ngắn xen kẽ
+        const longSilenceEnd = ends.find((e, i) => {
+          const silStart = starts[i] ?? 0;
+          return (e - silStart) >= 1.0;
+        });
+        const onset = longSilenceEnd ?? ends[0];
+        resolve(Math.max(0, onset - 0.05)); // buffer 50ms
       } else {
-        resolve(0); // không phát hiện im lặng → có tiếng ngay từ đầu
+        resolve(0); // không có silence → tiếng nói ngay từ đầu
       }
     });
     proc.on('error', () => resolve(0));

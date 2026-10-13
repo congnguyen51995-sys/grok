@@ -1907,23 +1907,26 @@ ${flaggedList}`;
                 <button
                   onClick={async () => {
                     const CONCUR = 5;
-                    const MAX_RETRY = 2; // thử lại tối đa 2 lần
-                    // Lần đầu: chạy tất cả idle
+                    const MAX_RETRY = 2;
+                    // Rolling pool: xong 1 cái thì pick ngay cái tiếp, luôn giữ CONCUR luồng chạy
+                    const runPool = async (list) => {
+                      const pool = new Set();
+                      for (const v of list) {
+                        while (pool.size >= CONCUR) await Promise.race([...pool]);
+                        const p = processVideo(v.id).finally(() => pool.delete(p));
+                        pool.add(p);
+                      }
+                      await Promise.all([...pool]);
+                    };
                     const pending = videos.filter(v => v.status === 'idle' || v.status === 'error');
-                    for (let i = 0; i < pending.length; i += CONCUR) {
-                      const batch = pending.slice(i, i + CONCUR);
-                      await Promise.all(batch.map(v => processVideo(v.id)));
-                    }
+                    await runPool(pending);
                     // Auto-retry các tập lỗi (tối đa MAX_RETRY vòng)
                     for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
                       const errors = videosRef.current.filter(v => v.status === 'error');
                       if (!errors.length) break;
                       addLog(`🔁 Tự động thử lại ${errors.length} tập lỗi (lần ${attempt + 1})...`);
-                      await new Promise(r => setTimeout(r, 3000)); // chờ 3s trước khi retry
-                      for (let i = 0; i < errors.length; i += CONCUR) {
-                        const batch = errors.slice(i, i + CONCUR);
-                        await Promise.all(batch.map(v => processVideo(v.id)));
-                      }
+                      await new Promise(r => setTimeout(r, 3000));
+                      await runPool(errors);
                     }
                   }}
                   disabled={processing && videos.filter(v=>v.status==='idle'||v.status==='error').length===0}

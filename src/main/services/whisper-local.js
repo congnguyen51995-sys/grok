@@ -44,9 +44,25 @@ function runWhisper(wavPath, language, modelSize = 'small') {
   });
 }
 
+// Giới hạn 2 Whisper chạy cùng lúc
+const WHISPER_MAX_CONCUR = 2;
+let _whisperRunning = 0;
+const _whisperQueue = [];
+function acquireWhisperSlot() {
+  return new Promise(res => {
+    if (_whisperRunning < WHISPER_MAX_CONCUR) { _whisperRunning++; res(); }
+    else _whisperQueue.push(res);
+  });
+}
+function releaseWhisperSlot() {
+  if (_whisperQueue.length) { const next = _whisperQueue.shift(); next(); }
+  else _whisperRunning--;
+}
+
 function registerWhisperLocalHandlers() {
   // Transcribe toàn bộ video/audio bằng local faster-whisper
   ipcMain.handle('whisper:local-transcribe', async (_, { filePath, language, modelSize }) => {
+    await acquireWhisperSlot();
     let wavPath = null;
     try {
       if (!fs.existsSync(PYTHON)) return { ok: false, error: 'GPT-SoVITS runtime không tìm thấy' };
@@ -76,6 +92,7 @@ function registerWhisperLocalHandlers() {
     } catch (e) {
       return { ok: false, error: e.message };
     } finally {
+      releaseWhisperSlot();
       if (wavPath) try { fs.unlinkSync(wavPath); } catch {}
     }
   });
